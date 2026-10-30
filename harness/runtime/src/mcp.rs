@@ -182,6 +182,10 @@ struct Entry {
     catalog_micros: Arc<AtomicU64>,
     redactor_builds: Arc<AtomicU64>,
     config: McpServerConfig,
+    /// Who admits a call no rule decides under Durable Approval: the configuration's at first,
+    /// then the host's latest choice, which takes effect from the next call without
+    /// reconnecting.
+    unruled: RwLock<tickloop_harness_protocol::mcp::McpUnruled>,
     /// How the tools reach the model: the configuration's at first, then the user's latest
     /// choice, which takes effect without reconnecting.
     exposure: RwLock<snapshot::Exposure>,
@@ -361,7 +365,7 @@ impl Entry {
     /// none cannot show it is the same account, so its target holds in this entry alone.
     fn call_target(&self, tool: &snapshot::Tool) -> String {
         let mut hash = Sha256::new();
-        hash.update(serde_json::to_vec(&self.config).unwrap_or_default());
+        hash.update(serde_json::to_vec(&server_identity(&self.config)).unwrap_or_default());
         hash.update([0]);
         if let Some(bearer) = &self.bearer {
             hash.update(b"host:");
@@ -875,6 +879,7 @@ impl McpConnections {
                         self.renew_in_place(entry.clone()).await;
                     }
                 }
+                *entry.unruled.write().unwrap() = config.unruled;
                 if entry.change_exposure(snapshot::Exposure::of(&config)) {
                     *self
                         .inner
@@ -943,6 +948,7 @@ impl McpConnections {
                     catalog_micros: self.inner.catalog_micros.clone(),
                     redactor_builds: self.inner.redactor_builds.clone(),
                     exposure: RwLock::new(snapshot::Exposure::of(&config)),
+                    unruled: RwLock::new(config.unruled),
                     config,
                     token: RwLock::new(None),
                     credential: RwLock::new(None),
@@ -1652,7 +1658,16 @@ fn connects_alike(current: &McpServerConfig, next: &McpServerConfig) -> bool {
     let mut next = next.clone();
     next.exposure = current.exposure;
     next.tool_exposure.clone_from(&current.tool_exposure);
+    next.unruled = current.unruled;
     *current == next
+}
+
+/// `config` as it names what the server is: who admits its unruled calls is no part of it.
+pub(super) fn server_identity(config: &McpServerConfig) -> McpServerConfig {
+    McpServerConfig {
+        unruled: Default::default(),
+        ..config.clone()
+    }
 }
 
 fn redacted_resources(entry: &Entry, mut resources: Vec<Value>) -> Vec<Value> {

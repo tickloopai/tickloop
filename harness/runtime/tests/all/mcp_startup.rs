@@ -182,6 +182,7 @@ impl Fixture {
 
 fn http_server(name: &str, server: &McpService, exposure: ToolExposure) -> McpServerConfig {
     McpServerConfig {
+        unruled: Default::default(),
         name: name.into(),
         source: "global".into(),
         transport: McpTransport::Http {

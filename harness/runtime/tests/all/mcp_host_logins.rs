@@ -85,6 +85,7 @@ impl HostBearer for HostLogin {
 
 pub(crate) fn remote(url: &str) -> McpServerConfig {
     McpServerConfig {
+        unruled: Default::default(),
         exposure: ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),

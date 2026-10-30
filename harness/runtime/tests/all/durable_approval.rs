@@ -494,8 +494,8 @@ async fn stopping_a_rebuilt_permission_wait_ends_it_as_a_questions() {
     rebuilt.shutdown().await;
 }
 
-/// A host that denies whatever would prompt still denies the third-party call: no wait, no
-/// person.
+/// A host that denies whatever would prompt still denies the third-party call Auto review does
+/// not admit: no wait, no person.
 #[tokio::test]
 async fn deny_on_prompt_still_denies_the_call_without_a_wait() {
     let store = Arc::new(InMemoryTranscriptStore::new());
@@ -504,6 +504,13 @@ async fn deny_on_prompt_still_denies_the_call_without_a_wait() {
         vec![call(CALL, tool, json!({})), text(DONE)]
     })
     .await;
+    // Auto review, which a third-party call goes to in Auto mode, does not admit it.
+    agent
+        .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![
+            verdict(true),
+            verdict(true),
+        ])))
+        .await;
     let admissions = watch_admissions(&agent);
     let chat = agent.create_chat_without_folder().await.unwrap();
     let turn = agent
@@ -2017,4 +2024,330 @@ async fn a_late_login_failure_leaves_a_connection_made_again_with_another_login_
         );
         connections.shutdown().await;
     }
+}
+
+/// The tools of the server `review` at `server`, whose unruled calls `unruled` admits; the host
+/// may change that choice between refreshes.
+async fn admission_provider(
+    server: &McpService,
+    unruled: Arc<Mutex<tickloop_harness_protocol::mcp::McpUnruled>>,
+) -> Arc<tickloop_harness_runtime::mcp::McpToolProvider> {
+    use tickloop_harness_protocol::mcp::{McpServerConfig, McpTransport, ToolExposure};
+    use tickloop_harness_runtime::mcp::{
+        HostCapabilities, McpConnections, McpServerState, McpToolProvider,
+    };
+    let url = server.url();
+    let config = move || McpServerConfig {
+        unruled: *unruled.lock().unwrap(),
+        exposure: ToolExposure::Direct,
+        tool_exposure: Vec::new(),
+        description: String::new(),
+        oauth: Default::default(),
+        sensitive_values: Vec::new(),
+        disabled: false,
+        name: SERVER.into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: url.clone(),
+            headers: std::collections::BTreeMap::new(),
+        },
+        timeout_ms: 300_000,
+    };
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        std::collections::BTreeMap::new(),
+        std::collections::BTreeMap::new(),
+    );
+    connections.reconcile(vec![config()]).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while connections.snapshot()[0].state != McpServerState::Connected {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the server connects");
+    Arc::new(McpToolProvider::new(
+        connections,
+        Arc::new(move || vec![config()]),
+    ))
+}
+
+/// A Chat with a Folder under Durable Approval, whose server `review` admits its unruled calls
+/// as `unruled` says, whose model makes `replies` and whose reviewer answers `verdicts`.
+struct Reviewed {
+    agent: Agent,
+    chat: ChatId,
+    reviewer: Arc<ScriptedModel>,
+    unruled: Arc<Mutex<tickloop_harness_protocol::mcp::McpUnruled>>,
+    _folder: tempfile::TempDir,
+}
+
+async fn reviewed(
+    server: &McpService,
+    unruled: tickloop_harness_protocol::mcp::McpUnruled,
+    replies: Vec<Vec<Content>>,
+    verdicts: Vec<Vec<Content>>,
+) -> Reviewed {
+    reviewed_in(server, unruled, replies, verdicts, true).await
+}
+
+/// [`reviewed`], in a Chat with a Folder or, without `with_folder`, without one.
+async fn reviewed_in(
+    server: &McpService,
+    unruled: tickloop_harness_protocol::mcp::McpUnruled,
+    replies: Vec<Vec<Content>>,
+    verdicts: Vec<Vec<Content>>,
+    with_folder: bool,
+) -> Reviewed {
+    let unruled = Arc::new(Mutex::new(unruled));
+    let tools = admission_provider(server, unruled.clone()).await;
+    let mut options = options(PromptPolicy::DurableApproval);
+    options.host.directory_trust = tickloop_harness_protocol::DirectoryTrustPolicy::CallerManaged;
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: Some(Arc::new(InMemoryTranscriptStore::new())),
+            environment: with_folder.then(|| {
+                Arc::new(tickloop_harness_runtime::environment::FolderEnvironment::bare())
+                    as Arc<dyn tickloop_harness_runtime::environment::ExecutionEnvironment>
+            }),
+            models: ChosenModels::new(Arc::new(ScriptedModel::new(replies))),
+        },
+        options,
+    )
+    .unwrap();
+    agent.install_host_tools(tools).unwrap();
+    let reviewer = Arc::new(ScriptedModel::new(verdicts));
+    agent.set_auto_reviewer(reviewer.clone()).await;
+    let folder = tempfile::tempdir().unwrap();
+    let chat = match with_folder {
+        true => agent.create_chat(folder.path().into()).await.unwrap(),
+        false => agent.create_chat_without_folder().await.unwrap(),
+    };
+    Reviewed {
+        agent,
+        chat,
+        reviewer,
+        unruled,
+        _folder: folder,
+    }
+}
+
+fn verdict(block: bool) -> Vec<Content> {
+    text(&tickloop_harness_test_support::auto_classification(block).to_string())
+}
+
+/// A server whose host sends unruled calls to Auto review first: a call the reviewer allows
+/// runs at once, with no one asked, in a Chat with a Folder and in one without: a remote call
+/// touches no local file, so it is reviewed without a working directory.
+#[tokio::test]
+async fn an_auto_review_server_runs_what_the_reviewer_allows_without_asking() {
+    for with_folder in [true, false] {
+        use tickloop_harness_protocol::mcp::McpUnruled;
+        let server = McpService::start().await;
+        server.set_tools(json!([{"name": "read", "inputSchema": {"type": "object"}}]));
+        server.set_result(json!({"content": [{"type": "text", "text": "MCP_OK"}]}));
+        let Reviewed {
+            agent,
+            chat,
+            reviewer,
+            _folder,
+            ..
+        } = reviewed_in(
+            &server,
+            McpUnruled::AutoReview,
+            vec![call(CALL, "mcp__review__read", json!({})), text(DONE)],
+            vec![verdict(false)],
+            with_folder,
+        )
+        .await;
+        let admissions = watch_admissions(&agent);
+        let turn = agent
+            .advance(chat, prompt("Read the service.", Delivery::Queue))
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome(&turn).await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert_eq!(server.calls().len(), 1);
+        assert_eq!(
+            reviewer.requests.lock().unwrap().len(),
+            1,
+            "the call was reviewed"
+        );
+        assert!(
+            !admissions
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|admission| admission.starts_with("asked")),
+            "{:?}",
+            admissions.lock().unwrap()
+        );
+        // The reviewer reads the server's declaration of the tool, and no working directory where
+        // the Chat has none.
+        let reviewed = format!("{:?}", reviewer.requests.lock().unwrap()[0].messages);
+        assert!(reviewed.contains("mcp_server"), "{reviewed}");
+        assert_eq!(
+            reviewed.contains("working_directory"),
+            with_folder,
+            "{reviewed}"
+        );
+        agent.shutdown().await;
+    }
+}
+
+/// A call Auto review blocks on such a server waits for the person, and runs once allowed.
+#[tokio::test]
+async fn an_auto_review_server_asks_the_person_what_the_reviewer_blocks() {
+    for with_folder in [true, false] {
+        use tickloop_harness_protocol::mcp::McpUnruled;
+        let server = McpService::start().await;
+        server.set_tools(json!([{"name": "read", "inputSchema": {"type": "object"}}]));
+        server.set_result(json!({"content": [{"type": "text", "text": "MCP_OK"}]}));
+        let Reviewed {
+            agent,
+            chat,
+            reviewer,
+            _folder,
+            ..
+        } = reviewed_in(
+            &server,
+            McpUnruled::AutoReview,
+            vec![call(CALL, "mcp__review__read", json!({})), text(DONE)],
+            vec![verdict(true), verdict(true)],
+            with_folder,
+        )
+        .await;
+        let turn = agent
+            .advance(chat, prompt("Read the service.", Delivery::Queue))
+            .await
+            .unwrap();
+        let TurnOutcome::Waiting(TurnWait::Permission(request)) = outcome(&turn).await else {
+            panic!("a blocked call waits for the person");
+        };
+        assert!(server.calls().is_empty());
+        let reviews = reviewer.requests.lock().unwrap().len();
+        assert!(reviews >= 1, "the call was reviewed");
+        let reply = agent
+            .advance(chat, answer(&request, PermissionReply::AllowOnce))
+            .await
+            .unwrap();
+        assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
+        assert!(matches!(
+            outcome(&turn).await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert_eq!(server.calls().len(), 1, "the allowed call ran once");
+        assert_eq!(
+            reviewer.requests.lock().unwrap().len(),
+            reviews,
+            "the allowed call is not reviewed again"
+        );
+        agent.shutdown().await;
+    }
+}
+
+/// A server whose host sends unruled calls to the person never reaches the reviewer.
+#[tokio::test]
+async fn a_person_server_never_reaches_the_reviewer() {
+    use tickloop_harness_protocol::mcp::McpUnruled;
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name": "read", "inputSchema": {"type": "object"}}]));
+    let Reviewed {
+        agent,
+        chat,
+        reviewer,
+        _folder,
+        ..
+    } = reviewed(
+        &server,
+        McpUnruled::Person,
+        vec![call(CALL, "mcp__review__read", json!({})), text(DONE)],
+        vec![verdict(false)],
+    )
+    .await;
+    let turn = agent
+        .advance(chat, prompt("Read the service.", Delivery::Queue))
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome(&turn).await,
+        TurnOutcome::Waiting(TurnWait::Permission(_))
+    ));
+    assert!(reviewer.requests.lock().unwrap().is_empty());
+    assert!(server.calls().is_empty());
+    agent.shutdown().await;
+}
+
+/// Changing who admits a server's unruled calls keeps its connection, and applies from the next
+/// call.
+#[tokio::test]
+async fn changing_who_admits_unruled_calls_keeps_the_connection() {
+    use tickloop_harness_protocol::mcp::McpUnruled;
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name": "read", "inputSchema": {"type": "object"}}]));
+    server.set_result(json!({"content": [{"type": "text", "text": "MCP_OK"}]}));
+    let Reviewed {
+        agent,
+        chat,
+        reviewer,
+        unruled,
+        _folder,
+    } = reviewed(
+        &server,
+        McpUnruled::Person,
+        vec![
+            call(CALL, "mcp__review__read", json!({})),
+            text(DONE),
+            call("again", "mcp__review__read", json!({})),
+            text(DONE),
+        ],
+        vec![verdict(false)],
+    )
+    .await;
+    let turn = agent
+        .advance(chat, prompt("Read the service.", Delivery::Queue))
+        .await
+        .unwrap();
+    let TurnOutcome::Waiting(TurnWait::Permission(request)) = outcome(&turn).await else {
+        panic!("the person admits the first call");
+    };
+    let reply = agent
+        .advance(
+            chat,
+            answer(
+                &request,
+                PermissionReply::Deny {
+                    comment: Some("Not now.".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    outcome(&reply).await;
+    assert!(matches!(
+        outcome(&turn).await,
+        TurnOutcome::Completed { .. }
+    ));
+    let initializations = server.arrivals("initialize").len();
+
+    *unruled.lock().unwrap() = McpUnruled::AutoReview;
+    let turn = agent
+        .advance(chat, prompt("Read it again.", Delivery::Queue))
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome(&turn).await,
+        TurnOutcome::Completed { .. }
+    ));
+    assert_eq!(server.calls().len(), 1, "the second call ran after review");
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        server.arrivals("initialize").len(),
+        initializations,
+        "the server kept its connection"
+    );
+    agent.shutdown().await;
 }

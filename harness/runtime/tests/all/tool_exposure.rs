@@ -78,6 +78,7 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
     server.set_tools(json!([{"name":"mail","description":"Send email","inputSchema":{"type":"object","properties":{"value":{"anyOf":[{"type":"string"},{"type":"object"}]}},"required":["value"]}},{"name":"secret","inputSchema":{"type":"object"}}]));
     server.set_result(json!({"content":[{"type":"text","text":"MAIL_OK"}]}));
     let mut configs = vec![McpServerConfig {
+        unruled: Default::default(),
         name: "office".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -93,6 +94,7 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
         description: "Office tools".into(),
     }];
     configs.push(McpServerConfig {
+        unruled: Default::default(),
         name: "ui5".into(),
         transport: McpTransport::Failed {
             reason: "missing command".into(),
@@ -248,6 +250,7 @@ async fn batch_waits_for_each_confirmation_while_other_calls_finish() {
     server.set_tools(json!([{"name":"mail","inputSchema":{"type":"object","properties":{}}}]));
     server.set_result(json!({"content":[{"type":"text","text":"MAIL_OK"}]}));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         name: "office".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -725,6 +728,7 @@ async fn a_batch_cut_off_by_a_process_exit_loads_as_interrupted_with_each_call_o
     server.set_result(json!({"content":[{"type":"text","text":"WROTE"}]}));
     server.set_delay(Duration::from_secs(30));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         name: "slow".into(),
         source: "fixture".into(),
         transport: McpTransport::Http {
@@ -1332,6 +1336,7 @@ async fn native_search_models_call_deferred_tools_directly_under_direct_call_app
     ]));
     server.set_result(json!({"content":[{"type":"text","text":"MAIL_OK"}]}));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         name: "office".into(),
         source: "global".into(),
         transport: McpTransport::Http {

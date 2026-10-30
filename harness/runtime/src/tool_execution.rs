@@ -1637,6 +1637,8 @@ impl Agent {
                     )
                 );
             let prompt_policy = self.tool_prompt_policy();
+            let is_durable_third_party = prompt_policy == PromptPolicy::DurableApproval
+                && host_permission == Some(crate::host_tools::HostToolPermission::ThirdParty);
             let is_granted = decision == Decision::Check
                 && self
                     .is_permission_granted(
@@ -1665,14 +1667,15 @@ impl Agent {
                 {
                     Decision::Allow
                 }
-                // Durable Approval hands a third-party call no rule decides to a person, never to
-                // Auto review, and a call a person allowed while its Run waited is not reviewed
-                // again.
+                // Durable Approval hands a third-party call no rule decides to a person, unless its
+                // server's host chose Auto review first, and a call a person allowed while its Run
+                // waited is not reviewed again.
                 Decision::Check
                     if is_granted
-                        || prompt_policy == PromptPolicy::DurableApproval
-                            && host_permission
-                                == Some(crate::host_tools::HostToolPermission::ThirdParty) =>
+                        || is_durable_third_party
+                            && !prepared_host_call
+                                .as_ref()
+                                .is_some_and(|call| call.auto_reviews_unruled()) =>
                 {
                     Decision::Ask
                 }
@@ -1718,13 +1721,15 @@ impl Agent {
             let mut auto_denial_message = None;
             if decision == Decision::Check {
                 let mut assessment = self
-                    .review_auto_operation(
+                    .review_operation(
                         receipt,
                         &operation,
                         prepared_host_call
                             .as_ref()
                             .map(|call| call.approval_facts().clone()),
                         cancel.clone(),
+                        true,
+                        host_permission == Some(crate::host_tools::HostToolPermission::ThirdParty),
                     )
                     .await
                     .map_err(|error| error.to_string())?;
@@ -1752,6 +1757,7 @@ impl Agent {
                         &policy,
                         &mut assessment,
                         allow_rule_skips_review,
+                        is_durable_third_party,
                     )
                     .await?;
                 assessment_details = Some(assessment.details.clone());
@@ -2408,6 +2414,7 @@ impl Agent {
                                     &policy,
                                     &mut assessment,
                                     true,
+                                    false,
                                 )
                                 .await?;
                             assessment_details = Some(assessment.details.clone());
@@ -2787,6 +2794,7 @@ impl Agent {
         policy: &PermissionPolicy,
         assessment: &mut approval_assessment::ApprovalAssessment,
         allow_rule_skips_review: bool,
+        soft_block_asks: bool,
     ) -> Result<AutoPermissionDecision, ToolCallError> {
         let decision;
         let mut approval_reason = None;
@@ -2892,6 +2900,12 @@ impl Agent {
                         decision = Decision::Ask;
                         approval_reason =
                             Some(format!("{warning}\n\nLatest blocked action: {reason}"));
+                    }
+                    // Under Durable Approval, a third-party call its host sends to Auto review
+                    // first goes to the person when review blocks it softly; a hard deny stays.
+                    None if soft_block_asks && kind == AutoBlockKind::SoftDeny => {
+                        decision = Decision::Ask;
+                        approval_reason = Some(reason.clone());
                     }
                     _ => {
                         decision = Decision::Deny;

@@ -113,7 +113,7 @@ pub(super) fn tool_list_key(
     bearer: Option<&Bearer>,
 ) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let mut identity = config.clone();
+    let mut identity = super::server_identity(config);
     identity.sensitive_values.clear();
     identity.disabled = false;
     identity.exposure = Default::default();

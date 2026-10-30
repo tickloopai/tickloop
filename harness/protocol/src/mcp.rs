@@ -26,6 +26,23 @@ pub struct McpServerConfig {
     /// The user turned the server off where the Agent works: it stays listed but never runs.
     #[serde(default)]
     pub disabled: bool,
+    /// How a call of the server's tools that no permission rule decides is admitted under
+    /// Durable Approval; other prompt policies decide it as their execution mode does. A change
+    /// applies from the next call, without connecting again.
+    #[serde(default)]
+    pub unruled: McpUnruled,
+}
+
+/// Who admits a call of a server's tools that no permission rule decides, under Durable
+/// Approval.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpUnruled {
+    /// The person, every time.
+    #[default]
+    Person,
+    /// Auto review first: what it admits runs, and what it does not admit goes to the person.
+    AutoReview,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

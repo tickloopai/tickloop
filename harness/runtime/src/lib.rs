@@ -1519,10 +1519,13 @@ impl Agent {
         prepared_facts: Option<tickloop_harness_protocol::PreparedApprovalFacts>,
         cancel: CancellationToken,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
-        self.review_operation(receipt, operation, prepared_facts, cancel, true)
+        self.review_operation(receipt, operation, prepared_facts, cancel, true, false)
             .await
     }
 
+    /// Reviews `operation` in the Chat's Folder, or, for a `remote` call, without one when the
+    /// Chat has none: the context then names no working directory, and Auto policy entries
+    /// scoped to a directory do not apply.
     async fn review_operation(
         &self,
         receipt: &Receipt,
@@ -1530,6 +1533,7 @@ impl Agent {
         prepared_facts: Option<tickloop_harness_protocol::PreparedApprovalFacts>,
         cancel: CancellationToken,
         emit_permission: bool,
+        remote: bool,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
         let (snapshot, bookkeeping, chat_client, boundary_id, root_goal) = {
             let chats = self.inner.chats.lock().await;
@@ -1610,7 +1614,8 @@ impl Agent {
                 ));
             }
         };
-        let Some(folder) = snapshot.folder.clone() else {
+        let folder = snapshot.folder.clone();
+        if folder.is_none() && !remote {
             let reason =
                 "This Chat has no Folder to review this action in; review it manually.".to_owned();
             if emit_permission {
@@ -1625,7 +1630,7 @@ impl Agent {
                     failure: ApprovalFailureKind::Configuration,
                 },
             ));
-        };
+        }
         let ids = self.chat_ids(snapshot.id).await;
         let context = approval_context::capture(
             &ids,
@@ -1634,8 +1639,11 @@ impl Agent {
             operation,
             root_goal.as_ref(),
             legacy,
-            &folder,
-            auto_settings.policy_for_directory(&folder),
+            folder.as_deref(),
+            match &folder {
+                Some(folder) => auto_settings.policy_for_directory(folder),
+                None => auto_settings.policy(),
+            },
         );
         let mut context = match context {
             Ok(context) => context,

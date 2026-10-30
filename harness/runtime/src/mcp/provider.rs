@@ -108,7 +108,7 @@ impl McpToolProvider {
     }
     fn authority(entry: &Entry) -> HostToolAuthority {
         let mut hash = Sha256::new();
-        hash.update(serde_json::to_vec(&entry.config).unwrap_or_default());
+        hash.update(serde_json::to_vec(&server_identity(&entry.config)).unwrap_or_default());
         // A host's login counts by its account, so that renewing its token changes nothing.
         if let Some(bearer) = &entry.bearer {
             hash.update([0]);
@@ -337,6 +337,19 @@ impl HostToolProvider for McpToolProvider {
             .connections
             .prepare_ready(name, input.clone(), &cancel)
             .await?;
+        let auto_review_unruled = *call.entry.unruled.read().unwrap()
+            == tickloop_harness_protocol::mcp::McpUnruled::AutoReview;
+        // What the server says of the tool is its own declaration: data for a reviewer, never
+        // evidence of what the call does.
+        let facts = tickloop_harness_protocol::PreparedApprovalFacts {
+            normalized_input: input.clone(),
+            external_declaration: Some(serde_json::json!({
+                "mcp_server": call.entry.config.name,
+                "tool": *call.tool.definition,
+                "annotations": *call.tool.annotations,
+            })),
+            ..Default::default()
+        };
         Ok(PreparedHostCall::new(
             name.into(),
             input.clone(),
@@ -346,6 +359,8 @@ impl HostToolProvider for McpToolProvider {
         )
         .with_mcp_server(call.entry.config.name.clone())
         .with_target(call.target.clone())
+        .with_auto_review_unruled(auto_review_unruled)
+        .with_approval_facts(facts)
         .with_payload(call))
     }
     async fn revalidate_call(

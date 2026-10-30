@@ -56,6 +56,9 @@ pub struct PreparedHostCall {
     /// A token-free identity of what the call reaches, which an approval given for it is bound
     /// to: for an MCP call, the server's configuration and account and the tool as listed.
     target: Option<String>,
+    /// Under Durable Approval, the call goes to Auto review before a person when no rule decides
+    /// it, as its server's host chose.
+    auto_review_unruled: bool,
     approval_facts: tickloop_harness_protocol::PreparedApprovalFacts,
     local_read: Option<(tickloop_harness_tools::PreparedTool, bool)>,
 }
@@ -95,6 +98,7 @@ impl PreparedHostCall {
             policy_identity: None,
             mcp_server: None,
             target: None,
+            auto_review_unruled: false,
             local_read: None,
         }
     }
@@ -115,6 +119,15 @@ impl PreparedHostCall {
 
     pub(crate) fn target(&self) -> Option<&str> {
         self.target.as_deref()
+    }
+
+    pub(crate) fn with_auto_review_unruled(mut self, auto_review: bool) -> Self {
+        self.auto_review_unruled = auto_review;
+        self
+    }
+
+    pub(crate) fn auto_reviews_unruled(&self) -> bool {
+        self.auto_review_unruled
     }
 
     pub fn with_payload<T: Any + Send + Sync>(mut self, payload: T) -> Self {

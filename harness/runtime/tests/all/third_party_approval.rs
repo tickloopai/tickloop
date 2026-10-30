@@ -27,6 +27,7 @@ async fn provider_with_secrets(
     server.set_tools(json!([{"name":"read","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true}}]));
     server.set_result(json!({"content":[{"type":"text","text":"MCP_OK"}]}));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),
@@ -765,6 +766,7 @@ async fn invalid_resolved_service_names_cannot_expose_ambiguous_tools() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
