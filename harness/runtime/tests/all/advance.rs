@@ -801,6 +801,78 @@ async fn an_unfinished_task_board_stays_for_the_next_answer() {
     agent.shutdown().await;
 }
 
+fn write_draft() -> Step {
+    Step::Reply(call(
+        "write",
+        "Write",
+        json!({"file_path": "draft.txt", "content": "draft"}),
+    ))
+}
+
+/// The answer to a new prompt that starts a finished board over goes on to work with tools other
+/// than the Task tools.
+#[tokio::test]
+async fn an_answer_after_a_finished_task_board_works_with_other_tools() {
+    let fixture = fixture();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Script::new(vec![
+        create_task("plan"),
+        Step::Respond(cancel_created_task),
+        Step::Reply(text("planned")),
+        write_draft(),
+        Step::Reply(text("drafted")),
+    ]);
+    let (agent, chat) = tasks_agent(&fixture, store, model).await;
+    complete(&agent, chat, after_leaf("plan the work")).await;
+    complete(&agent, chat, after_leaf("write the draft")).await;
+    assert!(fixture.folder.join("draft.txt").exists());
+    let (titles, _) = task_board(&agent, chat).await;
+    assert!(titles.is_empty(), "{titles:?}");
+    agent.shutdown().await;
+}
+
+/// A regenerated answer starts from the task board before its prompt and goes on to work with
+/// tools other than the Task tools.
+#[tokio::test]
+async fn a_regenerated_answer_from_an_earlier_task_board_works_with_other_tools() {
+    let fixture = fixture();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Script::new(vec![
+        create_task("plan"),
+        Step::Reply(text("planned")),
+        write_draft(),
+        Step::Reply(text("drafted")),
+    ]);
+    let (agent, chat) = tasks_agent(&fixture, store, model).await;
+    let asked = complete(&agent, chat, after_leaf("plan the work")).await;
+    complete(&agent, chat, regenerate(answer(&agent, &asked).await)).await;
+    assert!(fixture.folder.join("draft.txt").exists());
+    let (titles, _) = task_board(&agent, chat).await;
+    assert!(titles.is_empty(), "{titles:?}");
+    agent.shutdown().await;
+}
+
+/// The answer to an edited prompt starts from the task board before that prompt and goes on to
+/// work with tools other than the Task tools.
+#[tokio::test]
+async fn an_answer_to_an_edited_prompt_from_an_earlier_task_board_works_with_other_tools() {
+    let fixture = fixture();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Script::new(vec![
+        create_task("plan"),
+        Step::Reply(text("planned")),
+        write_draft(),
+        Step::Reply(text("drafted")),
+    ]);
+    let (agent, chat) = tasks_agent(&fixture, store, model).await;
+    let asked = complete(&agent, chat, after_leaf("plan the work")).await;
+    complete(&agent, chat, replace(&asked, "write the draft")).await;
+    assert!(fixture.folder.join("draft.txt").exists());
+    let (titles, _) = task_board(&agent, chat).await;
+    assert!(titles.is_empty(), "{titles:?}");
+    agent.shutdown().await;
+}
+
 /// A compaction boundary carries the task board that stood before it, so an answer after the
 /// boundary is answered again from that board once the Chat is reloaded.
 #[tokio::test]

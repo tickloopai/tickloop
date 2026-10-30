@@ -4247,6 +4247,8 @@ impl Agent {
                 if board_revision(chat) != revision {
                     self.publish_task_board(&mut chats, chat_id, loop_id);
                 }
+                self.take_due_task_checkpoint(chats.get_mut(&chat_id).unwrap())
+                    .await;
                 admission
             };
             match admission {
@@ -4394,6 +4396,7 @@ impl Agent {
             chat.bookkeeping.lifecycle.take_start_back(pending);
             self.save(&chat.snapshot);
         }
+        self.take_due_task_checkpoint(chat).await;
         match admission {
             RunAdmission::Idle => Ok(TriggerTake::Waits),
             RunAdmission::ValidateTrigger(_) => Ok(TriggerTake::LookAgain),
