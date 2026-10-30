@@ -503,6 +503,9 @@ pub enum GuidanceNote {
     /// The MCP configuration warnings one note announced, by the digest of their text; the
     /// digest of no warnings withdraws earlier ones.
     McpWarnings { digest: String },
+    /// Environment guidance by content digest; `None` withdraws it. A compact boundary carries
+    /// the last delivery state without carrying its text.
+    Environment { digest: Option<String> },
     /// Guidance announced earlier that no longer applies.
     Withdrawn {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -523,6 +526,7 @@ impl crate::TaggedRecord for GuidanceNote {
         "mcp_instructions",
         "mcp_servers",
         "mcp_warnings",
+        "environment",
         "withdrawn",
     ];
 }

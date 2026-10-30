@@ -161,7 +161,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: TICK_READ.into(),
-        description: "Read a Tick this Chat opened using its complete hosted: instance identity. Extension Ticks return their state (seq, at, and data, which is null until the Tick has content: a Tick just opened may still be loading, so read it again shortly) only. Use TickDescribe for capabilities and the tool catalog. Terminal Ticks return their screen as plain text (data.text, at most 200 lines and 64 KiB) and data.exit, null while the program runs and its exit code or signal once it ended. Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.".into(),
+        description: "Read a Tick this Chat opened using its complete hosted: instance identity. Extension Ticks return their state (seq, at, and data, which is null until the Tick has content: a Tick just opened may still be loading, so read it again shortly) only. Use TickDescribe for capabilities and the tool catalog. Terminal Ticks return their screen as plain text (data.text, at most 200 lines and 64 KiB) and data.exit, null while the program runs and its exit code or signal once it ended. Reading never subscribes. Verify changes by reading the same instance again. A connecting Tick may report data.connection: retrying keeps retrying its error; not_authorized requires the user to log in again in /ticks; failed reports a failure that reopening with the same arguments will not fix. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.".into(),
         input_schema: json!({"type":"object","properties":target,"required":["tick_instance_id"],"additionalProperties":false}),
     });
     let mut call_properties = target.clone();
@@ -169,7 +169,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
     call_properties["args"] = json!({"type":"object","description":"The tool's arguments; omit or pass {} for a tool that takes none."});
     definitions.push(ToolDefinition {
         name: TICK_CALL.into(),
-        description: "Call one tool declared by an extension Tick using its complete hosted: instance identity. Use TickDescribe for that Tick's catalog first; query tools read content, while modifying tools require permission. Use ArtifactRead/ArtifactEdit/ArtifactComment for artifacts and Bash/Read/TaskStop for Shell tasks.".into(),
+        description: "Call one tool declared by an extension Tick using its complete hosted: instance identity. Use TickDescribe for that Tick's catalog first; query tools read content, while modifying tools require permission. If the catalog revision changed after approval, describe it again before preparing a new call; verify a successful change with TickRead on the same instance. Use ArtifactRead/ArtifactEdit/ArtifactComment for artifacts and Bash/Read/TaskStop for Shell tasks.".into(),
         input_schema: json!({"type":"object","properties":call_properties,"required":["tick_instance_id","tool"],"additionalProperties":false}),
     });
     definitions.push(ToolDefinition {
@@ -187,9 +187,10 @@ fn tick_manage_description() -> String {
             "send_input types text, then logical keys ({}), into a terminal Tick, at most {TERMINAL_INPUT_BYTES} bytes; an extension Tick is operated with TickCall.",
             crate::terminal_input::KEY_NAMES
         ),
-        "close ends the Tick's process.".to_owned(),
-        "reopen starts a new instance from the recorded program of one lost with its Tickhost; it needs approval again, gets a new identity, and no subscription follows it.".to_owned(),
-        "Omitted cwd uses the Agent file work directory. A bare command[0] is found as the program of an installed Tick package (command[0]='tick-<package>'), then on PATH. Results report only verified facts: the instance. Users need not say Tick: a request to see what an installed plugin shows asks for its Tick. Before opening an installed plugin's program, load the tickloop Skill and that plugin's <package>:usage Skill.".to_owned(),
+        "Prefer an existing matching instance unless the user asks for a new one; a text-only request needs no Tick. After opening, read the returned instance to verify its content before reporting it; tell the user it shows as a card in this Chat's Monitor, not a separate window. An unknown open outcome may already have started the Tick: inspect the existing state instead of opening another. Hosted Ticks do not use the Shell sandbox; never use them or a multiplexer to bypass a blocked Shell command.".to_owned(),
+        "close ends the Tick's process; hiding or leaving its card does not. A program the user started in a terminal is not a Tick this Chat can read or operate.".to_owned(),
+        "reopen starts a new instance from the recorded program of one lost with its Tickhost; it needs approval again, gets a new identity, and no subscription follows it. Reopen only when the user asks.".to_owned(),
+        "Omitted cwd uses the Agent file work directory. A bare command[0] is found as the program of an installed Tick package (command[0]='tick-<package>'), then on PATH. Results report only verified facts: the instance. Users need not say Tick: a request to see what an installed plugin shows asks for its Tick. Before opening an installed plugin's program, load that plugin's <package>:usage Skill and follow its launch arguments. Check workspace_host.tickhost and workspace_host.plugins for availability; do not infer it from the repository or an installed multiplexer. If the plugin is missing or disabled, ask the user to install or enable it in /ticks, not build a launcher from project source. Follow plugin_login diagnostics from open; when a Tick refuses authorization, even without plugin_login, ask the user to log in to the plugin in /ticks and wait for their confirmation before opening again.".to_owned(),
     ]
     .join(" ")
 }
@@ -402,6 +403,21 @@ fn tick_manage_schema() -> Value {
 mod tests {
     use super::*;
     use tick_protocol::{HostedRunId, ShellTaskId};
+
+    #[test]
+    fn tick_tools_require_only_the_plugins_usage_skill() {
+        let manage = definitions()
+            .into_iter()
+            .find(|definition| definition.name == TICK_MANAGE)
+            .unwrap();
+        assert!(manage.description.contains("<package>:usage"));
+        assert!(!manage.description.contains("load the tickloop Skill"));
+        assert!(
+            manage
+                .description
+                .contains("Prefer an existing matching instance")
+        );
+    }
 
     /// The subscription forms name exactly the fields of the subscription TickManage schema.
     #[test]

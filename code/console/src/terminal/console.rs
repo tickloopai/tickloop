@@ -4067,6 +4067,25 @@ impl Console {
         Ok(())
     }
 
+    pub(super) fn set_monitor_action_waiting(
+        &self,
+        chat: Uuid,
+        waiting: bool,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let monitor = state.monitor_for_chat_mut(chat);
+        if monitor.action_waiting == waiting {
+            return Ok(());
+        }
+        monitor.action_waiting = waiting;
+        if state.chat == Some(chat) {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Shows why an action did nothing, kept across periodic status refreshes until the next key.
     pub(super) fn hold_status(&self, text: &str) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;

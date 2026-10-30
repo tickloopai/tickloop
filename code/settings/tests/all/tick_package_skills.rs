@@ -97,14 +97,7 @@ fn package_skills_are_named_after_their_package_with_its_install_directory_in_th
             .definitions()
             .map(|skill| skill.name.as_str())
             .collect::<Vec<_>>(),
-        [
-            "guide",
-            "loop",
-            "sample:guide",
-            "sample:tickloop",
-            "slides",
-            "tickloop"
-        ]
+        ["guide", "loop", "sample:guide", "sample:tickloop", "slides"]
     );
     assert!(
         registry
@@ -148,13 +141,28 @@ fn package_skills_are_named_after_their_package_with_its_install_directory_in_th
             .content
             .contains(package.root.to_string_lossy().as_ref())
     );
-    assert!(matches!(
+    assert_eq!(
+        registry.expand("tickloop", "", SkillCaller::Model),
+        Err(SkillError::Unknown("tickloop".into()))
+    );
+    for caller in [SkillCaller::Model, SkillCaller::User] {
+        let expansion = registry.expand("sample:tickloop", "", caller).unwrap();
+        assert_eq!(
+            expansion.source,
+            SkillSource::Plugin {
+                plugin: "sample".into(),
+                path: package.root.join("skills/tickloop/SKILL.md"),
+            }
+        );
+        assert!(expansion.content.ends_with("Package body"));
+    }
+    assert_eq!(
         registry
-            .expand("tickloop", "", SkillCaller::Model)
+            .expand("tickloop", "", SkillCaller::User)
             .unwrap()
-            .source,
-        SkillSource::BuiltIn
-    ));
+            .name,
+        "sample:tickloop"
+    );
     let warnings = registry.warnings();
     assert_eq!(warnings.len(), 2, "{warnings:?}");
     assert!(
@@ -226,7 +234,7 @@ fn an_unusable_package_or_registry_only_warns() {
 
     let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
     assert!(!registry.contains("sample:guide"));
-    assert!(registry.contains("tickloop"));
+    assert!(registry.contains("loop"));
     assert_eq!(registry.warnings().len(), 1);
     assert!(
         registry.warnings()[0].starts_with("the Skills of plugin sample are not loaded"),
@@ -240,7 +248,7 @@ fn an_unusable_package_or_registry_only_warns() {
     )
     .unwrap();
     let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
-    assert!(registry.contains("tickloop"));
+    assert!(registry.contains("loop"));
     assert_eq!(registry.warnings().len(), 1);
     assert!(
         registry.warnings()[0].starts_with("the Skills of installed plugins are not loaded"),

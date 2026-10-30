@@ -54,7 +54,6 @@ const OVERVIEW_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Shows overview keys and commands."),
     ("/resume", "Opens saved Agent history."),
     ("/slides", "Starts a new Agent that makes Slides."),
-    ("/tickloop", "Starts a new Agent with the Tickloop Skill."),
 ];
 
 const OVERVIEW_AGENT_COMMAND: &str =
@@ -145,12 +144,6 @@ const COMMANDS: &[CommandSpec] = &[
         arguments: "",
         description: "Show the selected Chat, model, execution mode and queue.",
         menu_group: Some(CommandGroup::Advanced),
-    },
-    CommandSpec {
-        command: "/tickloop",
-        arguments: "[REQUEST]",
-        description: "Loads the Tickloop Skill.",
-        menu_group: Some(CommandGroup::Skills),
     },
     CommandSpec {
         command: "/loop",
@@ -768,8 +761,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 31);
-        assert_eq!(builtin_commands().len(), 47);
+        assert_eq!(completion.candidates().len(), 30);
+        assert_eq!(builtin_commands().len(), 46);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -783,7 +776,6 @@ mod tests {
             "/goal",
             "/cwd",
             "/details",
-            "/tickloop",
             "/loop",
             "/slides",
             "/artifacts",
@@ -807,6 +799,30 @@ mod tests {
         let unique: std::collections::HashSet<_> =
             builtin_commands().iter().map(|spec| spec.command).collect();
         assert_eq!(unique.len(), builtin_commands().len());
+    }
+
+    #[test]
+    fn tickloop_is_discovered_only_from_registered_skills() {
+        let mut completion = Completion::default();
+        for scope in [
+            CommandScope::Root,
+            CommandScope::Child,
+            CommandScope::Overview,
+        ] {
+            completion.update_at("/tickloop", "/tickloop".len(), scope);
+            assert!(command_names(&completion).is_empty(), "{scope:?}");
+        }
+        assert!(
+            builtin_commands()
+                .iter()
+                .all(|spec| spec.command != "/tickloop")
+        );
+        assert!(!command_help(false).contains("/tickloop"));
+        assert!(!command_help(true).contains("/tickloop"));
+
+        completion.set_skills(Arc::from([skill("/tickloop")]));
+        completion.update("/tickloop");
+        assert_eq!(command_names(&completion), vec!["/tickloop"]);
     }
 
     #[test]

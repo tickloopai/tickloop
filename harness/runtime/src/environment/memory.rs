@@ -567,6 +567,10 @@ impl ExecutionPort for MemoryPort {
         self.authority.check(self.scope.chat)?;
         let describes = matches!(&query, ExecutionQuery::Describe(_));
         match query {
+            ExecutionQuery::Guidance => Err(ExecutionError::new(
+                "Unsupported",
+                "this environment supplies no guidance",
+            )),
             ExecutionQuery::Capabilities => {
                 Ok(ExecutionInspection::Capabilities(ExecutionCapabilities {
                     ticks: true,

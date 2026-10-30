@@ -3438,9 +3438,11 @@ mod tests {
             .flat_map(|skill| skill.split(|character: char| !character.is_ascii_alphanumeric()))
             .filter(is_compound_name)
             .collect::<HashSet<_>>();
-        assert!(named.is_superset(&HashSet::from(
-            ["TickManage", "TaskStop", "ScheduleWakeup",]
-        )));
+        assert!(named.is_superset(&HashSet::from([
+            "ArtifactEdit",
+            "AskUserQuestion",
+            "ScheduleWakeup",
+        ])));
         for word in named {
             assert!(
                 tools.contains(word) || NOT_TOOLS.contains(&word),

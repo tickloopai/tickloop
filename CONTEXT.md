@@ -348,9 +348,6 @@ _Avoid_: Workspace Trust, automatic trust
 **Skill**:
 A set of instructions teaching the Agent how to combine existing tools to accomplish a kind of work; it provides no state access, tool capability, or extra permissions of its own. The host controls on-demand loading by the model and explicit invocation by the user separately.
 
-**Tickloop Skill**:
-The built-in system-level Skill, named `tickloop`, that teaches the Agent to open, operate, and subscribe to Ticks, independent of the working directory; it activates automatically when Tickhost is available, and the user can also start a new Agent with it via `/tickloop`.
-
 ### ID
 
 **Tickloop ID**:

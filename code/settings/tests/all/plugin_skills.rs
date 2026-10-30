@@ -174,8 +174,7 @@ fn enabled_plugin_skills_are_named_after_their_plugin_beside_tick_package_skills
             "notes:summary",
             "notes:write",
             "quotes:usage",
-            "slides",
-            "tickloop"
+            "slides"
         ]
     );
     assert!(registry.warnings().is_empty(), "{:?}", registry.warnings());
@@ -207,7 +206,7 @@ fn enabled_plugin_skills_are_named_after_their_plugin_beside_tick_package_skills
     let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
     assert_eq!(
         names(&registry),
-        ["loop", "quotes:usage", "slides", "tickloop"],
+        ["loop", "quotes:usage", "slides"],
         "a disabled plugin's Skills are not loaded"
     );
 
@@ -332,7 +331,7 @@ fn an_unusable_plugin_or_registry_only_warns_and_a_disabled_one_is_quiet() {
     fs::remove_dir_all(&notes.root).unwrap();
 
     let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
-    assert!(registry.contains("tickloop"));
+    assert!(registry.contains("loop"));
     assert!(!registry.contains("notes:write"));
     assert_eq!(registry.warnings().len(), 1, "{:?}", registry.warnings());
     assert!(
@@ -350,7 +349,7 @@ fn an_unusable_plugin_or_registry_only_warns_and_a_disabled_one_is_quiet() {
 
     fs::write(store.directory().join("installed.json"), "not json").unwrap();
     let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
-    assert!(registry.contains("tickloop"));
+    assert!(registry.contains("loop"));
     assert_eq!(registry.warnings().len(), 1);
     assert!(
         registry.warnings()[0].starts_with("the Skills of installed plugins are not loaded"),

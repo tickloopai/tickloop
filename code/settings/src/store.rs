@@ -140,7 +140,7 @@ impl SettingsStore for UserSettings {
         match folder {
             Some(folder) => SkillRegistry::discover(folder, self.root()),
             None => {
-                let mut registry = SkillRegistry::builtin_without_ticks();
+                let mut registry = SkillRegistry::builtin();
                 registry.set_loop_instructions(std::sync::Arc::new(
                     crate::loop_skill::LoopFiles::new(None, self.root()),
                 ));

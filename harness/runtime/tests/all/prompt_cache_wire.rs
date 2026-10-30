@@ -3,18 +3,63 @@
 //! tail breakpoint moves forward.
 
 use std::{
+    path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use serde_json::{Value, json};
 use tickloop_harness_model::{LocalModelClients, ModelClients, cards::ModelCatalog};
-use tickloop_harness_protocol::{EventKind, ExecutionMode};
-use tickloop_harness_runtime::Agent;
-use tickloop_harness_test_support::model_http_support::accept_script_request;
+use tickloop_harness_policy::{
+    settings::{
+        MemorySettingsStore, PermissionChanges, SettingsSnapshot, SettingsStore,
+        SettingsStoreError, SettingsUpdate,
+    },
+    skills::SkillRegistry,
+};
+use tickloop_harness_protocol::{EventKind, ExecutionMode, SkillSource};
+use tickloop_harness_runtime::{Agent, HarnessOptions, HarnessSeams};
+use tickloop_harness_test_support::{
+    harness::ChosenModels, model_http_support::accept_script_request,
+};
 use tokio::{io::AsyncWriteExt, net::TcpListener};
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(8);
+const PLUGIN_GUIDANCE: &str = "Open the Reader with tick-tickloop and the document URL.";
+
+#[derive(Default)]
+struct PluginSettings(MemorySettingsStore);
+
+impl SettingsStore for PluginSettings {
+    fn read(&self, folder: Option<&Path>) -> SettingsSnapshot {
+        self.0.read(folder)
+    }
+
+    fn write(&self, update: SettingsUpdate) -> Result<(), SettingsStoreError> {
+        self.0.write(update)
+    }
+
+    fn write_permissions(
+        &self,
+        changes: &PermissionChanges,
+        expected: Option<(&Path, &str)>,
+    ) -> Result<(), SettingsStoreError> {
+        self.0.write_permissions(changes, expected)
+    }
+
+    fn skills(&self, _: Option<&Path>) -> SkillRegistry {
+        let mut skills = SkillRegistry::builtin();
+        skills.register_markdown(
+            &format!("---\nname: usage\ndescription: Open the Reader Tick\n---\n{PLUGIN_GUIDANCE}"),
+            SkillSource::Plugin {
+                plugin: "tickloop".into(),
+                path: "/plugins/tickloop/skills/usage/SKILL.md".into(),
+            },
+            &[],
+        );
+        skills
+    }
+}
 
 fn frame(kind: &str, mut data: Value) -> String {
     data["type"] = json!(kind);
@@ -93,6 +138,15 @@ fn without_breakpoints(mut value: Value) -> Value {
 
 #[tokio::test]
 async fn a_tool_loop_reads_the_previous_request_and_moves_its_tail_breakpoint() {
+    check_tool_loop_cache(false).await;
+}
+
+#[tokio::test]
+async fn loading_plugin_usage_keeps_the_wire_prefix_and_advances_cache_breakpoints() {
+    check_tool_loop_cache(true).await;
+}
+
+async fn check_tool_loop_cache(load_plugin_usage: bool) {
     let workdir = tempfile::tempdir().unwrap();
     std::fs::write(workdir.path().join("notes.txt"), "Delivery is Friday.").unwrap();
     let notes = workdir.path().join("notes.txt");
@@ -110,10 +164,12 @@ async fn a_tool_loop_reads_the_previous_request_and_moves_its_tail_breakpoint() 
                 let response = if has_tool_result(&body) {
                     reply(json!({"type":"text","text":"Friday."}), "end_turn")
                 } else {
-                    reply(
-                        json!({"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":notes}}),
-                        "tool_use",
-                    )
+                    let tool = if load_plugin_usage {
+                        json!({"type":"tool_use","id":"toolu_1","name":"Skill","input":{"skill":"tickloop:usage"}})
+                    } else {
+                        json!({"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":notes}})
+                    };
+                    reply(tool, "tool_use")
                 };
                 captured.lock().unwrap().push(body);
                 response
@@ -136,7 +192,21 @@ async fn a_tool_loop_reads_the_previous_request_and_moves_its_tail_breakpoint() 
     // A loopback service needs no key.
     config.api_key_env.clear();
     let client = LocalModelClients::new(None).client(&config).unwrap();
-    let agent = Agent::new_embedded(config, client);
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: None,
+            environment: Some(Arc::new(
+                tickloop_harness_runtime::environment::FolderEnvironment::bare(),
+            )),
+            models: ChosenModels::new(client),
+        },
+        HarnessOptions {
+            settings: Some(Arc::new(PluginSettings::default())),
+            ..HarnessOptions::local(config)
+        },
+    )
+    .unwrap();
     let chat = agent
         .create_chat(workdir.path().to_path_buf())
         .await
@@ -172,6 +242,31 @@ async fn a_tool_loop_reads_the_previous_request_and_moves_its_tail_breakpoint() 
     let [first, second] = &requests[..] else {
         panic!("two conversation requests, got {}", requests.len());
     };
+    if load_plugin_usage {
+        assert!(!first["messages"].to_string().contains(PLUGIN_GUIDANCE));
+        assert_eq!(
+            second["messages"]
+                .to_string()
+                .matches(PLUGIN_GUIDANCE)
+                .count(),
+            1
+        );
+        assert!(
+            second["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| { message["content"].as_array().unwrap() })
+                .any(|block| {
+                    block["type"] == "tool_result"
+                        && block["tool_use_id"] == "toolu_1"
+                        && block["is_error"] != true
+                }),
+            "the plugin Skill actually loads successfully"
+        );
+        assert!(!second["system"].to_string().contains(PLUGIN_GUIDANCE));
+        assert!(!second["tools"].to_string().contains(PLUGIN_GUIDANCE));
+    }
     let first_system_end = format!("system/{}", first["system"].as_array().unwrap().len() - 1);
     let first_tail = last_block(first, first["messages"].as_array().unwrap().len() - 1);
     assert_eq!(

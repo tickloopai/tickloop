@@ -15,7 +15,6 @@ use tickloop_code_local_environment::hosted::{
     worker_control::{DaemonControl, WorkerControlGrant},
 };
 use tickloop_harness::model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
-use tickloop_harness::policy::skills::TICKLOOP_SKILL;
 use tickloop_harness::protocol::{
     Content, EventKind, HerdrInteraction, HerdrPane, HostCallContext, ModelIdentity, Role,
     ToolDefinition, ToolResult,
@@ -28,6 +27,421 @@ use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 use tickloop_harness::test_support::{ScriptedModel, call, config, next_event, text};
+
+#[tokio::test]
+async fn sandbox_guidance_tracks_effective_settings_without_rewriting_request_prefixes() {
+    use tickloop_code_local_environment::{
+        environment::LocalEnvironment, hosted::shells::OwnTickhost,
+    };
+    use tickloop_code_settings::UserSettings;
+    use tickloop_harness::{
+        runtime::{HarnessOptions, HarnessSeams},
+        test_support::harness::ChosenModels,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let folder = directory.path().join("folder");
+    let settings_root = directory.path().join("settings");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::create_dir(&settings_root).unwrap();
+    let settings_path = settings_root.join("settings.json");
+    let settings = UserSettings::in_root(&settings_root);
+    let environment =
+        LocalEnvironment::with_shells(Arc::new(OwnTickhost::new())).with_sandbox(settings.clone());
+    let model = Arc::new(ScriptedModel::new(
+        (0..14).map(|_| text("Ready.")).collect(),
+    ));
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: None,
+            environment: Some(Arc::new(environment)),
+            models: ChosenModels::new(model.clone()),
+        },
+        HarnessOptions {
+            settings: Some(Arc::new(settings)),
+            ..HarnessOptions::local(config())
+        },
+    )
+    .unwrap();
+    let chat = agent.create_chat(folder.clone()).await.unwrap();
+    let mut events = agent.subscribe();
+    let mut sandbox = json!({"enabled":false});
+    let mut previous_messages = Vec::new();
+    let mut initial_system = None;
+    let mut initial_tools = None;
+    let mut notes_seen = 0;
+    let withdrawal = "The Bash command sandbox is disabled. Earlier sandbox instructions no longer apply; ordinary permission checks still apply.";
+
+    for turn in 0..14 {
+        match turn {
+            1 => {
+                sandbox["enabled"] = json!(true);
+                sandbox["excludedCommands"] =
+                    json!(["TOKEN=PRIVATE_EXCLUSION_SENTINEL vendor-cli *"]);
+            }
+            3 => sandbox["allowUnsandboxedCommands"] = json!(false),
+            4 => sandbox["network"] = json!({"allowedDomains":["z.example", "a.example"]}),
+            5 => {
+                sandbox["filesystem"] =
+                    json!({"allowWrite":["build", "cache"], "denyWrite":["private"]})
+            }
+            6 => sandbox["filesystem"]["allowGitConfig"] = json!(true),
+            7 => sandbox["excludedCommands"] = json!(["git status", "npm test"]),
+            8 => sandbox["failIfUnavailable"] = json!(true),
+            9 => sandbox["autoAllowBashIfSandboxed"] = json!(false),
+            10 => sandbox["excludedCommands"] = json!(["git diff", "cargo test"]),
+            11 => {
+                sandbox["network"]["allowedDomains"] =
+                    json!(["a.example", "z.example", "a.example"]);
+                sandbox["filesystem"]["allowWrite"] = json!(["cache", "build", "cache"]);
+                sandbox["excludedCommands"] = json!(["cargo test", "git diff", "cargo test"]);
+            }
+            12 => sandbox["enabled"] = json!(false),
+            _ => {}
+        }
+        std::fs::write(
+            &settings_path,
+            serde_json::to_vec(&json!({
+                "sandbox":{"enabled":false},
+                "projects":{folder.display().to_string():{"sandbox":sandbox}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let receipt = agent
+            .submit(chat, format!("Observe configuration {turn}"))
+            .await
+            .unwrap();
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id != receipt.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        {
+            let requests = model.requests.lock().unwrap();
+            assert_eq!(requests.len(), turn + 1);
+            let request = &requests[turn];
+            let messages = request
+                .messages
+                .iter()
+                .map(|message| serde_json::to_value(message).unwrap())
+                .collect::<Vec<_>>();
+            let system = messages[0].clone();
+            let tools = serde_json::to_value(&request.tools).unwrap();
+            assert_eq!(initial_system.get_or_insert(system.clone()), &system);
+            assert_eq!(initial_tools.get_or_insert(tools.clone()), &tools);
+            assert_eq!(
+                &messages[..previous_messages.len()],
+                previous_messages.as_slice(),
+                "turn {turn}: earlier request messages must remain byte-equivalent"
+            );
+            previous_messages = messages;
+            let notes = request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|content| match content {
+                    Content::Text { text }
+                        if text.contains("## Bash command sandbox")
+                            || text.contains(withdrawal) =>
+                    {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if matches!(turn, 1 | 3..=9 | 12) {
+                notes_seen += 1;
+            }
+            assert_eq!(
+                notes.len(),
+                notes_seen,
+                "turn {turn}: append exactly one note only when effective guidance changes"
+            );
+            if (1..=11).contains(&turn) {
+                let latest = notes.last().unwrap();
+                assert!(
+                    !latest.contains("PRIVATE_EXCLUSION_SENTINEL"),
+                    "command exclusion patterns can contain credentials and must not enter model guidance"
+                );
+                assert!(latest.contains("configured"));
+                assert!(latest.contains("/sandbox"));
+                assert!(latest.contains("dangerouslyDisableSandbox"));
+                assert!(latest.contains("Bash"));
+                if turn >= 3 {
+                    assert!(latest.contains("Strict"));
+                }
+                if turn >= 4 {
+                    assert!(latest.contains("a.example"));
+                }
+                if turn >= 5 {
+                    assert!(latest.contains("build"));
+                    assert!(latest.contains("private"));
+                }
+                if turn >= 6 {
+                    assert!(latest.contains(".git/config"));
+                    assert!(latest.contains("hooks"));
+                }
+                if turn >= 7 {
+                    assert!(latest.contains("\"excludedCommandCount\":2"));
+                    assert!(!latest.contains("git status"));
+                    assert!(!latest.contains("git diff"));
+                }
+                if turn >= 8 {
+                    assert!(latest.contains("failIfUnavailable is true"));
+                }
+                if turn >= 9 {
+                    assert!(latest.contains("\"autoAllowBashIfSandboxed\":false"));
+                }
+            }
+            if turn >= 12 {
+                assert!(notes.last().unwrap().contains(withdrawal));
+            }
+        }
+    }
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn sandbox_guidance_survives_resume_branch_and_compaction_and_sanitizes_invalid_settings() {
+    use tickloop_code_local_environment::{
+        environment::LocalEnvironment, hosted::shells::OwnTickhost,
+    };
+    use tickloop_code_settings::UserSettings;
+    use tickloop_harness::{
+        protocol::{BranchRequest, ChatId},
+        runtime::{HarnessOptions, HarnessSeams, transcript::JsonlTranscriptStore},
+        test_support::{harness::ChosenModels, persisted_config},
+    };
+
+    async fn turn(agent: &Agent, chat: ChatId, prompt: &str) {
+        let mut events = agent.subscribe();
+        let receipt = agent.submit(chat, prompt.into()).await.unwrap();
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id != receipt.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    }
+
+    fn notes(request: &ModelRequest) -> Vec<&str> {
+        request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|content| match content {
+                Content::Text { text }
+                    if text.contains("## Bash command sandbox")
+                        || text.contains("Earlier sandbox instructions no longer apply") =>
+                {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let folder = directory.path().join("folder");
+    let settings_root = directory.path().join("settings");
+    let state_root = directory.path().join("state");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::create_dir(&settings_root).unwrap();
+    let settings_path = settings_root.join("settings.json");
+    std::fs::write(&settings_path, r#"{"sandbox":{"enabled":true}}"#).unwrap();
+    let model = Arc::new(ScriptedModel::new(
+        (0..17)
+            .map(|_| text("The user is checking sandbox configuration; no commands have run."))
+            .collect(),
+    ));
+    let open = || {
+        let settings = UserSettings::in_root(&settings_root);
+        let environment = LocalEnvironment::with_shells(Arc::new(OwnTickhost::new()))
+            .with_sandbox(settings.clone());
+        Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: Some(Arc::new(
+                    JsonlTranscriptStore::open(state_root.clone()).unwrap(),
+                )),
+                environment: Some(Arc::new(environment)),
+                models: ChosenModels::new(model.clone()),
+            },
+            HarnessOptions {
+                local_state_root: Some(state_root.clone()),
+                settings: Some(Arc::new(settings)),
+                ..HarnessOptions::local(persisted_config())
+            },
+        )
+        .unwrap()
+    };
+    let agent = open();
+    let chat = agent.create_chat(folder).await.unwrap();
+    turn(&agent, chat, "Check the configured sandbox.").await;
+    assert_eq!(
+        notes(model.requests.lock().unwrap().last().unwrap()).len(),
+        1
+    );
+    std::fs::write(
+        &settings_path,
+        r#"{"sandbox":{"enabled":"PRIVATE_PARSE_INPUT_ONE"}}"#,
+    )
+    .unwrap();
+    turn(&agent, chat, "Check invalid configuration.").await;
+    let invalid_note = {
+        let requests = model.requests.lock().unwrap();
+        let current = notes(requests.last().unwrap());
+        assert_eq!(current.len(), 2);
+        let invalid = current.last().unwrap().to_string();
+        assert!(invalid.contains("Shell execution is blocked"));
+        assert!(invalid.contains("/sandbox"));
+        assert!(!invalid.contains("PRIVATE_PARSE_INPUT"));
+        invalid
+    };
+    std::fs::write(
+        &settings_path,
+        r#"{"sandbox":{"enabled":"PRIVATE_PARSE_INPUT_TWO"}}"#,
+    )
+    .unwrap();
+    turn(&agent, chat, "Check another invalid configuration.").await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let current = notes(requests.last().unwrap());
+        assert_eq!(current.len(), 2);
+        assert_eq!(*current.last().unwrap(), invalid_note);
+    }
+    std::fs::write(&settings_path, r#"{"sandbox":{"enabled":true}}"#).unwrap();
+    turn(&agent, chat, "Check corrected configuration.").await;
+    assert_eq!(
+        notes(model.requests.lock().unwrap().last().unwrap()).len(),
+        3
+    );
+    agent.shutdown().await;
+    drop(agent);
+
+    let agent = open();
+    agent.resume_chat(chat).await.unwrap();
+    turn(&agent, chat, "Continue with unchanged sandbox settings.").await;
+    assert_eq!(
+        notes(model.requests.lock().unwrap().last().unwrap()).len(),
+        3,
+        "resume must retain the last delivered guidance"
+    );
+    let branch = agent
+        .branch_chat(BranchRequest {
+            request_id: tickloop_ids::generate(),
+            source_chat_id: chat,
+            name: None,
+        })
+        .await
+        .unwrap();
+    turn(&agent, branch.child_chat_id, "Continue in the branch.").await;
+    assert_eq!(
+        notes(model.requests.lock().unwrap().last().unwrap()).len(),
+        3,
+        "branch must retain the last delivered guidance"
+    );
+    agent.compact(chat).await.unwrap();
+    turn(&agent, chat, "Continue after compaction.").await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let current = notes(requests.last().unwrap());
+        assert_eq!(
+            current.len(),
+            1,
+            "compaction must re-emit current guidance once, not stale settings"
+        );
+        assert!(current[0].contains("configured"));
+        assert!(!current[0].contains("invalid or unreadable"));
+    }
+    agent.compact(chat).await.unwrap();
+    agent.compact(branch.child_chat_id).await.unwrap();
+    agent.shutdown().await;
+    drop(agent);
+
+    let agent = open();
+    agent.resume_chat(chat).await.unwrap();
+    for prompt in [
+        "Continue after persisted compaction.",
+        "Continue without another change.",
+    ] {
+        turn(&agent, chat, prompt).await;
+        let requests = model.requests.lock().unwrap();
+        let current = notes(requests.last().unwrap());
+        assert_eq!(
+            current.len(),
+            1,
+            "enabled guidance must be re-emitted once after compact and restart"
+        );
+        assert!(current[0].contains("configured"));
+    }
+    agent.shutdown().await;
+    drop(agent);
+
+    std::fs::write(&settings_path, r#"{"sandbox":{"enabled":false}}"#).unwrap();
+    let agent = open();
+    agent.resume_chat(chat).await.unwrap();
+    turn(&agent, chat, "Continue after the sandbox was disabled.").await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let current = notes(requests.last().unwrap());
+        assert_eq!(current.len(), 2);
+        assert!(
+            current
+                .last()
+                .unwrap()
+                .contains("Earlier sandbox instructions no longer apply")
+        );
+    }
+    agent.resume_chat(branch.child_chat_id).await.unwrap();
+    turn(
+        &agent,
+        branch.child_chat_id,
+        "Continue after compaction and disabling.",
+    )
+    .await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let current = notes(requests.last().unwrap());
+        assert_eq!(
+            current.len(),
+            1,
+            "disabling immediately after compaction still withdraws the archived guidance"
+        );
+        assert!(current[0].contains("Earlier sandbox instructions no longer apply"));
+    }
+    agent.compact(chat).await.unwrap();
+    agent.shutdown().await;
+    drop(agent);
+
+    let agent = open();
+    agent.resume_chat(chat).await.unwrap();
+    for prompt in [
+        "Continue after compacting the withdrawal.",
+        "Keep the sandbox disabled.",
+    ] {
+        turn(&agent, chat, prompt).await;
+        let requests = model.requests.lock().unwrap();
+        assert!(
+            notes(requests.last().unwrap()).is_empty(),
+            "an already-withdrawn sandbox must not emit a second withdrawal after compact and restart"
+        );
+    }
+    agent.shutdown().await;
+}
 
 const READ_HOST_SOURCE: &str = "ReadCapturedHostSource";
 const QUEUED_SOURCE_INPUT: &str = "Use the host source captured by this follow-up input.";
@@ -258,6 +672,106 @@ async fn assert_merged_host_source(headless: bool) {
 }
 
 #[tokio::test]
+async fn sandbox_guidance_summarized_away_by_a_directed_summary_is_still_withdrawn() {
+    use tickloop_code_local_environment::{
+        environment::LocalEnvironment, hosted::shells::OwnTickhost,
+    };
+    use tickloop_code_settings::UserSettings;
+    use tickloop_harness::{
+        protocol::{ChatId, DirectedSummaryRequest, SummaryDirection},
+        runtime::{HarnessOptions, HarnessSeams},
+        test_support::{harness::ChosenModels, persisted_config},
+    };
+
+    async fn turn(agent: &Agent, chat: ChatId, prompt: &str) {
+        let mut events = agent.subscribe();
+        let receipt = agent.submit(chat, prompt.into()).await.unwrap();
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id != receipt.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let folder = directory.path().join("folder");
+    let settings_root = directory.path().join("settings");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::create_dir(&settings_root).unwrap();
+    let settings_path = settings_root.join("settings.json");
+    std::fs::write(&settings_path, r#"{"sandbox":{"enabled":true}}"#).unwrap();
+    let model = Arc::new(ScriptedModel::new(
+        (0..4)
+            .map(|_| text("The configured Bash command sandbox limits writes to the Folder."))
+            .collect(),
+    ));
+    let settings = UserSettings::in_root(&settings_root);
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: None,
+            environment: Some(Arc::new(
+                LocalEnvironment::with_shells(Arc::new(OwnTickhost::new()))
+                    .with_sandbox(settings.clone()),
+            )),
+            models: ChosenModels::new(model.clone()),
+        },
+        HarnessOptions {
+            settings: Some(Arc::new(settings)),
+            ..HarnessOptions::local(persisted_config())
+        },
+    )
+    .unwrap();
+    let chat = agent.create_chat(folder).await.unwrap();
+    turn(&agent, chat, "Check the configured sandbox.").await;
+    turn(&agent, chat, "Keep working.").await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let second_prompt = snapshot
+        .messages
+        .iter()
+        .position(|message| {
+            message.role == Role::User
+                && message.content.iter().any(
+                    |content| matches!(content, Content::Text { text } if text == "Keep working."),
+                )
+        })
+        .unwrap();
+    agent
+        .summarize_checkpoint(
+            chat,
+            DirectedSummaryRequest {
+                message_id: snapshot.message_ids[&second_prompt],
+                direction: SummaryDirection::UpToHere,
+                guidance: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    std::fs::write(&settings_path, r#"{"sandbox":{"enabled":false}}"#).unwrap();
+    turn(&agent, chat, "Continue after the sandbox was disabled.").await;
+
+    let requests = model.requests.lock().unwrap();
+    let last = requests.last().unwrap();
+    assert!(
+        last.messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|content| matches!(
+                content,
+                Content::Text { text } if text.contains("Earlier sandbox instructions no longer apply")
+            )),
+        "a summary may still carry the earlier guidance, so disabling must withdraw it"
+    );
+}
+
+#[tokio::test]
 async fn merged_input_uses_its_captured_view_source_for_subsequent_host_calls() {
     assert_merged_host_source(false).await;
 }
@@ -346,21 +860,16 @@ fn first_model_request_identifies_host_without_advertising_pane_display() {
             json!([]),
             "{case}: no Tick package is installed"
         );
-        for field in TICKLOOP_SKILL
-            .split("workspace_host.")
-            .skip(1)
-            .filter_map(|rest| {
-                rest.split(|character: char| {
-                    !(character.is_ascii_alphanumeric() || character == '_')
-                })
-                .next()
-            })
-        {
-            assert!(
-                state["workspace_host"].get(field).is_some(),
-                "{case}: the tickloop Skill names workspace_host.{field}"
-            );
-        }
+        assert_eq!(
+            state["workspace_host"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["name", "plugins", "tickhost"].into_iter().collect(),
+            "{case}: only actual host capabilities are reported"
+        );
         assert_eq!(
             state["workspace_host"]["tickhost"],
             if runs_ticks {
@@ -421,7 +930,7 @@ async fn workspace_host_request_probe() {
         .unwrap();
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
-    // The tickloop Skill is listed for the model to load, never injected on its own.
+    // Tick capabilities need no general Skill activation.
     assert!(snapshot.invoked_skills.is_empty());
     {
         let requests = model.requests.lock().unwrap();

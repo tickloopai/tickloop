@@ -66,14 +66,7 @@ fn discovers_builtin_user_and_nearest_project_skills_in_stable_order() {
 
     assert_eq!(
         names,
-        [
-            "loop",
-            "nearest",
-            "personal",
-            "root-skill",
-            "slides",
-            "tickloop"
-        ]
+        ["loop", "nearest", "personal", "root-skill", "slides"]
     );
     assert!(registry.warnings().is_empty());
     assert!(matches!(
@@ -92,17 +85,17 @@ fn builtin_name_is_reserved_and_a_broken_skill_only_adds_a_warning() {
     let user_skills = directory.path().join("skills");
     write_skill(
         &user_skills,
-        "tickloop",
-        "name: tickloop\ndescription: Replacement",
+        "slides",
+        "name: slides\ndescription: Replacement",
         "Replacement body",
     );
     write_skill(&user_skills, "broken", "name: Broken", "Broken body");
 
     let registry = SkillRegistry::discover(directory.path(), Some(directory.path()));
-    let expansion = registry.expand("tickloop", "", SkillCaller::User).unwrap();
+    let expansion = registry.expand("slides", "", SkillCaller::User).unwrap();
 
     assert!(matches!(expansion.source, SkillSource::BuiltIn));
-    assert!(expansion.content.contains("# Ticks\n\nA Tick is"));
+    assert!(expansion.content.contains("The user ran /slides"));
     assert_eq!(registry.warnings().len(), 2);
 }
 
@@ -219,8 +212,14 @@ async fn wait_for_completion(agent: &Agent, chat: uuid::Uuid) {
 #[tokio::test]
 async fn model_sees_metadata_then_receives_the_body_only_after_calling_skill() {
     let directory = tempfile::tempdir().unwrap();
+    write_skill(
+        &directory.path().join(".tickloop/skills"),
+        "guide",
+        "name: guide\ndescription: Inspect a workspace",
+        "Inspect the workspace before suggesting changes.",
+    );
     let model = Arc::new(ScriptedModel::new(vec![
-        call("skill-1", "Skill", json!({"skill": "tickloop"})),
+        call("skill-1", "Skill", json!({"skill": "guide"})),
         text("ready"),
     ]));
     let agent = agent_with_project_skills(directory.path(), model.clone());
@@ -244,17 +243,13 @@ async fn model_sees_metadata_then_receives_the_body_only_after_calling_skill() {
             .iter()
             .find(|tool| tool.name == "Skill")
             .unwrap();
-        assert!(skill_tool.description.contains("tickloop"));
+        assert!(skill_tool.description.contains("- guide [Project]"));
         let first = serde_json::to_string(&requests[0].messages).unwrap();
-        assert!(!first.contains(
-            "an installed multiplexer command or a repository name is not proof of the environment"
-        ));
+        assert!(!first.contains("Inspect the workspace before suggesting changes."));
         let second = serde_json::to_string(&requests[1].messages).unwrap();
-        assert!(second.contains(
-            "an installed multiplexer command or a repository name is not proof of the environment"
-        ));
-        assert!(second.contains("Launching skill: tickloop"));
-        let guidance = requests[1].messages.iter().find(|message| message.content.iter().any(|content| matches!(content, Content::Text { text } if text.contains("an installed multiplexer command or a repository name is not proof of the environment")))).unwrap();
+        assert!(second.contains("Inspect the workspace before suggesting changes."));
+        assert!(second.contains("Launching skill: guide"));
+        let guidance = requests[1].messages.iter().find(|message| message.content.iter().any(|content| matches!(content, Content::Text { text } if text.contains("Inspect the workspace before suggesting changes.")))).unwrap();
         assert_eq!(guidance.role, tickloop_harness::protocol::Role::User);
         assert!(
             serde_json::to_string(guidance)
@@ -265,7 +260,7 @@ async fn model_sees_metadata_then_receives_the_body_only_after_calling_skill() {
 
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.invoked_skills.len(), 1);
-    assert_eq!(snapshot.invoked_skills[0].name, "tickloop");
+    assert_eq!(snapshot.invoked_skills[0].name, "guide");
 }
 
 #[tokio::test]
@@ -424,6 +419,12 @@ async fn model_passes_skill_arguments_through_the_args_parameter() {
 #[tokio::test]
 async fn user_invocation_uses_the_same_expansion_and_records_the_slash_prompt() {
     let directory = tempfile::tempdir().unwrap();
+    write_skill(
+        &directory.path().join(".tickloop/skills"),
+        "guide",
+        "name: guide\ndescription: Inspect a workspace",
+        "Inspect the workspace before suggesting changes.",
+    );
     let model = Arc::new(ScriptedModel::new(vec![text("ready")]));
     let agent = agent_with_project_skills(directory.path(), model.clone());
     agent
@@ -433,33 +434,37 @@ async fn user_invocation_uses_the_same_expansion_and_records_the_slash_prompt() 
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
     agent
-        .invoke_skill(chat, "/tickloop", "show the current Workspace")
+        .invoke_skill(chat, "/guide", "show the current Workspace")
         .await
         .unwrap();
     wait_for_completion(&agent, chat.uuid()).await;
 
     let requests = model.requests.lock().unwrap();
     let messages = serde_json::to_string(&requests[0].messages).unwrap();
-    assert!(messages.contains(
-        "an installed multiplexer command or a repository name is not proof of the environment"
-    ));
-    assert!(messages.contains("/tickloop show the current Workspace"));
+    assert!(messages.contains("Inspect the workspace before suggesting changes."));
+    assert!(messages.contains("/guide show the current Workspace"));
     let [.., prompt, guidance] = requests[0].messages.as_slice() else {
         panic!("the request carries the prompt and the guidance it invoked");
     };
     assert!(matches!(
         prompt.content.as_slice(),
-        [Content::Text { text }] if text == "/tickloop show the current Workspace"
+        [Content::Text { text }] if text == "/guide show the current Workspace"
     ));
     assert!(matches!(
         guidance.content.as_slice(),
-        [Content::Text { text }] if text.trim_start_matches("<system-reminder>\n").starts_with("Reference guidance from tickloop")
+        [Content::Text { text }] if text.trim_start_matches("<system-reminder>\n").starts_with("Reference guidance from guide")
     ));
 }
 
 #[tokio::test]
 async fn invoked_skill_content_survives_compaction_and_transcript_restore() {
     let directory = tempfile::tempdir().unwrap();
+    write_skill(
+        &directory.path().join(".tickloop/skills"),
+        "guide",
+        "name: guide\ndescription: Inspect a workspace",
+        "Inspect the workspace before suggesting changes.",
+    );
     let state_root = directory.path().join("state");
     let model = Arc::new(ScriptedModel::new(vec![
         text("ready"),
@@ -472,7 +477,7 @@ async fn invoked_skill_content_survives_compaction_and_transcript_restore() {
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
-    agent.invoke_skill(chat, "tickloop", "").await.unwrap();
+    agent.invoke_skill(chat, "guide", "").await.unwrap();
     wait_for_completion(&agent, chat.uuid()).await;
     agent.compact(chat).await.unwrap();
     agent.shutdown().await;
@@ -487,10 +492,12 @@ async fn invoked_skill_content_survives_compaction_and_transcript_restore() {
     let snapshot = restored.resume_chat(chat).await.unwrap();
 
     assert_eq!(snapshot.invoked_skills.len(), 1);
-    assert_eq!(snapshot.invoked_skills[0].name, "tickloop");
-    assert!(snapshot.invoked_skills[0].content.contains(
-        "an installed multiplexer command or a repository name is not proof of the environment"
-    ));
+    assert_eq!(snapshot.invoked_skills[0].name, "guide");
+    assert!(
+        snapshot.invoked_skills[0]
+            .content
+            .contains("Inspect the workspace before suggesting changes.")
+    );
 }
 
 #[tokio::test]

@@ -49,6 +49,9 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 /// How often a running command's output size is published.
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(40);
+/// How long a stop waits for the command's exit once the stop is dispatched; a host that never
+/// reports the exit leaves the outcome unknown instead of holding the caller.
+const STOP_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(15);
 /// Size limit for a single task output file. Claude Code uses 5GB; per the decision in ticket 34
 /// Tickloop keeps 64 MiB, enforced by the Tickhost running the command.
 pub(crate) const MAX_COMMAND_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -949,17 +952,26 @@ impl Registry {
                 ),
             }));
         }
-        loop {
-            let update = updates.borrow().clone();
-            if update.result.is_some() {
-                return Ok(update.snapshot);
+        let ended = tokio::time::timeout(STOP_CONFIRMATION_TIMEOUT, async {
+            loop {
+                let update = updates.borrow().clone();
+                if update.result.is_some() {
+                    return Ok(update.snapshot);
+                }
+                if updates.changed().await.is_err() {
+                    return Err(ToolError::InvalidInput(
+                        "command status channel closed before a result".into(),
+                    ));
+                }
             }
-            if updates.changed().await.is_err() {
-                return Err(ToolError::InvalidInput(
-                    "command status channel closed before a result".into(),
-                ));
-            }
-        }
+        })
+        .await;
+        ended.unwrap_or_else(|_| {
+            Err(ToolError::Rejected(format!(
+                "Shell stop outcome unknown after dispatch: its exit was not confirmed within {}s; do not repeat the stop without inspecting the task",
+                STOP_CONFIRMATION_TIMEOUT.as_secs()
+            )))
+        })
     }
 
     pub(super) async fn stop(&self, id: Uuid) -> Result<CommandSnapshot, ToolError> {

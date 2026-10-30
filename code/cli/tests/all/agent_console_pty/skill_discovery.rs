@@ -88,9 +88,9 @@ async fn run_skill_completion(fixture: &PrivateFixture) {
             frame.contains("/canvas:frontend-design")
                 && frame.contains("/loop")
                 && frame.contains("/slides")
-                && frame.contains("/tickloop")
         })
         .await;
+    assert!(!grouped.contains("/tickloop"), "{grouped}");
     assert_eq!(
         grouped
             .lines()

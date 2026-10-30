@@ -8,7 +8,12 @@ use super::{
 };
 use async_trait::async_trait;
 use crossterm::event::KeyEvent;
-use std::{any::Any, path::Path, sync::Arc};
+use std::{
+    any::Any,
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use uuid::Uuid;
 
 pub struct TickDetailLine {
@@ -171,4 +176,85 @@ pub(super) async fn execute(
     context: TickActionContext<'_>,
 ) -> Result<(), String> {
     action.backend.execute(context).await
+}
+
+/// Monitor actions waiting on their hosts, which may never answer. They run beside the Console's
+/// loop so input and Agent events keep flowing, one at a time in the order the user gave them,
+/// since each acts on the state the one before it left. A Chat whose action waits behind another
+/// says so on its Monitor status line.
+pub(super) struct MonitorActionQueue {
+    agent: ConsoleExecution,
+    console: Console,
+    root: Option<PathBuf>,
+    running: tokio::task::JoinSet<Result<(), String>>,
+    running_chat: Option<Uuid>,
+    waiting: VecDeque<(Uuid, PreparedTickAction)>,
+}
+
+impl MonitorActionQueue {
+    pub(super) fn new(agent: ConsoleExecution, console: Console, root: Option<PathBuf>) -> Self {
+        Self {
+            agent,
+            console,
+            root,
+            running: tokio::task::JoinSet::new(),
+            running_chat: None,
+            waiting: VecDeque::new(),
+        }
+    }
+
+    pub(super) fn is_running(&self) -> bool {
+        !self.running.is_empty()
+    }
+
+    pub(super) fn submit(&mut self, chat: Uuid, action: PreparedTickAction) -> Result<(), String> {
+        self.waiting.push_back((chat, action));
+        self.start_next();
+        self.show_waiting(chat)
+    }
+
+    /// Waits for the running action and starts the next; an error, a panic included, comes with
+    /// its Chat.
+    pub(super) async fn finished(&mut self) -> Result<(), (Uuid, String)> {
+        let result = self.running.join_next().await;
+        let chat = self.running_chat.take();
+        if let Some(started) = self.start_next() {
+            self.show_waiting(started)
+                .map_err(|error| (started, error))?;
+        }
+        let outcome = match result {
+            Some(Ok(outcome)) => outcome,
+            Some(Err(error)) if error.is_panic() => Err(format!("Monitor action failed: {error}")),
+            _ => Ok(()),
+        };
+        match (chat, outcome) {
+            (Some(chat), Err(error)) => Err((chat, error)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Starts the next waiting action unless one runs, and returns its Chat.
+    fn start_next(&mut self) -> Option<Uuid> {
+        if self.is_running() {
+            return None;
+        }
+        let (chat, action) = self.waiting.pop_front()?;
+        let (agent, console, root) = (self.agent.clone(), self.console.clone(), self.root.clone());
+        self.running_chat = Some(chat);
+        self.running.spawn(async move {
+            let context = TickActionContext {
+                agent: &agent,
+                console: &console,
+                root: root.as_deref(),
+                chat,
+            };
+            execute(action, context).await
+        });
+        Some(chat)
+    }
+
+    fn show_waiting(&self, chat: Uuid) -> Result<(), String> {
+        let waiting = self.waiting.iter().any(|(waiting, _)| *waiting == chat);
+        self.console.set_monitor_action_waiting(chat, waiting)
+    }
 }
