@@ -5,8 +5,8 @@ use tickloop_harness_model::validate_model_for_resume_in_root;
 use tickloop_harness_protocol::OperationId;
 use tickloop_harness_protocol::projection;
 use tickloop_harness_protocol::{
-    ChatSnapshot, Content, LoopId, Message, OperationState, Role, RunId, ToolCallRecovery,
-    ToolResult,
+    ChatSnapshot, Content, LoopId, Message, OperationRecord, OperationState, Role, RunId,
+    ToolCallRecovery, ToolResult,
 };
 use tickloop_harness_tools::ASK_USER_QUESTION_TOOL_NAME;
 use tickloop_ids::IdContext;
@@ -227,15 +227,19 @@ fn interrupted_nested_calls(
     snapshot: &ChatSnapshot,
     parent: &projection::HistoryCall,
 ) -> Option<String> {
-    let lines = snapshot
+    let made = snapshot
         .operations
         .iter()
         .filter(|operation| {
             operation.parent_call_id.as_deref() == Some(parent.call_id.as_str())
                 && parent.run_id.is_none_or(|run| operation.run_id == run)
         })
-        .map(|operation| {
-            let outcome = match operation.state {
+        .collect::<Vec<_>>();
+    if made.is_empty() {
+        return None;
+    }
+    let describe = |operation: &OperationRecord| {
+        let outcome = match operation.state {
                 OperationState::Completed => "completed".to_owned(),
                 OperationState::Unknown | OperationState::Admitted => "outcome unknown; it may have taken effect, so inspect current state before repeating it".to_owned(),
                 OperationState::Proposed => "not executed".to_owned(),
@@ -250,16 +254,44 @@ fn interrupted_nested_calls(
                         .take(MAX_REASON_CHARACTERS)
                         .collect::<String>()
                 ),
-            };
-            format!("- {}: {outcome}", operation.name)
-        })
-        .collect::<Vec<_>>();
-    (!lines.is_empty()).then(|| {
-        format!(
-            "This call was interrupted before it returned, for example because the agent process exited, and it will not be rerun. The calls it made:\n{}",
-            lines.join("\n")
-        )
-    })
+        };
+        format!("- {}: {outcome}", operation.name)
+    };
+    // The batch makes its calls in order: each call shows how its latest attempt ended, and a
+    // call the batch never reached shows as not executed.
+    let batch = snapshot
+        .messages
+        .get(parent.message_index)
+        .and_then(|message| message.content.get(parent.content_index))
+        .and_then(|content| match content {
+            Content::ToolUse { input, .. } => input["calls"].as_array(),
+            _ => None,
+        });
+    let lines = match batch {
+        Some(calls) => calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                made.iter()
+                    .rev()
+                    .find(|operation| operation.parent_call_index == Some(index))
+                    .map_or_else(
+                        || {
+                            format!(
+                                "- {}: not executed",
+                                call["name"].as_str().unwrap_or("call")
+                            )
+                        },
+                        |operation| describe(operation),
+                    )
+            })
+            .collect::<Vec<_>>(),
+        None => made.into_iter().map(describe).collect(),
+    };
+    Some(format!(
+        "This call was interrupted before it returned, for example because the agent process exited, and it will not be rerun. The calls it made:\n{}",
+        lines.join("\n")
+    ))
 }
 
 fn interrupted_before_admission() -> ToolResult {

@@ -453,6 +453,10 @@ struct ChatBookkeeping {
     /// recorded with values this version does not know, kept as written for its entry.
     #[serde(default)]
     later_provenance: BTreeMap<usize, persistence::LaterProvenance>,
+    /// What each call of a batch that has not returned ended with, which a load restores from
+    /// the Transcript: the batch goes on after its Run waited without making them again.
+    #[serde(skip)]
+    nested_outcomes: nested_calls::RecordedNestedCalls,
     /// Project partition (normalized working directory) owning each persistent rule in the rule
     /// set; deletions and modifications are written back to that partition.
     persistent_rule_projects: BTreeMap<Uuid, PathBuf>,
@@ -2267,16 +2271,11 @@ impl Agent {
         })
     }
 
-    /// The prompt policy a model tool call's approval is decided under. Durable Approval holds
-    /// only a call's own approval: a call made inside another call cannot wait durably, so its
-    /// approval is denied as on a host that denies whatever would prompt.
+    /// The prompt policy a model tool call's approval is decided under, a call an
+    /// `ExecuteTools` batch makes included: the batch makes its calls one at a time, so one that
+    /// waits durably suspends the whole Run at its place in the batch.
     fn tool_prompt_policy(&self) -> PromptPolicy {
-        match self.inner.host_options.prompt_policy {
-            PromptPolicy::DurableApproval if nested_calls::is_nested() => {
-                PromptPolicy::DenyOnPrompt
-            }
-            policy => policy,
-        }
+        self.inner.host_options.prompt_policy
     }
 
     /// The prompt policy of every prompt other than a model tool call's approval.
@@ -4844,15 +4843,20 @@ impl Agent {
         target: Option<String>,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
-        let nested = nested_calls::is_nested();
-        if !nested {
-            tool_batch::serialize_permission_prompt(&cancel).await?;
-        }
         let model_receipt = request.execution.run_id().map(|run_id| Receipt {
             chat_id,
             loop_id: request.loop_id,
             run_id,
         });
+        let waits_durably = model_receipt.is_some()
+            && self.tool_prompt_policy() == PromptPolicy::DurableApproval
+            && matches!(request.execution, PermissionExecution::ToolCall { .. });
+        // A call inside a batch waits alone, unless it waits durably: its Run then waits for it
+        // as for one of its own calls.
+        let waits_alone = nested_calls::is_nested() && !waits_durably;
+        if !waits_alone {
+            tool_batch::serialize_permission_prompt(&cancel).await?;
+        }
         let (sender, receiver) = oneshot::channel();
         let owner = PermissionOwner::new(chat_id.into(), request.loop_id.into())
             .map_err(|error| error.to_string())?;
@@ -4872,7 +4876,7 @@ impl Agent {
                     .run_cancel(receipt.run_id)
                     .cloned()
                     .ok_or("permission Run is unavailable")?;
-                if !nested {
+                if !waits_alone {
                     self.park_run(chat, receipt, run_cancel)
                         .map_err(|error| error.to_string())?;
                 }
@@ -4886,11 +4890,7 @@ impl Agent {
             chat.denial_window.remember_human_prompt(&request);
             chat.snapshot.permissions.push(request.clone());
             let release = match &model_receipt {
-                Some(receipt)
-                    if !nested
-                        && self.tool_prompt_policy() == PromptPolicy::DurableApproval
-                        && matches!(request.execution, PermissionExecution::ToolCall { .. }) =>
-                {
+                Some(receipt) if waits_durably => {
                     let release = self.suspend_for_permission(chat, receipt, &request, target);
                     self.save_now(&chat.snapshot);
                     release
@@ -4919,7 +4919,7 @@ impl Agent {
             );
             release
         };
-        if !nested
+        if !waits_alone
             && model_receipt.is_some()
             && let Some(next) = self
                 .next_run(chat_id)
@@ -4931,7 +4931,7 @@ impl Agent {
         let answer = tokio::select! {biased; _ = release.cancelled() => return Err(suspension::RUN_RELEASED.into()), _ = nested_calls::stopped() => Err("Nested execution stopped after Auto rejection; call not dispatched".into()), _ = cancel.cancelled() => Err("permission request cancelled".into()), answer = receiver => answer.map_err(|_| "permission request expired".to_owned())};
         let resumed = if answer.is_ok() {
             if let Some(receipt) = &model_receipt
-                && !nested
+                && !waits_alone
             {
                 self.resume_parked_run(receipt, cancel.clone()).await
             } else {
@@ -4956,7 +4956,7 @@ impl Agent {
             chat.snapshot
                 .permissions
                 .retain(|permission| permission.id != request.id);
-            if nested
+            if waits_alone
                 && chat.snapshot.permissions.is_empty()
                 && chat.active_run == model_receipt.as_ref().map(|receipt| receipt.run_id)
             {

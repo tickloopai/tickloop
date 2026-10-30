@@ -1073,6 +1073,9 @@ impl Agent {
         };
         let mut chats = self.inner.chats.lock().await;
         if let Some(chat) = chats.get_mut(&receipt.chat_id)
+            // A batch's call whose Run was released while it waited leaves its record alone.
+            && !(crate::nested_calls::is_nested()
+                && Self::release_of(chat, receipt.run_id).is_cancelled())
             && let Some(operation) = chat
                 .snapshot
                 .operations
@@ -1729,7 +1732,9 @@ impl Agent {
                             .map(|call| call.approval_facts().clone()),
                         cancel.clone(),
                         true,
-                        host_permission == Some(crate::host_tools::HostToolPermission::ThirdParty),
+                        prepared_host_call
+                            .as_ref()
+                            .is_some_and(|call| call.is_remote()),
                     )
                     .await
                     .map_err(|error| error.to_string())?;

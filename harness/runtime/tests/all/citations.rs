@@ -21,8 +21,10 @@ use tickloop_harness_transcript::Line;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
-struct WebServer {
-    url: String,
+pub(crate) struct WebServer {
+    pub(crate) url: String,
+    /// How many searches the server answered.
+    pub(crate) searches: Arc<std::sync::atomic::AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -33,9 +35,11 @@ impl Drop for WebServer {
 }
 
 impl WebServer {
-    async fn new(results: Vec<Value>) -> Self {
+    pub(crate) async fn new(results: Vec<Value>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = answered.clone();
         let task = tokio::spawn(async move {
             let mut searches = 0;
             while let Ok((mut socket, _)) = listener.accept().await {
@@ -52,6 +56,7 @@ impl WebServer {
                     let body =
                         json!({"results": results[searches.min(results.len() - 1)]}).to_string();
                     searches += 1;
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     ("application/json", body)
                 } else {
                     (
@@ -68,12 +73,13 @@ impl WebServer {
         });
         Self {
             url: format!("http://{address}"),
+            searches: answered,
             task,
         }
     }
 }
 
-fn hit(path: &str) -> Value {
+pub(crate) fn hit(path: &str) -> Value {
     json!({"url": format!("https://evidence.test/{path}"), "title": format!("Source {path}"), "content": format!("Evidence for {path}")})
 }
 

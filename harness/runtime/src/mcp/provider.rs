@@ -339,17 +339,17 @@ impl HostToolProvider for McpToolProvider {
             .await?;
         let auto_review_unruled = *call.entry.unruled.read().unwrap()
             == tickloop_harness_protocol::mcp::McpUnruled::AutoReview;
-        // What the server says of the tool is its own declaration: data for a reviewer, never
-        // evidence of what the call does.
+        // The reviewer learns which server and tool the call reaches, never what the server
+        // writes of its tool: a description or annotation could argue for its own approval.
         let facts = tickloop_harness_protocol::PreparedApprovalFacts {
             normalized_input: input.clone(),
             external_declaration: Some(serde_json::json!({
                 "mcp_server": call.entry.config.name,
-                "tool": *call.tool.definition,
-                "annotations": *call.tool.annotations,
+                "tool": call.tool.definition.name,
             })),
             ..Default::default()
         };
+        let is_remote = matches!(call.entry.config.transport, McpTransport::Http { .. });
         Ok(PreparedHostCall::new(
             name.into(),
             input.clone(),
@@ -360,6 +360,7 @@ impl HostToolProvider for McpToolProvider {
         .with_mcp_server(call.entry.config.name.clone())
         .with_target(call.target.clone())
         .with_auto_review_unruled(auto_review_unruled)
+        .with_remote(is_remote)
         .with_approval_facts(facts)
         .with_payload(call))
     }

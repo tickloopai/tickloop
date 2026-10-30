@@ -1212,6 +1212,10 @@ pub enum WaitKind {
         /// call prepared again reaches the same, and asks again otherwise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<String>,
+        /// The call's place in its `ExecuteTools` batch when it was made inside one; the wait's
+        /// resume point then names that batch call, which goes on at this call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nested_index: Option<usize>,
     },
     /// A foreground `Subagent` call waits for its child's run to end and report.
     #[serde(rename_all = "camelCase")]
@@ -1842,6 +1846,7 @@ mod tests {
                 request: Box::new(request),
                 operation_id: Uuid::nil(),
                 target: Some("target".into()),
+                nested_index: None,
             },
             resume: ResumePoint::InBatch {
                 assistant_message: Uuid::nil(),
@@ -1893,4 +1898,25 @@ mod tests {
 pub struct NestedCallEntry {
     pub chat_id: Uuid,
     pub operation: tickloop_harness_protocol::OperationRecord,
+    /// How the call ended for its batch, once it did. A batch that goes on after its Run waited
+    /// takes this outcome instead of making the call again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<NestedCallStatus>,
+    /// The images the call returned with its outcome, which the batch returns to the model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<tickloop_harness_protocol::Image>,
+    /// The numbered sources the call's result cites, which the batch's result cites in turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<tickloop_harness_protocol::CitationSource>,
+}
+
+/// How a call made inside an `ExecuteTools` batch ended, as the batch's result reports it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NestedCallStatus {
+    Completed,
+    Error,
+    Denied,
+    NotExecuted,
+    Unknown,
 }

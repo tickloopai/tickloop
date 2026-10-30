@@ -592,8 +592,9 @@ impl Lifecycle {
     }
 
     /// The wait `id`, which no call's result ends, is over: its answer goes on, in the same
-    /// change. An allowed call's wait ends this way just before the call runs. `false` when the
-    /// wait is neither open nor allowed.
+    /// change. An allowed call's wait ends this way just before the call runs, and a denied
+    /// call's inside a batch once the batch recorded the denial. `false` when the wait already
+    /// ended.
     pub(crate) fn end_wait(&mut self, id: Uuid) -> bool {
         let Some(response_id) = self
             .waits
@@ -601,7 +602,7 @@ impl Lifecycle {
             .filter(|wait| {
                 matches!(
                     wait.record.state,
-                    WaitState::Open | WaitState::Allowed { .. }
+                    WaitState::Open | WaitState::Allowed { .. } | WaitState::Resolved { .. }
                 )
             })
             .map(|wait| wait.record.response_id)

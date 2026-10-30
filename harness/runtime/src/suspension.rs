@@ -13,7 +13,7 @@ use tickloop_harness_protocol::{
 };
 use tickloop_harness_tools::ASK_USER_QUESTION_TOOL_NAME;
 use tickloop_harness_transcript::{
-    Line, ModelVisibleResult, ResumePoint, WaitEntry, WaitKind, WaitState,
+    Line, ModelVisibleResult, NestedCallStatus, ResumePoint, WaitEntry, WaitKind, WaitState,
 };
 use tokio::sync::{Notify, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::{
     Agent, Chat, ParkedRun, PendingApproval, PermissionAnswer, RunStart, WaitHosting,
-    interaction::PendingReply, lifecycle::Lifecycle, run_supervision,
+    interaction::PendingReply, lifecycle::Lifecycle, nested_calls, run_supervision,
     session_permissions::PermissionOwner, tool_batch,
 };
 
@@ -163,7 +163,12 @@ impl Agent {
             .rev()
             .find(|operation| operation.run_id == receipt.run_id && operation.call_id == call_id)
             .map(|operation| operation.id);
-        let assistant_message = batch_message_of(&chat.snapshot, receipt.run_id, &call_id);
+        // A call inside a batch waits at its place in the batch call, which goes on from there.
+        let (batch_call, nested_index) = match nested_calls::parent_call_id() {
+            Some(parent) => (parent, nested_calls::parent_call_index()),
+            None => (call_id, None),
+        };
+        let assistant_message = batch_message_of(&chat.snapshot, receipt.run_id, &batch_call);
         if let (Some(operation_id), Some(assistant_message)) = (operation_id, assistant_message) {
             chat.bookkeeping.lifecycle.suspend(
                 receipt,
@@ -171,10 +176,11 @@ impl Agent {
                     request: Box::new(request.clone()),
                     operation_id,
                     target,
+                    nested_index,
                 },
                 ResumePoint::InBatch {
                     assistant_message,
-                    call_id,
+                    call_id: batch_call,
                 },
             );
         }
@@ -1037,10 +1043,9 @@ impl Agent {
             && let WaitKind::Permission {
                 request, target, ..
             } = &wait.kind
-            && let Some(call_id) = wait.resume.call_id()
         {
             chat.permission_grants.insert(
-                (receipt.run_id, call_id.to_owned()),
+                (receipt.run_id, request.execution.call_key()),
                 PermissionGrant {
                     request: (**request).clone(),
                     target: target.clone(),
@@ -1054,6 +1059,28 @@ impl Agent {
                 at: wait.resume,
                 result: None,
             });
+        }
+        if let WaitKind::Permission {
+            request,
+            nested_index: Some(index),
+            ..
+        } = &wait.kind
+            && let Some(batch_call) = wait.resume.call_id()
+        {
+            let (start, is_denied) = self
+                .nested_permission_start(chat, &wait, request, batch_call, *index, waited)
+                .await;
+            drop(chats);
+            // As an allowed call runs only once its wait's end is in the store, the batch goes
+            // on past a denied call only once the denial is.
+            if is_denied {
+                self.commit_transcripts(&[receipt.chat_id])
+                    .await
+                    .map_err(|error| {
+                        format!("{}: {error}", nested_calls::DENIED_CALL_UNRECORDED)
+                    })?;
+            }
+            return Ok(start);
         }
         let result = match (waited, wait.state) {
             // As the asking Run's own: an answer the user gave reaches the chain even when the
@@ -1092,6 +1119,77 @@ impl Agent {
             at: wait.resume,
             result: Some(result),
         })
+    }
+}
+
+impl Agent {
+    /// Where a rebuilt Run goes on after its batch's call `index` waited for a person, unless
+    /// the person allowed it, and whether the person denied the call: a denial ends the call
+    /// denied and the batch goes on from the next call; a stopped or expired wait ends the call
+    /// not executed, and the batch returns what its calls ended with.
+    async fn nested_permission_start(
+        &self,
+        chat: &mut Chat,
+        wait: &WaitEntry,
+        request: &PermissionRequest,
+        batch_call: &str,
+        index: usize,
+        waited: Result<(), String>,
+    ) -> (RunStart, bool) {
+        if let (Ok(()), WaitState::Resolved { result, .. }) = (&waited, &wait.state) {
+            self.record_waited_nested_call(
+                chat,
+                request,
+                batch_call,
+                index,
+                NestedCallStatus::Denied,
+                result.tool.clone(),
+            );
+            chat.bookkeeping.lifecycle.end_wait(wait.wait_id);
+            self.save_now(&chat.snapshot);
+            let start = RunStart::Resume {
+                at: wait.resume.clone(),
+                result: None,
+            };
+            return (start, true);
+        }
+        chat.snapshot
+            .permissions
+            .retain(|permission| permission.id != wait.wait_id);
+        self.inner.approvals.lock().await.remove(&wait.wait_id);
+        self.save(&chat.snapshot);
+        let error = waited
+            .err()
+            .unwrap_or_else(|| PERMISSION_EXPIRED.to_owned());
+        self.record_waited_nested_call(
+            chat,
+            request,
+            batch_call,
+            index,
+            NestedCallStatus::NotExecuted,
+            ToolResult {
+                content: error.clone(),
+                is_error: true,
+                output_ref: None,
+            },
+        );
+        let tool = nested_calls::stopped_batch_result(
+            &chat.bookkeeping.nested_outcomes,
+            wait.run_id.into(),
+            batch_call,
+            &request_input(&chat.snapshot, wait).unwrap_or_default(),
+            index,
+            &error,
+        );
+        let start = RunStart::Resume {
+            at: wait.resume.clone(),
+            result: Some(ModelVisibleResult {
+                content: tool.content.clone().into(),
+                tool,
+                ends_run: false,
+            }),
+        };
+        (start, false)
     }
 }
 

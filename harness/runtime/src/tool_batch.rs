@@ -835,7 +835,7 @@ fn append_call_result(
     true
 }
 
-fn has_result_on_chain(snapshot: &ChatSnapshot, run_id: RunId, call_id: &str) -> bool {
+pub(crate) fn has_result_on_chain(snapshot: &ChatSnapshot, run_id: RunId, call_id: &str) -> bool {
     snapshot
         .messages
         .iter()

@@ -59,6 +59,9 @@ pub struct PreparedHostCall {
     /// Under Durable Approval, the call goes to Auto review before a person when no rule decides
     /// it, as its server's host chose.
     auto_review_unruled: bool,
+    /// The call reaches only a remote service, such as an MCP server over HTTP, and touches no
+    /// local file: Auto review needs no Folder for it.
+    is_remote: bool,
     approval_facts: tickloop_harness_protocol::PreparedApprovalFacts,
     local_read: Option<(tickloop_harness_tools::PreparedTool, bool)>,
 }
@@ -99,6 +102,7 @@ impl PreparedHostCall {
             mcp_server: None,
             target: None,
             auto_review_unruled: false,
+            is_remote: false,
             local_read: None,
         }
     }
@@ -128,6 +132,15 @@ impl PreparedHostCall {
 
     pub(crate) fn auto_reviews_unruled(&self) -> bool {
         self.auto_review_unruled
+    }
+
+    pub(crate) fn with_remote(mut self, is_remote: bool) -> Self {
+        self.is_remote = is_remote;
+        self
+    }
+
+    pub(crate) fn is_remote(&self) -> bool {
+        self.is_remote
     }
 
     pub fn with_payload<T: Any + Send + Sync>(mut self, payload: T) -> Self {
