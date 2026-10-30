@@ -629,6 +629,7 @@ fn sse_stream(
     SseStream::from_bytes_stream(stream)
         .map(move |event| {
             event.and_then(|mut event| {
+                event.data = event.data.filter(|data| !data.is_empty());
                 if let Some(redact) = &redactor {
                     if let Some(data) = event.data.take() {
                         event.data = Some(
@@ -891,6 +892,148 @@ mod tests {
     };
 
     use super::*;
+
+    async fn event_stream_response(body: &str) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(stream.read(&mut bytes).await.unwrap() > 0);
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let response = reqwest::Client::new().get(endpoint).send().await.unwrap();
+        server.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn empty_sse_data_preserves_metadata_and_the_following_message() {
+        for newline in ["\n", "\r\n"] {
+            for data in ["data:", "data: ", ""] {
+                for redacted in [false, true] {
+                    let data = if data.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{data}{newline}")
+                    };
+                    let body = format!(
+                        "{data}id: secret{newline}event: secret{newline}retry: 3000{newline}{newline}data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"tools\":[],\"text\":\"secret\"}}}}{newline}{newline}"
+                    );
+                    let directory_requests = DirectoryRequests::default();
+                    let request_id = rmcp::model::RequestId::Number(1);
+                    directory_requests
+                        .lock()
+                        .unwrap()
+                        .insert(request_id.clone(), tokio::time::Instant::now());
+                    let directory_redacted = Arc::new(AtomicBool::new(false));
+                    let observed = directory_redacted.clone();
+                    let redactor: Option<ResponseRedactor> = redacted.then(|| {
+                        Arc::new(move |value: &mut Value, part| {
+                            if matches!(part, ResponsePart::ToolDirectory) {
+                                observed.store(true, Ordering::SeqCst);
+                            }
+                            if value.as_str() == Some("secret") {
+                                *value = Value::String("[redacted]".into());
+                            } else if let Some(text) = value.get_mut("text") {
+                                *text = Value::String("[redacted]".into());
+                            }
+                        }) as ResponseRedactor
+                    });
+                    let mut events = sse_stream(
+                        event_stream_response(&body).await,
+                        MAX_JSON_BYTES,
+                        redactor,
+                        directory_requests.clone(),
+                        None,
+                    );
+                    let priming = events.next().await.unwrap().unwrap();
+                    assert_eq!(priming.data, None);
+                    let expected = if redacted { "[redacted]" } else { "secret" };
+                    assert_eq!(priming.id.as_deref(), Some(expected));
+                    assert_eq!(priming.event.as_deref(), Some(expected));
+                    assert_eq!(priming.retry, Some(3000));
+                    assert!(directory_requests.lock().unwrap().contains_key(&request_id));
+                    let response = events.next().await.unwrap().unwrap();
+                    let message: Value =
+                        serde_json::from_str(response.data.as_deref().unwrap()).unwrap();
+                    assert_eq!(message["id"], 1);
+                    assert_eq!(message["result"]["tools"], serde_json::json!([]));
+                    assert_eq!(message["result"]["text"], expected);
+                    assert_eq!(directory_redacted.load(Ordering::SeqCst), redacted);
+                    assert_eq!(directory_requests.lock().unwrap().is_empty(), redacted);
+                    assert!(events.next().await.is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nonempty_sse_data_keeps_existing_validation() {
+        for (body, payload) in [
+            ("data: not-json\n\n", "not-json"),
+            ("data:  \n\n", " "),
+            ("data:\ndata:\n\n", "\n"),
+        ] {
+            for redacted in [false, true] {
+                let redactor: Option<ResponseRedactor> =
+                    redacted.then(|| Arc::new(|_: &mut Value, _| {}) as ResponseRedactor);
+                let mut events = sse_stream(
+                    event_stream_response(body).await,
+                    MAX_JSON_BYTES,
+                    redactor,
+                    DirectoryRequests::default(),
+                    None,
+                );
+                let event = events.next().await.unwrap();
+                if redacted {
+                    assert_eq!(
+                        event.unwrap_err().to_string(),
+                        "body error: invalid MCP event response"
+                    );
+                } else {
+                    assert_eq!(event.unwrap().data.as_deref(), Some(payload));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_sse_data_alone_does_not_complete_initialization() {
+        let events = sse_stream(
+            event_stream_response("data: \nid: 0\nretry: 3000\n\n").await,
+            MAX_JSON_BYTES,
+            Some(Arc::new(|_, _| {})),
+            DirectoryRequests::default(),
+            None,
+        );
+        let result = StreamableHttpPostResponse::Sse(events, None)
+            .expect_initialized::<McpHttpError>()
+            .await;
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::UnexpectedServerResponse(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_sse_data_still_counts_toward_event_size_limits() {
+        let mut events = sse_stream(
+            event_stream_response("data: \nid: 0\nretry: 3000\n\n").await,
+            8,
+            Some(Arc::new(|_, _| {})),
+            DirectoryRequests::default(),
+            None,
+        );
+        assert_eq!(
+            events.next().await.unwrap().unwrap_err().to_string(),
+            "body error: MCP SSE event too large"
+        );
+    }
 
     #[tokio::test]
     async fn bearer_request_does_not_follow_a_cross_origin_redirect() {
