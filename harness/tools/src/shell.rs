@@ -17,8 +17,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    DEFAULT_OUTPUT_BYTES, Operation, ToolDefinition, ToolError, io_error, open_existing,
-    read::semantic_integer, write::semantic_boolean,
+    DEFAULT_OUTPUT_BYTES, Operation, ToolDefinition, ToolError,
+    input::{given_text, parse_input, semantic_boolean, semantic_integer},
+    io_error, open_existing,
 };
 use tickloop_harness_base::private_fs::PrivateDirectory;
 
@@ -76,6 +77,7 @@ pub(super) struct ShellInput {
         deserialize_with = "semantic_boolean"
     )]
     dangerously_disable_sandbox: bool,
+    #[serde(default, deserialize_with = "given_text")]
     cwd: Option<String>,
     /// Internal directories whose files shell commands may read without approval.
     #[serde(skip)]
@@ -290,16 +292,18 @@ pub(super) fn definition() -> ToolDefinition {
 }
 
 pub(super) fn prepare_input(input: &Value) -> Result<(String, Operation, Value), ToolError> {
-    let parsed: ShellInput = serde_json::from_value(input.clone())
-        .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let parsed: ShellInput = parse_input(input)?;
     if parsed.command.trim().is_empty() || parsed.command.contains('\0') {
         return Err(ToolError::InvalidInput(
             "command cannot be empty or contain NUL".into(),
         ));
     }
     let mut normalized_input = input.clone();
-    if let Some(timeout) = normalized_input.get_mut("timeout") {
-        *timeout = json!(parsed.timeout);
+    if let Some(fields) = normalized_input.as_object_mut() {
+        match parsed.timeout {
+            Some(timeout) => fields.insert("timeout".into(), json!(timeout)),
+            None => fields.remove("timeout"),
+        };
     }
     if let Some(run_in_background) = normalized_input.get_mut("run_in_background") {
         *run_in_background = json!(parsed.run_in_background);

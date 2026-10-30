@@ -3436,3 +3436,98 @@ async fn model_requests_and_tick_artifact_mcp_calls_reuse_third_party_catalogs()
     assert_eq!(agent.mcp_performance_counts(), before);
     agent.shutdown().await;
 }
+
+/// An MCP tool's optional arguments left `null` or `""` where its schema cannot take them are
+/// not sent; a refused argument is named with why, and never dispatched.
+#[tokio::test]
+async fn mcp_calls_drop_unset_optional_arguments_and_name_refused_ones() {
+    use tickloop_harness_protocol::{EventKind, ExecutionMode};
+    use tickloop_harness_runtime::{Agent, mcp::McpToolProvider};
+    use tickloop_harness_test_support::{ScriptedModel, call, config, text};
+
+    let server = McpService::start().await;
+    server.set_tools(json!([{
+        "name":"search",
+        "inputSchema":{
+            "type":"object",
+            "properties":{
+                "query":{"type":"string"},
+                "limit":{"type":"integer"},
+                "mode":{"type":"string","enum":["fast","full"]},
+                "note":{"type":"string"}
+            },
+            "required":["query"],
+            "additionalProperties":false
+        }
+    }]));
+    server.set_result(json!({"content":[{"type":"text","text":"SEARCHED"}]}));
+    let configuration = http_config("schema", &server);
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections.reconcile(vec![configuration.clone()]).await;
+    wait_for_state(&connections, "schema", McpServerState::Connected).await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "refused",
+            "mcp__schema__search",
+            json!({"query":"q","limit":"ten"}),
+        ),
+        call(
+            "filled",
+            "mcp__schema__search",
+            json!({"query":"q","limit":null,"mode":"","note":""}),
+        ),
+        text("done"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_host_tools(Arc::new(McpToolProvider::new(
+            connections,
+            Arc::new(move || vec![configuration.clone()]),
+        )))
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Search once".into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap().kind {
+                EventKind::PermissionRequested { request } => {
+                    assert_eq!(request.input, json!({"query":"q","note":""}));
+                    agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    agent.shutdown().await;
+    assert_eq!(server.calls().len(), 1);
+    assert_eq!(
+        server.calls()[0]["params"]["arguments"],
+        json!({"query":"q","note":""})
+    );
+    let requests = model.requests.lock().unwrap();
+    let final_messages = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+    assert!(final_messages.contains("SEARCHED"));
+    assert!(
+        final_messages.contains(
+            r#"invalid mcp__schema__search input at /limit: \"ten\" is not of type \"integer\""#
+        ),
+        "{final_messages}"
+    );
+}

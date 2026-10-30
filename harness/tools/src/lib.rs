@@ -21,6 +21,7 @@ use tickloop_harness_protocol::{
 };
 
 pub mod file_change;
+mod input;
 pub mod permissions;
 mod persisted_output;
 pub use persisted_output::{

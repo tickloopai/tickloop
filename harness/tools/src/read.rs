@@ -11,11 +11,13 @@ use std::{
     time::SystemTime,
 };
 
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    FileOutcome, Operation, ToolDefinition, ToolError, format_file_size, io_error, open_existing,
+    FileOutcome, Operation, ToolDefinition, ToolError, format_file_size,
+    input::{parse_input, semantic_integer},
+    io_error, open_existing,
     shell::BASH_TOOL_NAME,
 };
 use tickloop_harness_base::image;
@@ -105,8 +107,7 @@ pub(super) fn prepare_input(
         #[serde(default, deserialize_with = "semantic_integer")]
         limit: Option<usize>,
     }
-    let parsed: ReadInput = serde_json::from_value(input.clone())
-        .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let parsed: ReadInput = parse_input(input)?;
     if parsed.limit == Some(0) {
         return Err(ToolError::InvalidInput(
             "limit must be a positive number of lines".into(),
@@ -127,24 +128,6 @@ pub(super) fn prepare_input(
         }),
         normalized_input,
     ))
-}
-
-/// Claude Code `semanticNumber`: models occasionally quote numbers, so digit strings count too.
-pub(super) fn semantic_integer<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<usize>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum SemanticInteger {
-        Number(usize),
-        Text(String),
-    }
-    match SemanticInteger::deserialize(deserializer)? {
-        SemanticInteger::Number(value) => Ok(Some(value)),
-        SemanticInteger::Text(text) => text.parse().map(Some).map_err(|_| {
-            D::Error::custom(format!("expected a non-negative integer, found {text:?}"))
-        }),
-    }
 }
 
 /// Reads text as numbered lines, or an image for the model to view when `accepts_images`.

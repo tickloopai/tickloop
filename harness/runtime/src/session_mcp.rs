@@ -1086,7 +1086,7 @@ impl HostToolProvider for SessionMcpProvider {
             schema_validator(schema)
                 .map_err(|_| "invalid session MCP schema")?
                 .validate(input)
-                .map_err(|_| "invalid session MCP input".into())
+                .map_err(|error| crate::tool_input::schema_refusal(name, &error))
         } else {
             Err(UNAVAILABLE.into())
         }

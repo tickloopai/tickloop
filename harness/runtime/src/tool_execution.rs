@@ -712,7 +712,14 @@ pub(crate) fn validate_schema(schema: &Value, value: &Value, location: &str) -> 
     if let Some(choices) = schema.get("enum").and_then(Value::as_array)
         && !choices.contains(value)
     {
-        return Err(format!("{location} has an invalid value"));
+        let choices = choices
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "{location} has an invalid value; expected one of {choices}"
+        ));
     }
     if let Some(types) = schema.get("type") {
         let matches = |name: &str| match name {
@@ -1196,6 +1203,35 @@ impl Agent {
                 .is_some_and(|tool| matches!(tool.route, ToolRoute::SharedTask))
         {
             shared_tasks::prepared_update_input(input)
+        } else {
+            input
+        };
+        let input = match registration.as_ref().map(|tool| &tool.route) {
+            Some(ToolRoute::Goal) if name == crate::goal::tools::UPDATE_GOAL_TOOL_NAME => {
+                crate::goal::tools::prepared_update_input(input)
+            }
+            Some(ToolRoute::Host(_) | ToolRoute::TickSubscription)
+                if name == crate::tick_tools::TICK_MANAGE =>
+            {
+                crate::tick_tools::prepared_manage_input(input)
+            }
+            _ => input,
+        };
+        let input = match &registration {
+            Some(registered) if registered.is_host_or_local() => {
+                crate::tool_input::without_unset_optional_fields(
+                    &registered.definition.input_schema,
+                    input,
+                )
+            }
+            _ => input,
+        };
+        let input = if name == crate::tick_tools::TICK_CALL
+            && registration
+                .as_ref()
+                .is_some_and(|tool| matches!(tool.route, ToolRoute::Host(_)))
+        {
+            crate::tick_tools::prepared_call_input(input)
         } else {
             input
         };

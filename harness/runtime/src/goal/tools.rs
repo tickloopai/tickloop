@@ -80,11 +80,26 @@ Set status `blocked`, with the blocking condition as reason, only when the same 
 You cannot pause, resume, edit, clear, or budget-limit a goal; the user and the host control those.".into(),
             input_schema: json!({"type":"object","properties":{
                 "status":{"type":"string","enum":["complete","blocked"]},
-                "evidence":{"type":"string","minLength":1,"description":"Required with `complete`: requirement-by-requirement evidence from this conversation."},
-                "reason":{"type":"string","minLength":1,"description":"Required with `blocked`: the blocking condition and what would unblock it."}
+                "evidence":{"type":"string","minLength":1,"description":"Required with `complete`: requirement-by-requirement evidence from this conversation. Ignored with `blocked`."},
+                "reason":{"type":"string","minLength":1,"description":"Required with `blocked`: the blocking condition and what would unblock it. Ignored with `complete`."}
             },"required":["status"],"additionalProperties":false}),
         },
     ]
+}
+
+/// UpdateGoal `input` as it is prepared, approved, executed and recorded: models fill the flat
+/// schema's field that the reported status does not take, and that field is dropped whatever it
+/// holds. Input without a known status is left to the strict parse.
+pub(crate) fn prepared_update_input(mut input: Value) -> Value {
+    let ignored = match input.get("status").and_then(Value::as_str) {
+        Some("complete") => "reason",
+        Some("blocked") => "evidence",
+        _ => return input,
+    };
+    if let Some(fields) = input.as_object_mut() {
+        fields.remove(ignored);
+    }
+    input
 }
 
 pub(crate) fn parse_get_goal(input: &Value) -> Result<(), String> {
@@ -121,7 +136,7 @@ pub(crate) fn parse_create_goal(input: &Value) -> Result<NewGoal, String> {
 }
 
 pub(crate) fn parse_update_goal(input: &Value) -> Result<GoalReport, String> {
-    let input = UpdateGoalInput::deserialize(input)
+    let input = UpdateGoalInput::deserialize(prepared_update_input(input.clone()))
         .map_err(|error| invalid(UPDATE_GOAL_TOOL_NAME, error))?;
     let text = |field: Option<String>, name: &str, status: &str| match field {
         Some(text) if !text.trim().is_empty() => Ok(text.trim().to_owned()),
@@ -130,18 +145,10 @@ pub(crate) fn parse_update_goal(input: &Value) -> Result<GoalReport, String> {
             format!("status `{status}` requires {name}"),
         )),
     };
-    let unexpected = |name: &str, status: &str| {
-        Err(invalid(
-            UPDATE_GOAL_TOOL_NAME,
-            format!("status `{status}` does not take {name}"),
-        ))
-    };
     match input.status {
-        ReportedStatus::Complete if input.reason.is_some() => unexpected("reason", "complete"),
         ReportedStatus::Complete => Ok(GoalReport::Complete {
             evidence: text(input.evidence, "evidence", "complete")?,
         }),
-        ReportedStatus::Blocked if input.evidence.is_some() => unexpected("evidence", "blocked"),
         ReportedStatus::Blocked => Ok(GoalReport::Blocked {
             reason: text(input.reason, "reason", "blocked")?,
         }),

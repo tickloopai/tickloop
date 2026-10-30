@@ -280,11 +280,14 @@ impl GoogleStream {
                         }
                     } else if let Some(call) = part.get("functionCall") {
                         let name = super::required_string(call, "name")?.to_owned();
-                        let input = call
-                            .get("args")
-                            .filter(|args| args.is_object())
-                            .ok_or_else(|| invalid_response("invalid Google function arguments"))?
-                            .clone();
+                        // A call without arguments may leave `args` out.
+                        let input = match call.get("args") {
+                            None | Some(Value::Null) => json!({}),
+                            Some(args) if args.is_object() => args.clone(),
+                            Some(_) => {
+                                return Err(invalid_response("invalid Google function arguments"));
+                            }
+                        };
                         let id = call["id"].as_str().map(str::to_owned).unwrap_or_else(|| {
                             let digest = Sha256::digest(
                                 format!(

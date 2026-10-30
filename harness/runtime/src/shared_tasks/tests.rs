@@ -802,3 +802,96 @@ fn prepared_update_input_keeps_what_the_strict_parse_judges() {
         json!({"action":"claim"})
     );
 }
+
+/// An edit changes only the fields it names; leaving dependencies out keeps them, and an edit
+/// naming none is refused without changing the task.
+#[tokio::test]
+async fn task_edit_changes_only_the_fields_it_names() {
+    let (core, receipts) = family(None).await;
+    let first = create(&core, &receipts[0], vec![]).await;
+    let task = create(&core, &receipts[0], vec![first.id.into()]).await;
+    let edit = |revision: u64, fields: Value| {
+        let mut input = json!({"mutation_id":Uuid::new_v4(),"task_id":task.id,"expected_revision":revision,"action":"edit"});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        input
+    };
+    let edited =
+        |result: Value| serde_json::from_value::<SharedTask>(result["task"].clone()).unwrap();
+
+    let renamed = edited(
+        invoke(
+            &core,
+            &receipts[0],
+            "TaskUpdate",
+            edit(1, json!({"title":"Renamed"})),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(renamed.title, "Renamed");
+    assert_eq!(renamed.description, task.description);
+    assert_eq!(renamed.dependencies, task.dependencies);
+    assert!(!renamed.dependencies.is_empty());
+
+    let described = edited(
+        invoke(
+            &core,
+            &receipts[0],
+            "TaskUpdate",
+            edit(2, json!({"description":"New scope"})),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(described.title, "Renamed");
+    assert_eq!(described.description, "New scope");
+    assert_eq!(described.dependencies, task.dependencies);
+
+    let refused = invoke(&core, &receipts[0], "TaskUpdate", edit(3, json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.contains("edit requires at least one of title, description or dependencies"),
+        "{refused}"
+    );
+
+    let cleared = edited(
+        invoke(
+            &core,
+            &receipts[0],
+            "TaskUpdate",
+            edit(3, json!({"dependencies":[]})),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(cleared.revision, 4);
+    assert_eq!(cleared.title, "Renamed");
+    assert!(cleared.dependencies.is_empty());
+    core.shutdown().await;
+}
+
+/// The TaskUpdate description offers edit as the partial update the parse accepts, so a model
+/// asked to change only a title calls it.
+#[test]
+fn task_update_description_offers_a_partial_edit() {
+    let update = definitions(TaskToolAccess::Enabled)
+        .into_iter()
+        .find(|definition| definition.name == "TaskUpdate")
+        .unwrap();
+    assert!(
+        update.description.contains(
+            "edit takes any of title, description and dependencies (the full list, [] for none); omitted fields keep their current value; give at least one."
+        ),
+        "{}",
+        update.description
+    );
+    assert!(!update.description.contains("edit requires"));
+    assert_eq!(
+        update.input_schema["required"],
+        json!(["mutation_id", "task_id", "expected_revision", "action"])
+    );
+}

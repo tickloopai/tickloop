@@ -1148,3 +1148,52 @@ async fn a_local_file_sent_elsewhere_follows_read_rules_and_refuses_sensitive_pa
         Err(ToolError::Rejected(message)) if message.starts_with("EISDIR")
     ));
 }
+
+/// `null` and `""` in Read's optional fields and Bash's `cwd` and `timeout` mean not given; a
+/// refused value names its field.
+#[tokio::test]
+async fn empty_optional_fields_mean_not_given() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_eq!(
+        read_text(
+            directory.path(),
+            b"one\ntwo",
+            json!({"file_path":"notes.txt","offset":null,"limit":""})
+        )
+        .await
+        .unwrap(),
+        "     1\u{2192}one\n     2\u{2192}two"
+    );
+    assert_eq!(
+        read_text(
+            directory.path(),
+            b"one",
+            json!({"file_path":"notes.txt","limit":"many"})
+        )
+        .await
+        .unwrap_err(),
+        "invalid tool input: limit: expected a non-negative integer, found \"many\""
+    );
+
+    let fixture = ShellCwdFixture::new();
+    let workspace = workspace(&fixture.project);
+    let prepare = |input: Value| {
+        let tools = &fixture.tools;
+        let workspace = &workspace;
+        async move {
+            tools
+                .prepare(&tickloop_ids::IdContext::new(), workspace, "Bash", &input)
+                .await
+                .unwrap()
+        }
+    };
+    let filled = prepare(
+        json!({"command":"pwd","cwd":"","timeout":"","run_in_background":null,"dangerouslyDisableSandbox":""}),
+    )
+    .await;
+    let plain = prepare(json!({"command":"pwd"})).await;
+    assert_eq!(filled.input["cwd"], plain.input["cwd"]);
+    assert_eq!(filled.input.get("timeout"), None);
+    assert_eq!(filled.input["run_in_background"], false);
+    assert_eq!(filled.requires_permission, plain.requires_permission);
+}

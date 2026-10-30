@@ -1585,3 +1585,39 @@ async fn responses_announce_each_call_once_with_the_id_of_its_output() {
         assert_eq!(started, output_tool_uses(&output.content));
     }
 }
+
+/// Some OpenAI-compatible models send no arguments for a call that takes none; the call reaches
+/// the tools with an empty object, while arguments that are not a JSON object still refuse it.
+#[tokio::test]
+async fn chat_completions_reads_empty_arguments_as_an_empty_object() {
+    for (arguments, expected) in [
+        ("", Some(json!({}))),
+        ("  \n", Some(json!({}))),
+        ("{}", Some(json!({}))),
+        ("[]", None),
+        ("{", None),
+    ] {
+        let stream = [
+            chat_chunk(json!({"role":"assistant","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"TaskList","arguments":arguments}}]}), Value::Null),
+            chat_chunk(json!({}), json!("tool_calls")),
+            format!("data: {}\n\n", json!({"id":"chat-1","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4}})),
+            "data: [DONE]\n\n".into(),
+        ]
+        .concat();
+        let (base_url, _) = serve_response(200, stream).await;
+        let client = LocalModelClients::new(None)
+            .client(&configuration(base_url, Protocol::ChatCompletions))
+            .unwrap();
+        let (events, _) = mpsc::unbounded_channel();
+        let result = client
+            .complete(prompt_request("List"), events, CancellationToken::new())
+            .await;
+        let input = result.ok().and_then(|output| {
+            output.content.into_iter().find_map(|block| match block {
+                Content::ToolUse { input, .. } => Some(input),
+                _ => None,
+            })
+        });
+        assert_eq!(input, expected, "{arguments:?}");
+    }
+}

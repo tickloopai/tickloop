@@ -374,3 +374,34 @@ async fn truncated_google_tool_call_never_becomes_executable_output() {
             .is_err()
     );
 }
+
+/// A call without arguments may leave `args` out; it reaches the tools as an empty object, while
+/// arguments that are not an object still refuse the reply.
+#[tokio::test]
+async fn google_call_without_args_takes_an_empty_object() {
+    for (call, expected) in [
+        (json!({"name":"Status"}), Some(json!({}))),
+        (json!({"name":"Status","args":null}), Some(json!({}))),
+        (json!({"name":"Status","args":"now"}), None),
+    ] {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let (endpoint, _) = model_http_support::serve_response(
+            200,
+            frame(json!([{ "functionCall": call }]), Some("STOP"), json!({})),
+        )
+        .await;
+        let (events, _) = mpsc::unbounded_channel();
+        let result = LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config(root.path(), endpoint))
+            .unwrap()
+            .complete(request(), events, CancellationToken::new())
+            .await;
+        let input = result.ok().and_then(|output| {
+            output.content.into_iter().find_map(|block| match block {
+                Content::ToolUse { name, input, .. } if name == "Status" => Some(input),
+                _ => None,
+            })
+        });
+        assert_eq!(input, expected, "{call}");
+    }
+}

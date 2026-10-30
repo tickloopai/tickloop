@@ -410,7 +410,12 @@ impl ChatStream {
                     ModelResponseRejection::InvalidToolCall,
                 ));
             }
-            let input: Value = serde_json::from_str(&tool.arguments).map_err(|_| {
+            // Some OpenAI-compatible models send no arguments at all for a call that takes none.
+            let arguments = match tool.arguments.trim() {
+                "" => "{}",
+                arguments => arguments,
+            };
+            let input: Value = serde_json::from_str(arguments).map_err(|_| {
                 ModelError::ResponseRejected(ModelResponseRejection::InvalidToolCall)
             })?;
             if !input.is_object() {
