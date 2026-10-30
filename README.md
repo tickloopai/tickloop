@@ -283,7 +283,7 @@ Plugin Markdown commands are also Skills: invoke `/plugin:command` or call `Skil
 
 Commands substitute `$ARGUMENTS`, zero-based `$0`, `$1`, `$ARGUMENTS[0]`, and names declared by `arguments`; quoted arguments stay together. Missing positional arguments stay as placeholders. With no substituted placeholder, nonempty arguments are appended. Shell blocks written as ! followed by backticks, or fenced with ` ```! `, run only on invocation, through ordinary Bash preparation and approval. Their output enters the instructions only after successful completion; a failure or unknown outcome stops preparation and is never retried automatically. Installation, discovery and completion execute no command blocks. User invocations pass `SessionStart` and `UserPromptSubmit` before guidance is activated or Shell blocks run. After a restart, only guidance proven ready for that invocation without Shell can be reused; a missing preparation record requires invoking the command again explicitly.
 
-`allowed-tools` grants nothing. `model` (including `inherit`) is ignored with a warning, keeping the Chat's current model. `@file` remains text: the Agent reads referenced files with `Read` under its usual permissions. Unsupported command fields, including `name` aliases, `context`, `agent`, `background`, `effort`, `shell` and frontmatter `hooks`, warn and are ignored; invocation flags must be YAML booleans. Only enabled plugins contribute Commands; user and project `.claude/commands` directories are not read.
+`allowed-tools` warns and is ignored, granting no permissions. `model` (including `inherit`) is ignored with a warning, keeping the Chat's current model. `@file` remains text: the Agent reads referenced files with `Read` under its usual permissions. Unsupported command fields, including `name` aliases, `context`, `agent`, `background`, `effort`, `shell` and frontmatter `hooks`, warn and are ignored; invocation flags must be YAML booleans. Only enabled plugins contribute Commands; user and project `.claude/commands` directories are not read.
 
 
 ### MCP servers
@@ -342,7 +342,7 @@ Existing Tick packages migrate automatically on first use, keeping saved login. 
 
 ## Hooks
 
-Hooks run shell commands at fixed points of the agent's work: before and after a tool call, when you send a prompt, when a conversation starts or ends, when a turn is about to stop and before the conversation is compacted. Tickloop reads Claude Code's hook format, input and output, so a `hooks` section copied from Claude Code, or a plugin's hooks, run unchanged. Hooks come from three places:
+Hooks run shell commands at fixed points of the agent's work: before and after a tool call, when you send a prompt, when a conversation starts or ends, when a turn is about to stop and before the conversation is compacted. Tickloop reads Claude Code-format `command` hooks; supported events and fields can be reused directly, within the compatibility limits below. Hooks come from three places:
 
 - **Your settings**: `hooks` at the top level of your `settings.json`, for every folder, and in `projects["/absolute/project/path"]`, for that working directory only. Both apply.
 - **Enabled plugins**: the plugin's `hooks/hooks.json`, or the `hooks` field of its manifest (a path or an inline object).
@@ -365,8 +365,10 @@ Hooks run shell commands at fixed points of the agent's work: before and after a
 
 Your own hooks run without asking. A plugin's or a repository's hook runs only after you trust it, and the trust is bound to its content:
 
-- A plugin hook's trust covers its declaration and the whole plugin: updating or reinstalling the plugin, or a change to any file it shipped, asks again.
+- A plugin hook's trust covers its declaration and recorded shipped files. Updates, reinstalls or edits that change that content require review again; reinstalling identical content alone does not invalidate trust. Files generated after installation are outside that inventory; older installations without a readable inventory cover the whole plugin directory.
 - A repository hook's trust covers its declaration and the folder's `.claude/hooks/` directory: a `git pull` that changes either asks again. Files the command runs from anywhere else are not covered, and changing them does not ask again.
+
+Full relative paths are part of the fingerprint, so moving a script asks again. Upgrading to v3 fingerprints requires trusting older fingerprints again; a read or fingerprinting failure skips the hook with a warning.
 
 Until you trust them, such hooks do not run, and the conversation says so, for example `PreToolUse:Bash hooks not run: 1 hook not confirmed yet · review in /hooks`. Only you can trust a hook: the agent has no way to do it. A turn never stops to ask: unconfirmed hooks are skipped in every conversation, Subagents and unattended ones included.
 
@@ -378,13 +380,13 @@ When a new conversation starts in a folder whose hooks are pending or modified, 
 
 ### What hooks can do
 
-Tickloop runs `command` hooks for ten events, with the input on stdin, exit codes and JSON output of Claude Code:
+Tickloop runs `command` hooks for ten events, receiving JSON on stdin and reading exit codes and supported JSON output fields:
 
 | Event | When it runs | What it can do |
 | --- | --- | --- |
 | `PreToolUse` | Before a tool call is prepared | Deny it, ask you, allow it (your own hooks only), rewrite its input (`updatedInput`), add context |
 | `PostToolUse` | After a tool call succeeds | Give the model a reason (`decision: "block"`) or context after the result |
-| `PostToolUseFailure` | After a tool call fails, including a missing file during preparation | Add context after the result |
+| `PostToolUseFailure` | After tool preparation or execution fails, including a missing file during preparation | Add context after the result |
 | `UserPromptSubmit` | Before the model reads a prompt you sent | Block the prompt (it stays out of the conversation and you see why), add context |
 | `SessionStart` | New conversation (`startup`), continuing one (`resume`), `/clear` (`clear`), after compaction (`compact`) | Add context |
 | `SessionEnd` | When the agent ends: stopped in the Agents overview, or its process exits, as with `tickloop daemon stop` | Notification only |
@@ -395,12 +397,12 @@ Tickloop runs `command` hooks for ten events, with the input on stdin, exit code
 `SessionStart` finishes before the first prompt's `UserPromptSubmit`. The prompt stays queued while these hooks run; its session context is recorded first, then the prompt and its prompt-hook context. A prompt still waiting for hooks survives a Worker restart or a planned upgrade. `esc` while waiting leaves it queued; Continue or another prompt resumes it, while `/stop` discards queued prompts.
 
 - Matchers take exact names, `|` lists or a regular expression; empty or `*` matches everything. They apply to the tool events, `SessionStart` (its source) and `PreCompact` (its trigger). Tool names are Tickloop's: `Read`, `Write`, `Edit`, `Bash` and `mcp__*` are the same as in Claude Code, and `Agent` or `Task` also matches `Subagent`.
-- Fields: `command`, `timeout` in seconds (600 by default), `if`, `async`, and `asyncRewake` with `rewakeMessage` and `rewakeSummary`. `if` takes a permission rule, such as `Bash(git push*)`, and runs the hook only for calls that rule could match; when it cannot tell, the hook runs.
-- The input has `session_id` (the Chat's ID), `transcript_path` (a Claude Code–format copy of the conversation, so scripts that read the transcript work), `cwd`, `permission_mode` and `hook_event_name`, plus each event's own fields. Commands run in the working directory with `CLAUDE_PROJECT_DIR` set; plugin hooks also get `TICKLOOP_PLUGIN_ROOT`, `TICKLOOP_PLUGIN_DATA` and their `CLAUDE_` aliases, and `${CLAUDE_PLUGIN_ROOT}` or `${user_config.KEY}` in the command are replaced. A plugin hook whose `user_config` value is missing does not run and waits for configuration.
+- Fields: `command`, `timeout` in seconds (600 by default), `if`, `async`, and `asyncRewake` with `rewakeMessage` and `rewakeSummary`. `if` takes a permission rule, such as `Bash(git push*)`, and runs the hook only for calls that rule could match; redirections, pipelines and `&&` are split into commands, and any matching command runs the hook. When it cannot tell, as with command substitutions, the hook runs.
+- The input has `session_id` (the Chat's ID), `transcript_path` (a Claude Code–format copy of the conversation, so scripts that read the transcript work), `cwd`, `permission_mode` and `hook_event_name`, plus each event's own fields. Commands run in the working directory with `CLAUDE_PROJECT_DIR` set; plugin hooks also get `TICKLOOP_PLUGIN_ROOT`, `TICKLOOP_PLUGIN_DATA` and their `CLAUDE_` aliases, and `${CLAUDE_PLUGIN_ROOT}` or `${user_config.KEY}` in the command are replaced. A plugin hook whose `user_config` value is missing does not run and waits for configuration. Referenced sensitive values reach only the execution process; displayed commands, output, errors, context, rewritten input and run records are redacted.
 - Exit code 0 succeeds; its stdout is parsed as JSON when it is JSON, and otherwise becomes context for `UserPromptSubmit` and `SessionStart`. Exit code 2 blocks, and stderr goes to the model (or rejects the prompt, or keeps the turn going). Other exit codes and timeouts only warn you.
-- Matching hooks run in parallel. When they disagree, deny beats ask, and ask beats allow. `ask` asks you even in Auto mode. Your own hook's `allow` skips the approval prompt and the Auto reviewer, while explicit Ask and Deny rules, sensitive-path checks and Plan mode still apply. After `updatedInput`, the approval shows the input that will run.
+- Matching hooks run in parallel. When they disagree, deny beats ask, and ask beats allow. `ask` asks you even in Auto mode. Your own hook's `allow` skips the approval prompt and the Auto reviewer, while explicit Ask and Deny rules, sensitive-path checks and Plan mode still apply. Confirmation or separate review required by the execution environment or the tool itself also remains in force. After `updatedInput`, the approval shows the input that will run.
 - `async: true` runs the hook in the background without holding up the agent; when it ends you see its result, and its `systemMessage` and `additionalContext` reach the model with the next request. `asyncRewake: true` also runs in the background, and exit code 2 wakes the agent with the hook's output, like a background command that finished. A running hook that prints `{"async": true}` as its first line of output moves to the background the same way, as in Claude Code, and is then treated as an `async` hook, its timeout still counting from its start. Decisions from background hooks are ignored.
-- `esc` and `/stop` cancel the hooks the current step is waiting for; a `PreToolUse` hook cancelled this way also cancels its tool call, and the model reads that the call was not executed. Background hooks and `StopFailure` hooks keep running after `esc`; `/stop` and stopping the agent end them. A background `SessionEnd` hook still runs as the agent ends: the agent waits for it with the other `SessionEnd` hooks, at most 60 seconds, and nothing reads its output. `esc` or `/stop` ends a loop of `Stop` hook blocks. As in Claude Code, `Stop` and `SubagentStop` hooks may block a turn's end 8 times in a row without a tool call between them; the ninth block is overridden with a warning and the turn ends. A tool call starts the count again, so a loop whose every turn calls a tool goes on.
+- `esc` and `/stop` cancel the hooks the current step is waiting for; a `PreToolUse` hook cancelled this way also cancels its tool call, and the model reads that the call was not executed. Background hooks and `StopFailure` hooks keep running after `esc`; `/stop` and stopping the agent end them. A background `SessionEnd` hook still runs as the agent ends: the agent waits for it with the other `SessionEnd` hooks, at most 60 seconds, and nothing reads its output. `esc` or `/stop` ends a loop of `Stop` hook blocks. As in Claude Code, `Stop` and `SubagentStop` hooks may block a turn's end 8 times in a row without a tool call between them; the ninth block is overridden with a warning and the turn ends. A model tool call other than hand-back resets the count; hand-back does not, and resetting the count does not reset `stop_hook_active`.
 - ACP and Print settlement cancels that Chat's background hooks, including hooks that switch to the background while running, and waits up to 10 seconds for them. A timeout or unknown command outcome fails settlement; commands are never resent. A cancelled hook delivers no late notification. Other Chats and ordinary terminal sessions keep their existing hook lifetimes.
 - A hook's `systemMessage`, the reason it blocked and its failures show as a line in the conversation. Every run, with its source, event, duration, exit code, decision and shortened output, is listed in `/permissions` → Recent activity (the last 100 per conversation).
 
@@ -410,9 +412,10 @@ Hooks run as you, outside the sandbox, like hooks in Claude Code.
 
 Not supported yet, each reported with a warning while the other hooks keep working: the `prompt`, `agent`, `http` and `mcp_tool` types; the fields `args`, `shell`, `once` and `onFailure`; other events such as `Notification`, `PermissionRequest`, `UserPromptExpansion` or `FileChanged`; `CLAUDE_ENV_FILE`; `disableAllHooks`; hooks in Skill or agent frontmatter; and Codex's `.codex/hooks.json`. Known limits:
 
-- `UserPromptSubmit` runs for the prompts you send, including one queued while the agent works (when the turn takes it in), but not for scheduled tasks, Tick updates and other automatic input.
+- `UserPromptSubmit` reads your actual prompt text, including text following file or other attached context. It also runs when a turn takes in a queued prompt, but not for attached system context, scheduled tasks, Tick updates or Agent messages.
+- `PostToolUseFailure` does not cover permission refusals, input-schema errors or a refusal or cancellation by `PreToolUse` itself; those calls were not executed.
 - `tool_response` is the tool's result text (parsed when it is JSON), not Claude Code's per-tool structure, and the transcript copy keeps tool results as text.
-- An `asyncRewake` hook that exits 2 after `esc` or `/stop` leaves its notification for the next turn instead of waking the agent.
+- An `asyncRewake` hook that exits 2 after `esc` leaves its notification for the next turn instead of waking the agent. `/stop` cancels background hooks and discards late output from the old run.
 
 ## Requirements
 
