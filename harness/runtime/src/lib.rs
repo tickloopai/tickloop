@@ -3095,12 +3095,14 @@ impl Agent {
         if let Some(user_loop) = user_loop {
             chat.user_loops.insert(run_id.into(), user_loop);
         }
+        let mut skill_guidance = None;
         if let Some(invoked_skill) = invoked_skill {
             chat.snapshot.user_skill_invocations.insert(
                 run_id.into(),
                 tickloop_harness_protocol::UserSkillInvocation {
                     name: invoked_skill.name.clone(),
                     source: invoked_skill.source.clone(),
+                    prepared_guidance_hash: None,
                 },
             );
             if invoked_skill.shell_commands.is_empty() {
@@ -3111,7 +3113,7 @@ impl Agent {
                 {
                     invoked.run_id = Some(run_id.into());
                 }
-                record_invoked_skill(chat, invoked);
+                skill_guidance = Some(invoked);
                 chat.user_skill_preparations.insert(
                     run_id.into(),
                     command_skills::UserSkillPreparation::Complete,
@@ -3185,26 +3187,6 @@ impl Agent {
         chat.snapshot.last_queue_sequence += 1;
         let queued_sequence = chat.snapshot.last_queue_sequence;
         let directed_origin = directed_human.clone();
-        let skill_guidance = chat
-            .snapshot
-            .user_skill_invocations
-            .get(&receipt.run_id)
-            .and_then(|invocation| {
-                matches!(
-                    chat.user_skill_preparations.get(&receipt.run_id),
-                    Some(command_skills::UserSkillPreparation::Complete)
-                )
-                .then(|| {
-                    chat.snapshot
-                        .invoked_skills
-                        .iter()
-                        .find(|skill| {
-                            skill.name == invocation.name && skill.source == invocation.source
-                        })
-                        .cloned()
-                })
-                .flatten()
-            });
         let queued = PendingInput {
             skill_guidance,
             receipt: receipt.clone(),
@@ -3711,6 +3693,7 @@ impl Agent {
                 .first()
                 .map(|pending| (pending.receipt.run_id, candidate.snapshot.messages.len()));
             for mut pending in blocked {
+                pending.skill_guidance = None;
                 pending.attached_file_reads.clear();
                 self.append_merged_input(&mut candidate, active, pending);
             }
@@ -3734,8 +3717,14 @@ impl Agent {
 
     /// Appends `pending`, queued to the Run `active`, to its conversation, answered by the Run's
     /// response.
-    fn append_merged_input(&self, chat: &mut Chat, active: &Receipt, pending: PendingInput) {
+    fn append_merged_input(&self, chat: &mut Chat, active: &Receipt, mut pending: PendingInput) {
         let consumed = pending.receipt.run_id;
+        if let Some(skill) = &mut pending.skill_guidance
+            && skill.source == tickloop_harness_protocol::SkillSource::BuiltIn
+            && skill.run_id == Some(consumed)
+        {
+            skill.run_id = Some(active.run_id);
+        }
         let index = chat.snapshot.messages.len();
         self.append_input_message(chat, pending);
         if let Some(response) = chat.bookkeeping.lifecycle.active_response(active.run_id)
@@ -3894,7 +3883,7 @@ impl Agent {
                 if let hooks::PromptGate::End = prompt_gate {
                     return Ok(Usage::default());
                 }
-                if self.prepare_user_skill(&receipt, &cancel).await? {
+                if Box::pin(self.prepare_user_skill(&receipt, &cancel, is_awaiting_model)).await? {
                     if let Some(usage) = self.finish_tool_results(&receipt).await? {
                         return Ok(usage);
                     }
@@ -4354,6 +4343,23 @@ impl Agent {
                 .run_loops
                 .insert(pending.receipt.run_id, pending.receipt.loop_id);
             return;
+        }
+        if let Some(skill) = pending.skill_guidance.take()
+            && let Some(hash) = command_skills::prepared_guidance_hash(&skill)
+        {
+            chat.snapshot.user_skill_invocations.insert(
+                pending.receipt.run_id,
+                tickloop_harness_protocol::UserSkillInvocation {
+                    name: skill.name.clone(),
+                    source: skill.source.clone(),
+                    prepared_guidance_hash: Some(hash),
+                },
+            );
+            record_invoked_skill(chat, skill);
+            chat.user_skill_preparations.insert(
+                pending.receipt.run_id,
+                command_skills::UserSkillPreparation::Complete,
+            );
         }
         let message_index = chat.snapshot.messages.len();
         chat.snapshot

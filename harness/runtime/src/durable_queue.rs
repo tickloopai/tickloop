@@ -180,15 +180,20 @@ impl Agent {
             }
             if pending.is_skill_invocation
                 && let Some(skill) = &pending.skill_guidance
+                && let Some(hash) = super::command_skills::prepared_guidance_hash(skill)
             {
                 chat.snapshot.user_skill_invocations.insert(
                     pending.receipt.run_id,
                     tickloop_harness_protocol::UserSkillInvocation {
                         name: skill.name.clone(),
                         source: skill.source.clone(),
+                        prepared_guidance_hash: Some(hash),
                     },
                 );
-                super::record_invoked_skill(chat, skill.clone());
+                chat.user_skill_preparations.insert(
+                    pending.receipt.run_id,
+                    super::command_skills::UserSkillPreparation::Complete,
+                );
             }
             pending.receipt.loop_id = chat.snapshot.chat_loop.id;
             if let Some(TriggerSource::TickUpdate { items }) = &mut pending.trigger_source {

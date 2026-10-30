@@ -71,9 +71,14 @@ pub struct InvokedSkill {
     pub run_id: Option<RunId>,
 }
 
-/// Display metadata captured when the user loads a Skill; it grants no active guidance.
+/// Metadata captured with a user's Skill input. Preparation facts belong to that input's Run;
+/// they neither activate guidance by themselves nor grant tool permissions.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct UserSkillInvocation {
     pub name: String,
     pub source: SkillSource,
+    /// SHA256 of this input's prepared guidance when it needs no Shell. Missing for Shell
+    /// plans and older records, which cannot establish that preparation finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_guidance_hash: Option<String>,
 }

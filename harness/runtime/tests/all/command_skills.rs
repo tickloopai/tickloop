@@ -833,6 +833,17 @@ async fn old_checkpoint_retains_queued_guidance_without_rebuilding_an_execution_
         let mut checkpoint = serde_json::to_value(checkpoint).unwrap();
         checkpoint["chats"][0]["snapshot"]["history"]["invoked_skills"] = json!([activated]);
         if legacy {
+            for invocation in
+                checkpoint["chats"][0]["snapshot"]["history"]["user_skill_invocations"]
+                    .as_object_mut()
+                    .unwrap()
+                    .values_mut()
+            {
+                invocation
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("prepared_guidance_hash");
+            }
             checkpoint["chats"][0]
                 .as_object_mut()
                 .unwrap()
@@ -914,7 +925,7 @@ async fn plain_command_guidance_keeps_the_existing_active_turn_merge_behavior() 
     };
     let command = agent.invoke_skill(chat, "demo:check", "").await.unwrap();
     assert!(
-        agent
+        !agent
             .snapshot(chat)
             .await
             .unwrap()
@@ -940,6 +951,16 @@ async fn plain_command_guidance_keeps_the_existing_active_turn_merge_behavior() 
         }
     }
     assert!(merged);
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .invoked_skills
+            .iter()
+            .any(|skill| skill.content.contains("Plain command guidance"))
+    );
+
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     agent.shutdown().await;
 }
@@ -1043,6 +1064,160 @@ async fn durable_restore_rejects_a_queued_command_whose_plan_and_source_were_not
                 && operation.input["command"] == "touch must-not-run")
     );
     resumed.shutdown().await;
+}
+
+#[tokio::test]
+async fn blocked_plain_command_guidance_never_enters_an_active_or_later_request() {
+    use tickloop_harness_protocol::hooks::{
+        ConfiguredHook, HookEvent, HookList, HookSource, HookTrust,
+    };
+    use tickloop_harness_runtime::environment::memory::MemoryCommandRun;
+    const SENTINEL: &str = "BLOCKED_GUIDANCE_SENTINEL";
+    for queued in [false, true] {
+        let folder = tempfile::tempdir().unwrap();
+        let environment = MemoryEnvironment::new();
+        environment.set_shell_approval_required(true);
+        environment.define_shell("touch hold", Duration::ZERO, b"held".to_vec(), 0);
+        environment.define_command("guard-prompt", |spec| {
+            let input: serde_json::Value = serde_json::from_slice(&spec.stdin).unwrap();
+            let blocked = input["prompt"].as_str().unwrap().contains(SENTINEL);
+            MemoryCommandRun {
+                exit_code: if blocked { 2 } else { 0 },
+                stderr: if blocked {
+                    b"blocked".to_vec()
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            }
+        });
+        let memory = MemorySettingsStore::default();
+        memory
+            .write(SettingsUpdate::TrustDirectory(
+                folder.path().canonicalize().unwrap(),
+            ))
+            .unwrap();
+        memory.set_hooks(HookList {
+            hooks: vec![ConfiguredHook {
+                key: "guard".into(),
+                hash: None,
+                source: HookSource::User,
+                file: "/settings.json".into(),
+                event: HookEvent::UserPromptSubmit,
+                matcher: None,
+                command: "guard-prompt".into(),
+                resolved_command: Some("guard-prompt".into()),
+                sensitive_values: Vec::new(),
+                condition: None,
+                timeout_secs: 600,
+                background: None,
+                plugin: None,
+                trust: HookTrust::Trusted,
+            }],
+            ..Default::default()
+        });
+        let model = Arc::new(ScriptedModel::new(if queued {
+            vec![
+                call("hold", "Bash", json!({"command":"touch hold"})),
+                text("done"),
+            ]
+        } else {
+            vec![text("done")]
+        }));
+        let agent = Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: None,
+                environment: Some(Arc::new(environment)),
+                models: ChosenModels::new(model.clone()),
+            },
+            HarnessOptions {
+                settings: Some(Arc::new(CommandSettings {
+                    memory,
+                    markdown: "---\ndescription: Check\n---\nPlain guidance: $ARGUMENTS".into(),
+                })),
+                ..HarnessOptions::local(config())
+            },
+        )
+        .unwrap();
+        let chat = agent.create_chat(folder.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        let active = if queued {
+            let active = agent.submit(chat, "Start work".into()).await.unwrap();
+            let permission = loop {
+                if let EventKind::PermissionRequested { request } =
+                    next_event(&mut events).await.kind
+                {
+                    break request;
+                }
+            };
+            Some((active, permission))
+        } else {
+            None
+        };
+        let command = agent
+            .invoke_skill(chat, "demo:check", SENTINEL)
+            .await
+            .unwrap();
+        assert!(
+            !agent
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .invoked_skills
+                .iter()
+                .any(|skill| skill.content.contains(SENTINEL))
+        );
+        let waiting = if let Some((active, permission)) = active {
+            agent
+                .answer_permission(chat, permission.id, true)
+                .await
+                .unwrap();
+            active
+        } else {
+            command
+        };
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id != waiting.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        if !queued {
+            let ordinary = agent
+                .submit(chat, "Allowed ordinary prompt".into())
+                .await
+                .unwrap();
+            loop {
+                let event = next_event(&mut events).await;
+                if event.run_id == ordinary.run_id
+                    && matches!(event.kind, EventKind::Completed { .. })
+                {
+                    break;
+                }
+            }
+        }
+        assert!(!format!("{:?}", model.requests.lock().unwrap()).contains(SENTINEL));
+        assert!(
+            !agent
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .invoked_skills
+                .iter()
+                .any(|skill| skill.content.contains(SENTINEL))
+        );
+        agent.shutdown().await;
+    }
 }
 
 #[tokio::test]
@@ -1150,7 +1325,7 @@ async fn command_preprocessing_respects_prompt_hooks_and_session_start_model_bou
             }
             let snapshot = agent.snapshot(chat).await.unwrap();
             if blocked {
-                assert_eq!(*order.lock().unwrap(), ["prompt"]);
+                assert_eq!(*order.lock().unwrap(), ["session", "prompt"]);
                 assert!(snapshot.invoked_skills.is_empty());
                 assert!(
                     !snapshot
@@ -1162,11 +1337,7 @@ async fn command_preprocessing_respects_prompt_hooks_and_session_start_model_bou
             } else {
                 assert_eq!(
                     *order.lock().unwrap(),
-                    if user {
-                        vec!["prompt", "pre-bash", "session"]
-                    } else {
-                        vec!["prompt", "session", "pre-bash"]
-                    }
+                    vec!["session", "prompt", "pre-bash"]
                 );
                 assert!(
                     snapshot
@@ -1559,6 +1730,10 @@ async fn user_command_hook_refusal_cancellation_and_stop_keep_input_records() {
                 _ => {}
             }
         }
+        if scenario == "cancelled" {
+            let snapshot = agent.snapshot(chat).await.unwrap();
+            assert!(snapshot.messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::Text {text} if text == "[Request interrupted by user for tool use]")));
+        }
         assert!(model.requests.lock().unwrap().is_empty(), "{scenario}");
         assert_eq!(dispatched, usize::from(scenario == "stopped"));
         agent.sync().await.unwrap();
@@ -1595,4 +1770,311 @@ async fn user_command_hook_refusal_cancellation_and_stop_keep_input_records() {
         agent.shutdown().await;
         restored.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn command_waiting_for_session_start_survives_upgrade_before_its_only_shell() {
+    use tickloop_harness_protocol::hooks::{
+        ConfiguredHook, HookEvent, HookList, HookSource, HookTrust,
+    };
+    use tickloop_harness_protocol::{Content, OperationState};
+    use tickloop_harness_runtime::environment::memory::MemoryCommandRun;
+    let folder = tempfile::tempdir().unwrap();
+    let environment = Arc::new(MemoryEnvironment::new());
+    environment.define_shell("printf held", Duration::ZERO, b"after-upgrade".to_vec(), 0);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let notify = entered.clone();
+    environment.define_command("session", move |_| {
+        notify.notify_one();
+        MemoryCommandRun {
+            duration: Duration::from_secs(300),
+            ..Default::default()
+        }
+    });
+    let memory = MemorySettingsStore::default();
+    memory
+        .write(SettingsUpdate::TrustDirectory(
+            folder.path().canonicalize().unwrap(),
+        ))
+        .unwrap();
+    memory.set_hooks(HookList {
+        hooks: vec![ConfiguredHook {
+            key: "session".into(),
+            hash: None,
+            source: HookSource::User,
+            file: "/settings.json".into(),
+            event: HookEvent::SessionStart,
+            matcher: None,
+            command: "session".into(),
+            resolved_command: Some("session".into()),
+            sensitive_values: Vec::new(),
+            condition: None,
+            timeout_secs: 600,
+            background: None,
+            plugin: None,
+            trust: HookTrust::Trusted,
+        }],
+        ..Default::default()
+    });
+    let settings = Arc::new(CommandSettings {
+        memory,
+        markdown: "---\ndescription: Check\n---\n!`printf held`".into(),
+    });
+    let make = |model: Arc<ScriptedModel>| {
+        Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: None,
+                environment: Some(environment.clone()),
+                models: ChosenModels::new(model),
+            },
+            HarnessOptions {
+                settings: Some(settings.clone()),
+                ..HarnessOptions::local(config())
+            },
+        )
+        .unwrap()
+    };
+    let predecessor = make(Arc::new(ScriptedModel::new(Vec::new())));
+    let chat = predecessor.create_chat(folder.path().into()).await.unwrap();
+    predecessor
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = predecessor.subscribe();
+    let receipt = predecessor
+        .invoke_skill(chat, "demo:check", "")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        predecessor
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .operations
+            .is_empty()
+    );
+    predecessor.interrupt(chat).await.unwrap();
+    loop {
+        let event = next_event(&mut events).await;
+        if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Interrupted) {
+            break;
+        }
+    }
+    let checkpoint = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(checkpoint) = predecessor.prepare_upgrade().await.unwrap() {
+                break checkpoint;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let checkpoint = serde_json::from_value(serde_json::to_value(checkpoint).unwrap()).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![text("done")]));
+    let successor = make(model.clone());
+    successor.restore_upgrade(checkpoint).await.unwrap();
+    successor.activate_upgrade().await.unwrap();
+    predecessor.shutdown_for_upgrade().await;
+    successor.release_upgrade().await.unwrap();
+    assert!(
+        successor
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .operations
+            .is_empty()
+    );
+    environment.define_command("session", |_| MemoryCommandRun::default());
+    let mut events = successor.subscribe();
+    successor.continue_loop(chat).await.unwrap();
+    let mut shells = 0;
+    loop {
+        let event = next_event(&mut events).await;
+        if event.run_id != receipt.run_id {
+            continue;
+        }
+        match event.kind {
+            EventKind::ToolStarted { name, .. } if name == "Bash" => shells += 1,
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(shells, 1);
+    let snapshot = successor.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.operations.len(), 1);
+    assert_eq!(snapshot.operations[0].state, OperationState::Completed);
+    let input = snapshot.operations[0].input_message_id.unwrap();
+    assert!(
+        snapshot
+            .message_ids
+            .iter()
+            .any(|(index, id)| *id == input && snapshot.prompt_execution_modes.contains_key(index))
+    );
+    assert!(
+        !snapshot
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|content| matches!(
+                content,
+                Content::ToolUse { .. } | Content::ToolResult { .. }
+            ))
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    successor.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_prior_plain_invocation_cannot_prove_a_later_shell_invocation_prepared() {
+    use tickloop_harness_protocol::hooks::{
+        ConfiguredHook, HookEvent, HookList, HookSource, HookTrust,
+    };
+    use tickloop_harness_runtime::{WaitHosting, environment::memory::MemoryCommandRun};
+    use tickloop_harness_test_support::transcripts::InMemoryTranscriptStore;
+    let folder = tempfile::tempdir().unwrap();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let memory = MemorySettingsStore::default();
+    memory
+        .write(SettingsUpdate::TrustDirectory(
+            folder.path().canonicalize().unwrap(),
+        ))
+        .unwrap();
+    memory.set_hooks(HookList {
+        hooks: vec![ConfiguredHook {
+            key: "hold".into(),
+            hash: None,
+            source: HookSource::User,
+            file: "/settings.json".into(),
+            event: HookEvent::PreToolUse,
+            matcher: Some("Bash".into()),
+            command: "hold".into(),
+            resolved_command: Some("hold".into()),
+            sensitive_values: Vec::new(),
+            condition: None,
+            timeout_secs: 600,
+            background: None,
+            plugin: None,
+            trust: HookTrust::Trusted,
+        }],
+        ..Default::default()
+    });
+    let settings = Arc::new(CommandSettings {
+        memory,
+        markdown: "---\ndescription: Check\n---\n!$ARGUMENTS".into(),
+    });
+    let make = |store: Arc<InMemoryTranscriptStore>, model: Arc<ScriptedModel>, wait: bool| {
+        let environment = MemoryEnvironment::new();
+        environment.define_shell(
+            "printf must-not-repeat",
+            Duration::ZERO,
+            b"unexpected".to_vec(),
+            0,
+        );
+        let notify = entered.clone();
+        environment.define_command("hold", move |_| {
+            notify.notify_one();
+            MemoryCommandRun {
+                duration: if wait {
+                    Duration::from_secs(300)
+                } else {
+                    Duration::ZERO
+                },
+                ..Default::default()
+            }
+        });
+        let mut options = HarnessOptions::local(config());
+        options.settings = Some(settings.clone());
+        options.waits = WaitHosting::Durable;
+        options.host.prompt_policy = tickloop_harness_protocol::PromptPolicy::DenyOnPrompt;
+        options.tools.tick_subscriptions = false;
+        options.tools.user_skills = true;
+        Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: Some(store),
+                environment: Some(Arc::new(environment)),
+                models: ChosenModels::new(model),
+            },
+            options,
+        )
+        .unwrap()
+    };
+    let first_model = Arc::new(ScriptedModel::new(vec![text("first done")]));
+    let first = make(store.clone(), first_model, true);
+    let chat = first.create_chat(folder.path().into()).await.unwrap();
+    first
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = first.subscribe();
+    let plain = first
+        .invoke_skill(chat, "demo:check", "OLD_PLAIN_GUIDANCE")
+        .await
+        .unwrap();
+    loop {
+        let event = next_event(&mut events).await;
+        if event.run_id == plain.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    assert_eq!(
+        first.snapshot(chat).await.unwrap().invoked_skills[0].shell_preprocessing,
+        Some(false)
+    );
+    let shell = first
+        .invoke_skill(chat, "demo:check", "`printf must-not-repeat`")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    first.sync().await.unwrap();
+    let crash = Arc::new(InMemoryTranscriptStore::new());
+    crash.seed(chat, store.lines(chat), store.position(chat).unwrap());
+    first.shutdown().await;
+    let model = Arc::new(ScriptedModel::new(vec![text(
+        "must not run with stale guidance",
+    )]));
+    let restored = make(crash, model.clone(), false);
+    restored.resume_chat(chat).await.unwrap();
+    let mut events = restored.subscribe();
+    restored.continue_loop(chat).await.unwrap();
+    let mut dispatched = 0;
+    let failure = loop {
+        let event = next_event(&mut events).await;
+        if event.run_id != shell.run_id {
+            continue;
+        }
+        match event.kind {
+            EventKind::ToolStarted { name, .. } if name == "Bash" => dispatched += 1,
+            EventKind::Failed(error) => break Some(error),
+            EventKind::Completed { .. } => break None,
+            _ => {}
+        }
+    };
+    assert!(
+        failure
+            .as_deref()
+            .is_some_and(|error| error.contains("interrupted or not retained")),
+        "{failure:?}"
+    );
+    assert!(model.requests.lock().unwrap().is_empty());
+    assert_eq!(dispatched, 0);
+    assert!(
+        restored
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .operations
+            .iter()
+            .all(|operation| operation.run_id != shell.run_id)
+    );
+    restored.shutdown().await;
 }

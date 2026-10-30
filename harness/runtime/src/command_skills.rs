@@ -1,6 +1,7 @@
 //! Command preprocessing uses the same prepared Bash execution as an ordinary tool call.
 use super::*;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tickloop_harness_policy::skills::SkillExpansion;
 use tickloop_harness_protocol::ProposedToolCall;
 
@@ -21,17 +22,28 @@ pub(super) fn shell_input(name: &str, command: &str) -> Value {
     serde_json::json!({"command": command, "description": format!("Prepare /{name}"), "run_in_background": false})
 }
 
+pub(super) fn prepared_guidance_hash(
+    skill: &tickloop_harness_protocol::InvokedSkill,
+) -> Option<String> {
+    (skill.shell_preprocessing != Some(true))
+        .then(|| format!("{:x}", Sha256::digest(skill.content.as_bytes())))
+}
+
 pub(super) fn ordinary_guidance_is_active(chat: &Chat, run: RunId) -> bool {
     chat.snapshot
         .user_skill_invocations
         .get(&run)
         .is_some_and(|invocation| {
-            chat.snapshot.invoked_skills.iter().any(|skill| {
-                skill.name == invocation.name
-                    && skill.source == invocation.source
-                    && (skill.shell_preprocessing == Some(false)
-                        || chat.skills.is_plugin_command(&invocation.name) == Some(false))
-            })
+            invocation
+                .prepared_guidance_hash
+                .as_ref()
+                .is_some_and(|expected| {
+                    chat.snapshot.invoked_skills.iter().any(|skill| {
+                        skill.name == invocation.name
+                            && skill.source == invocation.source
+                            && prepared_guidance_hash(skill).as_ref() == Some(expected)
+                    })
+                })
         })
 }
 
@@ -58,6 +70,7 @@ impl Agent {
         &self,
         receipt: &Receipt,
         cancel: &CancellationToken,
+        is_awaiting_model: &mut bool,
     ) -> Result<bool, String> {
         let mut expansion = {
             let mut chats = self.inner.chats.lock().await;
@@ -98,6 +111,7 @@ impl Agent {
             if cancel.is_cancelled() {
                 return Err("Skill preparation cancelled before dispatch".into());
             }
+            *is_awaiting_model = false;
             let registry = self.prepare_tool_registry(receipt, cancel).await?;
             let message_id = {
                 let chats = self.inner.chats.lock().await;
