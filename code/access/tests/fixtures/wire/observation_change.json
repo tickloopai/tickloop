@@ -561,5 +561,24 @@
         "queue_failures": []
       }
     }
+  },
+  {
+    "TaskNotification": {
+      "chat_id": "00000000-0000-0000-0000-0000000000c1",
+      "shell": {
+        "task_id": "00000000-0000-0000-0000-000000000042",
+        "tool_use_id": "call-1",
+        "output_file": "/tmp/task.log",
+        "status": "Failed"
+      },
+      "summary": "Background command \"make test\" failed with exit code 2"
+    }
+  },
+  {
+    "TaskNotification": {
+      "chat_id": "00000000-0000-0000-0000-0000000000c1",
+      "shell": null,
+      "summary": "Background check found something"
+    }
   }
 ]

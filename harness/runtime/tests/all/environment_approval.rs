@@ -251,3 +251,97 @@ async fn auto_reviews_ordinary_tick_opens_and_refuses_retired_view_forms_before_
         }
     }
 }
+
+/// Models fill every field of the flat TickManage schema and leave TickCall's `args` out; the
+/// fields other actions take are dropped and missing `args` are no arguments, so both calls run.
+#[tokio::test]
+async fn tick_calls_run_with_other_actions_fields_filled_and_args_left_out() {
+    use tickloop_harness_protocol::{Content, HostEndpointIdentity, HostToolAuthority};
+    use tickloop_harness_runtime::environment::{ExecutionTools, memory::counter_environment};
+    use tickloop_harness_test_support::routed::{RoutedModel, has_tool_result, tool_result};
+
+    let folder = tempfile::tempdir().unwrap();
+    let environment = Arc::new(counter_environment());
+    let model = Arc::new(RoutedModel::new(|request| {
+        let Some(opened) = tool_result(&request.messages, "open") else {
+            return call(
+                "open",
+                "TickManage",
+                json!({"action":"open","command":["/counter"],"cwd":"","protocol":true,
+                    "tick_instance_id":"","text":"","keys":[],"frequency":"","subscription":""}),
+            );
+        };
+        if !has_tool_result(request, "increment") {
+            return call(
+                "increment",
+                "TickCall",
+                json!({"tick_instance_id":opened["tick_instance_id"],"tool":"increment"}),
+            );
+        }
+        text("done")
+    }));
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: None,
+            environment: Some(environment.clone()),
+            models: ChosenModels::new(model),
+        },
+        HarnessOptions::local(config()),
+    )
+    .unwrap();
+    agent
+        .install_host_tools(Arc::new(ExecutionTools::new(
+            environment.clone(),
+            HostToolAuthority::Native {
+                endpoint: HostEndpointIdentity::TrustedAdapter {
+                    scope: tickloop_ids::generate(),
+                },
+            },
+        )))
+        .unwrap();
+    let chat = agent.create_chat(folder.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, "Count once.".into()).await.unwrap();
+    loop {
+        let event = next_event(&mut events).await;
+        if event.run_id != receipt.run_id {
+            continue;
+        }
+        match event.kind {
+            EventKind::Completed { .. } | EventKind::Interrupted => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    agent.shutdown().await;
+    let result = |id: &str| {
+        snapshot
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|content| match content {
+                Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == id => Some((content.text(), *is_error)),
+                _ => None,
+            })
+            .unwrap()
+    };
+    for id in ["open", "increment"] {
+        let (content, is_error) = result(id);
+        assert!(!is_error, "{id}: {content}");
+    }
+    assert!(
+        result("increment").0.contains("\"value\":1"),
+        "{}",
+        result("increment").0
+    );
+}

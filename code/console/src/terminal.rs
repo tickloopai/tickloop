@@ -48,6 +48,9 @@ mod file_mentions;
 mod footer;
 mod goal_view;
 mod herdr_agent;
+mod hook_activity;
+mod hooks_panel;
+mod hooks_work;
 mod hosted_probe;
 mod hyperlink;
 mod image_cache;
@@ -105,6 +108,7 @@ mod thinking_preview;
 pub mod tick_actions;
 mod tick_labels;
 mod ticks_panel;
+pub use ticks_panel::hooks_to_confirm_summary;
 mod ticks_work;
 mod transcript;
 mod update_notice;
@@ -484,6 +488,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/plugins"
                 | "/ticks"
                 | "/mcp"
+                | "/hooks"
                 | "/settings"
                 | "/permissions"
                 | "/sandbox"
@@ -1373,6 +1378,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         session_persistence,
         exact_chat: None,
         host_work_context,
+        after_clear: false,
         environment: std::env::vars_os()
             .map(|(name, value)| EnvironmentValue {
                 name: name.as_os_str().as_bytes().to_vec(),
@@ -2006,6 +2012,7 @@ async fn interact_with_herdr(
     let mut artifact_loads = tokio::task::JoinSet::new();
     let mut tick_package_tasks = ticks_work::TickPackageTasks::new(agent.clone());
     let mut mcp_tasks = mcp_work::McpTasks::default();
+    let mut hook_tasks = hooks_work::HookTasks::default();
     // While `/mcp` shows servers that are still connecting, it reads them again this often.
     let mut mcp_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
     mcp_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2213,6 +2220,16 @@ async fn interact_with_herdr(
         awaited_mcp_servers.retain(|run, _| pending.contains_key(run));
         suggestible_runs.retain(|run| pending.contains_key(run));
         let dispatch_directory = global.projection().dispatch_directory;
+        if interactive && config_root.is_some() {
+            hooks_work::offer_review(
+                console,
+                agent,
+                selected_chat.is_none() && !overview_active,
+                selected_chat.map(Into::into),
+                &dispatch_directory,
+                &mut hook_tasks,
+            )?;
+        }
         menus.set_new_agent_directory(dispatch_directory.clone());
         agent.set_new_agent_directory(dispatch_directory);
         if !overview_active && ui_selected != selected_chat {
@@ -3069,6 +3086,11 @@ async fn interact_with_herdr(
                     mcp_work::finish(console, root, agent, panel, done, &mut mcp_tasks)?;
                 }
             },
+            done = hook_tasks.join_next(), if !hook_tasks.is_empty() => {
+                if let Some(done) = done {
+                    hooks_work::finish(console, agent, done, &mut hook_tasks)?;
+                }
+            },
             _ = mcp_refresh.tick(), if console.mcp_panel_awaiting_connections()?.is_some() => {
                 if let Some(panel) = console.mcp_panel_awaiting_connections()? && let Some(root) = config_root.as_deref() {
                     mcp_work::refresh(root, agent, panel, &mut mcp_tasks);
@@ -3449,6 +3471,7 @@ async fn interact_with_herdr(
                 Some(InputEvent::Mcp(work)) => {
                     if let Some(root) = config_root.as_deref() { mcp_work::start(console, root, agent, work, &mut mcp_tasks)?; }
                 },
+                Some(InputEvent::Hooks(work)) => hooks_work::start(agent, work, &mut hook_tasks),
                 Some(InputEvent::TickAction { .. }) => {},
                 Some(InputEvent::OpenRewind) => {
                     let is_busy=selected_chat.is_some_and(|chat| pending.values().any(|receipt|receipt.chat_id==chat)
@@ -4131,6 +4154,12 @@ async fn interact_with_herdr(
                             if !interactive { outln!(console, "/mcp needs an interactive terminal; run tickloop mcp list there instead."); continue; }
                             if let Err(error) = mcp_work::open(console, root, agent, selected_chat.map(Into::into), workdir.clone(), &mut mcp_tasks) { outln!(console, "Cannot open /mcp: {}", safe_text(&error)); }
                         },
+                        command if command.split_whitespace().next() == Some("/hooks") => {
+                            if command.split_whitespace().count() != 1 { outln!(console, "Use /hooks"); continue; }
+                            if config_root.is_none() { outln!(console, "/hooks needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; }
+                            if !interactive { outln!(console, "/hooks needs an interactive terminal."); continue; }
+                            if let Err(error) = hooks_work::open(console, agent, selected_chat.map(Into::into), global.projection().dispatch_directory, &mut hook_tasks) { outln!(console, "Cannot open /hooks: {}", safe_text(&error)); }
+                        },
                         command if is_rewind_command(command) => {
                             let is_busy=selected_chat.is_some_and(|chat| input_waits(chat,&pending,&foreground_shells)
                                 || compaction_chats.values().any(|(candidate,_)|*candidate==chat)
@@ -4157,6 +4186,7 @@ async fn interact_with_herdr(
                                     }
                                 }
                                 if shell_stop_failed {continue;}
+                                agent.follow_clear_in_draft();
                             }
                             global.interpret(crate::agent_console::Intent::NewDraft).map_err(|error|error.to_string())?;
                             console.clear_visible_agent()?;
@@ -5097,6 +5127,14 @@ async fn interact_with_herdr(
                         EventKind::GoalUpdated {goal, notice} => {
                             if let Some(notice) = notice { console.write_pieces(&goal_view::notice_pieces(&notice, goal.as_ref().map_or("", |goal| goal.objective.as_str())))?; }
                         },
+                        EventKind::HookRan {record} => {
+                            for (notice, role) in hook_activity::run_notices(&record) {
+                                console.write_roles(&[("\n".into(), None), (safe_text(&notice), Some(role)), ("\n".into(), None)])?;
+                            }
+                        },
+                        EventKind::HooksSkipped {notice} => {
+                            console.write_roles(&[("\n".into(), None), (safe_text(&hook_activity::skip_notice(&notice)), Some(Role::MutedText)), ("\n".into(), None)])?;
+                        },
                         EventKind::CommandUpdated {..} | EventKind::TaskBoardChanged {..} | EventKind::ScheduledTasksChanged {..} => {},
                         EventKind::ContextCompaction {status,error} => {
                             outln!(console, "\nContext compaction: {status:?}");
@@ -5457,16 +5495,17 @@ async fn interact_with_herdr(
             },
             notification = task_notifications.recv() => match notification {
                 Ok(notification) if !overview_active && Some(notification.chat_id)==selected_chat => {
-                    console.write_shell_notification(&notification)?;
+                    console.write_task_notification(&notification)?;
                     status_dirty=true;
                 },
                 Ok(notification) => {
                     let notice=format!("{} · {}",background_label(agent,console,notification.chat_id),safe_line(&notification.summary));
                     if !interactive {outln!(console,"Background {notice}");}
-                    let (message, necessary) = match notification.status {
-                        TaskNotificationStatus::Completed => ("Shell task completed", false),
-                        TaskNotificationStatus::Failed => ("Shell task failed", true),
-                        TaskNotificationStatus::Killed => ("Shell task killed", false),
+                    let (message, necessary) = match notification.status() {
+                        Some(TaskNotificationStatus::Completed) => ("Shell task completed", false),
+                        Some(TaskNotificationStatus::Failed) => ("Shell task failed", true),
+                        Some(TaskNotificationStatus::Killed) => ("Shell task killed", false),
+                        None => ("Background hook finished", false),
                     };
                     background_notice=Some((notification.chat_id,BackgroundRunNotice { message: message.into(), compact_message: None, necessary }));
                     status_dirty=true;
@@ -5628,21 +5667,13 @@ async fn check_shell_prompt_watchdog(
     Ok(())
 }
 
-/// Following Claude Code's task notification style: a status-colored dot plus a summary.
+/// The line a background task's end adds to the conversation as it happens, the one a replay of
+/// its task notification shows.
 fn task_notification_line(
     notification: &TaskNotification,
     display: DisplayProfile,
 ) -> Vec<(String, Option<Role>)> {
-    let role = match notification.status {
-        TaskNotificationStatus::Completed => Role::Success,
-        TaskNotificationStatus::Failed => Role::Error,
-        TaskNotificationStatus::Killed => Role::Warning,
-    };
-    vec![
-        ("\n".into(), None),
-        (display.glyph(Glyph::ToolCall).into(), Some(role)),
-        (format!(" {}\n", safe_text(&notification.summary)), None),
-    ]
+    presentation::task_notification_runs(notification.status(), &notification.summary, display)
 }
 
 /// What the view has read of a `!` command: where reading resumes and its latest lines.
@@ -10010,6 +10041,42 @@ mod tests {
                 .matches("TickUpdate: Stock watcher")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn a_background_hook_summary_shows_once_live_as_its_replay_shows_it() {
+        use super::{ChatSnapshot, consume_input_echo_from_snapshot};
+        use tickloop_harness::protocol::{TaskNotification, local_messages};
+        const SUMMARY: &str = "Background check found something";
+        let chat = uuid::Uuid::new_v4();
+        let run = uuid::Uuid::new_v4();
+        let message = local_messages::background_hook_notification(
+            SUMMARY,
+            "Stop hook blocking error from command \"PostToolUse:Bash\": REWAKE-DEMO",
+        );
+        let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
+            "id":chat,"folder":"/work","messages":[message],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
+        })).unwrap();
+        snapshot.message_ids.insert(0, uuid::Uuid::new_v4());
+        snapshot.message_runs.insert(0, run.into());
+
+        let live = Console::test_interactive_for_chat(chat);
+        live.write_task_notification(&TaskNotification::for_background_hook(chat.into(), SUMMARY))
+            .unwrap();
+        live.defer_input_echo(chat, run).unwrap();
+        consume_input_echo_from_snapshot(&live, &snapshot, run).unwrap();
+        let replay = Console::test_interactive_for_chat(chat);
+        super::workflows::write_public_history(&replay, &snapshot).unwrap();
+
+        assert_eq!(
+            live.test_conversation_text(),
+            format!("\n⏺ {SUMMARY}\n"),
+            "the line shows as the hook ends, and the run it wakes does not repeat it"
+        );
+        assert_eq!(
+            replay.test_conversation_text(),
+            live.test_conversation_text()
         );
     }
 

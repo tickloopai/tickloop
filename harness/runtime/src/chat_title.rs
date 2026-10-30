@@ -37,9 +37,12 @@ impl Agent {
             let Some(chat) = chats.get(&chat_id) else {
                 return;
             };
+            // A prompt its UserPromptSubmit hooks may still block reaches no model, the title
+            // model included; the hooks start the title once they let it through.
             if chat.snapshot.delegation.is_some()
                 || chat.snapshot.branch_origin.is_some()
                 || chat.snapshot.generated_title.is_some()
+                || chat.hook_state.session.awaits_prompt_hooks()
             {
                 return;
             }

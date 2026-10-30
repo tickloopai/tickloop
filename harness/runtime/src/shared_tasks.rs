@@ -100,10 +100,11 @@ enum UpdateAction {
     Cancel {
         result: String,
     },
+    /// A partial edit: each field left out keeps its current value.
     Edit {
-        title: String,
-        description: String,
-        dependencies: Vec<SharedTaskId>,
+        title: Option<String>,
+        description: Option<String>,
+        dependencies: Option<Vec<SharedTaskId>>,
     },
 }
 
@@ -196,7 +197,7 @@ pub(super) fn definitions(access: TaskToolAccess) -> Vec<ToolDefinition> {
         ToolDefinition { name: "TaskCreate".into(), description: "Create an optional task on your Agent family's task board. Reuse mutation_id when retrying an uncertain response. Tasks do not extend user authorization. The root can assign work; any member may claim available work. No automatic pickup or polling is needed.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":task}},"required":["mutation_id","title","description"],"additionalProperties":false}) },
         ToolDefinition { name: "TaskList".into(), description: "Read the current task board, including revisions, assignments and unresolved dependencies. Display numbers are task_number_offset plus the task’s position in board.tasks plus one; TaskGet/TaskUpdate still require the task id, not its display number. Do not poll: assignment messages arrive automatically. A Run ending does not complete its Task. A member may have multiple Runs: compare claim.run_id and report.run_id; a hand-back from an earlier Run does not settle a later claim.".into(), input_schema: json!({"type":"object","properties":{},"additionalProperties":false}) },
         ToolDefinition { name: "TaskGet".into(), description: "Read one task with its current revision and dependencies.".into(), input_schema: json!({"type":"object","properties":{"task_id":task},"required":["task_id"],"additionalProperties":false}) },
-        ToolDefinition { name: "TaskUpdate".into(), description: "Apply one typed action at expected_revision. Each action takes only its own fields; fields of other actions are ignored: claim takes none; assign requires owner; complete, release and cancel require result; edit requires title, description and dependencies (the full list, [] for none). claim atomically starts an unowned or self-assigned pending task; one active task per member. assign, edit and cancel are root-only. complete marks the task completed and requires its claiming Run. release relinquishes unfinished work back to pending, clearing owner and claim; it does not mark work completed. Only the claiming Run may release active work; main may release needs_attention after reconciling its effects. A hand-back from a different Run does not settle the current claim: compare claim.run_id and report.run_id. Completed and cancelled tasks must not be changed. Active work cannot be reassigned or cancelled: stop its execution first and reconcile its effects. A recovered/ended claim needs attention and never automatically reruns. On a revision conflict, use current_task to reconsider the action; do not blindly retry with a newer revision, and do not retry terminal tasks. Reuse mutation_id only with identical input. Completion stores a report reference; include the final report in the normal final response or Subagent report. Assignment notifies the target once; a delivery failure is reported without rolling back the assignment.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"task_id":task,"expected_revision":{"type":"integer","minimum":1},"action":{"type":"string","enum":["claim","assign","complete","release","cancel","edit"]},"owner":{"type":"string","minLength":1},"result":{"type":"string","minLength":1},"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":task}},"required":["mutation_id","task_id","expected_revision","action"],"additionalProperties":false}) },
+        ToolDefinition { name: "TaskUpdate".into(), description: "Apply one typed action at expected_revision. Each action takes only its own fields; fields of other actions are ignored: claim takes none; assign requires owner; complete, release and cancel require result; edit takes any of title, description and dependencies (the full list, [] for none); omitted fields keep their current value; give at least one. claim atomically starts an unowned or self-assigned pending task; one active task per member. assign, edit and cancel are root-only. complete marks the task completed and requires its claiming Run. release relinquishes unfinished work back to pending, clearing owner and claim; it does not mark work completed. Only the claiming Run may release active work; main may release needs_attention after reconciling its effects. A hand-back from a different Run does not settle the current claim: compare claim.run_id and report.run_id. Completed and cancelled tasks must not be changed. Active work cannot be reassigned or cancelled: stop its execution first and reconcile its effects. A recovered/ended claim needs attention and never automatically reruns. On a revision conflict, use current_task to reconsider the action; do not blindly retry with a newer revision, and do not retry terminal tasks. Reuse mutation_id only with identical input. Completion stores a report reference; include the final report in the normal final response or Subagent report. Assignment notifies the target once; a delivery failure is reported without rolling back the assignment.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"task_id":task,"expected_revision":{"type":"integer","minimum":1},"action":{"type":"string","enum":["claim","assign","complete","release","cancel","edit"]},"owner":{"type":"string","minLength":1},"result":{"type":"string","minLength":1},"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":task}},"required":["mutation_id","task_id","expected_revision","action"],"additionalProperties":false}) },
     ];
     match access {
         TaskToolAccess::Disabled => tools.clear(),
@@ -450,6 +451,14 @@ fn apply_update(
     claim: TaskClaim,
     assignment: Option<TaskOwner>,
 ) -> Result<Uuid, String> {
+    if let UpdateAction::Edit {
+        title: None,
+        description: None,
+        dependencies: None,
+    } = &input.action
+    {
+        return Err("edit requires at least one of title, description or dependencies".into());
+    }
     let index = board
         .tasks
         .iter()
@@ -538,9 +547,12 @@ fn apply_update(
         dependencies,
     } = &input.action
     {
-        text_valid(title)?;
-        text_valid(description)?;
-        validate_dependencies(board, input.task_id, dependencies)?;
+        for text in [title, description].into_iter().flatten() {
+            text_valid(text)?;
+        }
+        if let Some(dependencies) = dependencies {
+            validate_dependencies(board, input.task_id, dependencies)?;
+        }
     }
     if let UpdateAction::Cancel { result } = &input.action {
         text_valid(result)?;
@@ -576,9 +588,15 @@ fn apply_update(
             description,
             dependencies,
         } => {
-            task.title = title;
-            task.description = description;
-            task.dependencies = dependencies;
+            if let Some(title) = title {
+                task.title = title;
+            }
+            if let Some(description) = description {
+                task.description = description;
+            }
+            if let Some(dependencies) = dependencies {
+                task.dependencies = dependencies;
+            }
         }
     }
     task.revision += 1;
@@ -1292,9 +1310,14 @@ impl Agent {
                 .find(|task| task.id == previous.task_id)
                 .cloned();
             drop(chats);
-            let delivery = self
-                .deliver_task_assignment(receipt, root_id, loop_id, mutation_id, cancel)
-                .await;
+            let delivery = Box::pin(self.deliver_task_assignment(
+                receipt,
+                root_id,
+                loop_id,
+                mutation_id,
+                cancel,
+            ))
+            .await;
             return Ok(ToolResult {
                 content: model_json(
                     &ids,
@@ -1458,9 +1481,9 @@ impl Agent {
         self.persist_task_boards(root).await?;
         self.publish_task_board(&mut chats, root_id, loop_id);
         drop(chats);
-        let delivery = self
-            .deliver_task_assignment(receipt, root_id, loop_id, mutation_id, cancel)
-            .await;
+        let delivery =
+            Box::pin(self.deliver_task_assignment(receipt, root_id, loop_id, mutation_id, cancel))
+                .await;
         Ok(ToolResult {
             content: model_json(
                 &ids,

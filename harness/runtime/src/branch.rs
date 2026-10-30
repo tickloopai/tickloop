@@ -294,6 +294,7 @@ impl Agent {
                 feedback_inputs: Default::default(),
                 feedback_cleanup_started: false,
                 user_loops: std::collections::HashMap::new(),
+                user_skill_preparations: Default::default(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: std::collections::HashSet::new(),
                 output_style,
@@ -307,6 +308,7 @@ impl Agent {
                 goal_clock_ms: 0,
                 denial_window: super::denials::DenialWindow::default(),
                 cache_prefix: Default::default(),
+                hook_state: Default::default(),
             },
         );
         self.save(&snapshot);
@@ -999,6 +1001,7 @@ mod tests {
                     chat.snapshot
                         .pending_inputs
                         .push(tickloop_harness_protocol::PendingInput {
+                            skill_guidance: None,
                             receipt: tickloop_harness_protocol::Receipt {
                                 chat_id: chat.snapshot.id,
                                 loop_id: loop_id.into(),
@@ -1138,6 +1141,7 @@ mod tests {
                     chat.snapshot
                         .operations
                         .push(tickloop_harness_protocol::OperationRecord {
+                            input_message_id: None,
                             parent_call_id: None,
                             parent_call_index: None,
                             task_binding: None,

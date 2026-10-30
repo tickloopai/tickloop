@@ -2160,7 +2160,7 @@ impl HostToolProvider for McpHostToolProvider {
             jsonschema::validator_for(schema).map_err(|_| format!("invalid {name} schema"))?;
         validator
             .validate(input)
-            .map_err(|_| format!("invalid {name} input"))
+            .map_err(|error| crate::tool_input::schema_refusal(name, &error))
     }
 
     fn permission(&self, chat_id: ChatId, name: &str, input: &Value) -> HostToolPermission {

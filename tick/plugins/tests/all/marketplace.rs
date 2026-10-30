@@ -285,13 +285,12 @@ async fn git_refs_sha_pins_and_sparse_subdirectories_install_the_selected_conten
     crate::support::write_skill(&root.join("plugins/review/skills/new"), "new");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "new"]);
-    let newest = git(&root, &["rev-parse", "HEAD"]);
     let market = fixture.source("sources-market");
     write_json(
         &market.join("marketplace.json"),
         &json!({"name": "sources", "plugins": [
-            {"name": "review", "source": {"source": "git-subdir", "url": format!("file://{}", root.display()), "path": "plugins/review", "ref": "v1", "sha": old}},
-            {"name": "whole", "source": {"source": "url", "url": format!("file://{}", root.display()), "sha": newest}},
+            {"name": "review", "source": {"source": "git-subdir", "url": format!("file://{}", root.display()), "path": "plugins/review", "ref": "main", "sha": old}},
+            {"name": "whole", "source": {"source": "url", "url": format!("file://{}", root.display()), "ref": "main", "sha": old}},
             {"name": "github", "source": {"source": "github", "repo": "owner/repo", "ref": "main", "sha": old}}
         ]}),
     );
@@ -317,11 +316,20 @@ async fn git_refs_sha_pins_and_sparse_subdirectories_install_the_selected_conten
         .await
         .unwrap()
         .plugin;
-    assert_eq!(whole.revision, newest[..12]);
+    assert_eq!(whole.revision, old[..12]);
+    assert_eq!(whole.version, old[..12]);
+    assert!(
+        whole
+            .root
+            .join("plugins/review/skills/old/SKILL.md")
+            .is_file()
+    );
+    assert!(!whole.root.join("plugins/review/skills/new").exists());
     assert!(whole.root.join("outside").is_file());
     let mut document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(market.join("marketplace.json")).unwrap()).unwrap();
-    document["plugins"][0]["source"]["sha"] = json!(newest);
+    document["plugins"][0]["source"]["sha"] = json!("0".repeat(40));
+    document["plugins"][1]["source"]["sha"] = json!("0".repeat(40));
     write_json(&market.join("marketplace.json"), &document);
     fixture
         .store
@@ -329,13 +337,17 @@ async fn git_refs_sha_pins_and_sparse_subdirectories_install_the_selected_conten
         .await
         .unwrap();
     let before = fixture.registry();
-    let error = fixture
-        .store
-        .install_marketplace_plugin("sources", "review", &no_http)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("SHA"), "{error}");
-    assert_eq!(before, fixture.registry());
+    let files = fixture.plugin_files();
+    for name in ["review", "whole"] {
+        let error = fixture
+            .store
+            .install_marketplace_plugin("sources", name, &no_http)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(&"0".repeat(40)), "{error}");
+        assert_eq!(before, fixture.registry());
+        assert_eq!(files, fixture.plugin_files());
+    }
     assert!(installed.root.join("skills/old/SKILL.md").exists());
 }
 
@@ -1047,7 +1059,7 @@ async fn git_short_sha_pins_resolve_older_commits_and_record_the_full_commit() {
     git(&root, &["commit", "-m", "new"]);
     let source = GitSource {
         url: format!("file://{}", root.display()),
-        reference: None,
+        reference: Some("main".into()),
         sha: Some(old[..8].to_uppercase()),
         subdirectory: None,
     };
@@ -1067,6 +1079,161 @@ async fn git_short_sha_pins_resolve_older_commits_and_record_the_full_commit() {
             .unwrap()
             .contains("name: old")
     );
+}
+
+#[tokio::test]
+async fn git_pins_fall_back_to_ref_history_when_object_fetches_are_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let root = fixture.source("fetch-fallback");
+    crate::support::write_skill(&root.join("plugins/review/skills/check"), "old");
+    git(&root, &["init", "-b", "main"]);
+    for setting in [
+        "uploadpack.allowAnySHA1InWant",
+        "uploadpack.allowReachableSHA1InWant",
+        "uploadpack.allowTipSHA1InWant",
+    ] {
+        git(&root, &["config", setting, "false"]);
+    }
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "old"]);
+    let old = git(&root, &["rev-parse", "HEAD"]);
+    crate::support::write_skill(&root.join("plugins/review/skills/check"), "new");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "new"]);
+    git(&root, &["tag", "v2"]);
+    let newest = git(&root, &["rev-parse", "HEAD"]);
+    let url = format!("file://{}", root.display());
+    let probe = fixture.source("fetch-probe");
+    git(
+        &probe,
+        &[
+            "-c",
+            "protocol.version=0",
+            "clone",
+            "--depth",
+            "1",
+            "--no-checkout",
+            &url,
+            ".",
+        ],
+    );
+    let refused = std::process::Command::new("git")
+        .args([
+            "-c",
+            "protocol.version=0",
+            "fetch",
+            "--depth",
+            "1",
+            "origin",
+            &old,
+        ])
+        .current_dir(&probe)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("unadvertised object"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let executable = fixture.root().join("git-protocol-v0");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nexec git -c protocol.version=0 \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let client = tick_plugins::GitClient::new(executable, std::time::Duration::from_secs(10));
+    for reference in [None, Some("main"), Some("v2")] {
+        let source = GitSource {
+            url: url.clone(),
+            reference: reference.map(str::to_owned),
+            sha: Some(old.clone()),
+            subdirectory: Some("plugins/review".into()),
+        };
+        let checkout = client.checkout(&source, &fixture.root()).await.unwrap();
+        assert_eq!(checkout.commit(), old);
+        let installed = fixture
+            .store
+            .install_checkout(&checkout, "pinned", "review", None)
+            .unwrap()
+            .plugin;
+        assert_eq!(installed.revision, old[..12]);
+        assert!(
+            std::fs::read_to_string(installed.root.join("skills/check/SKILL.md"))
+                .unwrap()
+                .contains("name: old")
+        );
+        let missing = GitSource {
+            sha: Some("0".repeat(40)),
+            ..source
+        };
+        let error = match client.checkout(&missing, &fixture.root()).await {
+            Ok(_) => panic!("missing commit accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(&"0".repeat(40)), "{error}");
+    }
+    let source = GitSource {
+        url,
+        reference: Some("v2".into()),
+        sha: None,
+        subdirectory: Some("plugins/review".into()),
+    };
+    let checkout = client.checkout(&source, &fixture.root()).await.unwrap();
+    assert_eq!(checkout.commit(), newest);
+}
+
+#[tokio::test]
+async fn git_pin_failures_report_both_fetch_errors_without_credential_urls() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let root = fixture.source("fetch-errors");
+    crate::support::write_skill(&root.join("skills/check"), "check");
+    git(&root, &["init", "-b", "main"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "initial"]);
+    let source_url =
+        "https://fixture-user:fixture%2Dpassword@example.test/repo?token=fixture-query";
+    let reported_url =
+        "https://fixture-user:fixture-password@example.test/repo?token=fixture-query";
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    let executable = fixture.root().join("git-fetch-errors");
+    let rewrite = format!("url.file://{}.insteadOf={source_url}", root.display());
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *'fetch --depth 1'*) printf '%s\\n' {} >&2; exit 1;;\n  *'fetch --unshallow'*) printf '%s\\n' {} >&2; exit 1;;\nesac\nexec git -c {} \"$@\"\n",
+            quote(&format!("initial fetch refused: {source_url}")),
+            quote(&format!("history unavailable: '{reported_url}'")),
+            quote(&rewrite),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let client = tick_plugins::GitClient::new(executable, std::time::Duration::from_secs(10));
+    let source = GitSource {
+        url: source_url.into(),
+        reference: Some("main".into()),
+        sha: Some("a".repeat(40)),
+        subdirectory: None,
+    };
+    let error = match client.checkout(&source, &fixture.root()).await {
+        Ok(_) => panic!("failed fetches were accepted"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("initial fetch refused"), "{error}");
+    assert!(error.contains("history unavailable"), "{error}");
+    for secret in [
+        "fixture-user",
+        "fixture-password",
+        "fixture%2Dpassword",
+        "fixture-query",
+        "https://",
+    ] {
+        assert!(!error.contains(secret), "credential URL exposed: {error}");
+    }
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@ use std::{os::unix::process::ExitStatusExt, process::Stdio, time::Duration};
 use tickloop_harness::protocol::ChatId;
 use tickloop_harness::runtime::environment::{
     CapturedOutput, CommandOutput, CommandSpec, ExecutionAuthority, ExecutionError,
-    ExecutionOutcome, ProgramExit,
+    ExecutionOutcome, OutputTap, ProgramExit,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -95,8 +95,8 @@ pub(super) async fn run(
         let completion = async {
             let (status, (), ()) = tokio::join!(
                 child.wait(),
-                capture(stdout_pipe, &mut stdout),
-                capture(stderr_pipe, &mut stderr)
+                capture(stdout_pipe, &mut stdout, spec.stdout_tap.as_ref()),
+                capture(stderr_pipe, &mut stderr, None)
             );
             status
         };
@@ -159,14 +159,22 @@ pub(super) async fn run(
     }
 }
 
-/// Reads a pipe to its end, keeping what the captured output keeps.
-async fn capture(pipe: Option<impl AsyncRead + Unpin>, captured: &mut CapturedOutput) {
+/// Reads a pipe to its end, keeping what the captured output keeps and passing every chunk to
+/// `tap` as it arrives.
+async fn capture(
+    pipe: Option<impl AsyncRead + Unpin>,
+    captured: &mut CapturedOutput,
+    tap: Option<&OutputTap>,
+) {
     let Some(mut pipe) = pipe else {
         return;
     };
     let mut buffer = vec![0; READ_CHUNK_BYTES];
     while let Ok(read @ 1..) = pipe.read(&mut buffer).await {
         captured.append(&buffer[..read]);
+        if let Some(tap) = tap {
+            tap.send(&buffer[..read]);
+        }
     }
 }
 

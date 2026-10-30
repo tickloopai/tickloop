@@ -31,6 +31,9 @@ mod response_lifecycle;
 #[path = "all/approval_budget.rs"]
 mod approval_budget;
 
+#[path = "all/background_hooks.rs"]
+mod background_hooks;
+
 #[path = "all/artifact_real_service.rs"]
 mod artifact_real_service;
 
@@ -109,6 +112,9 @@ mod tool_list_stability;
 #[path = "all/launch_rules.rs"]
 mod launch_rules;
 
+#[path = "all/wrapped_command_rules.rs"]
+mod wrapped_command_rules;
+
 #[path = "all/environment_approval.rs"]
 mod environment_approval;
 
@@ -119,3 +125,12 @@ mod plan_reminders;
 
 #[path = "all/sandbox_auto_approval.rs"]
 mod sandbox_auto_approval;
+
+#[path = "all/tool_hooks.rs"]
+mod tool_hooks;
+
+#[path = "all/session_hooks.rs"]
+mod session_hooks;
+
+#[path = "all/command_skills.rs"]
+mod command_skills;

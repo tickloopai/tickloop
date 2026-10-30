@@ -618,6 +618,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
                 .collect(),
             persistence: DenialPersistence::Disabled,
             load_warning: None,
+            hook_runs: Vec::new(),
         });
         surface.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         state.permissions_surface = Some(surface);
@@ -643,6 +644,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
             records: vec![record.clone()],
             persistence: DenialPersistence::Disabled,
             load_warning: Some("Controlled load warning".into()),
+            hook_runs: Vec::new(),
         });
         if detail {
             surface.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

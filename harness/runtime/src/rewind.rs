@@ -159,6 +159,47 @@ impl Agent {
         }))
     }
 
+    /// Takes the prompt at message `index` that a `UserPromptSubmit` hook blocked, with what
+    /// follows it, back out of the conversation, as [`Agent::take_back_interrupted_prompt`]
+    /// does: the model never reads it, and the Transcript keeps it as an abandoned branch.
+    /// `run_id` is the Run the prompt started or the queued input it came as. Views redraw the
+    /// conversation only when `is_shown`; a queued prompt taken back as it joins never was.
+    pub(super) fn take_back_blocked_prompt(
+        &self,
+        chat: &mut Chat,
+        run_id: RunId,
+        index: usize,
+        is_shown: bool,
+    ) {
+        if chat.snapshot.message_runs.get(&index) != Some(&run_id) {
+            return;
+        }
+        let Some(point) = chat.snapshot.rewind_point_at(index) else {
+            return;
+        };
+        match conversation_before(
+            &chat.snapshot,
+            &chat.bookkeeping,
+            point.message_index,
+            Some(point.execution_mode),
+        ) {
+            Ok(candidate) => {
+                if is_shown {
+                    self.replace_conversation(
+                        chat,
+                        point.message_index,
+                        point.message_id,
+                        candidate,
+                    );
+                } else {
+                    self.swap_conversation(chat, point.message_index, candidate);
+                }
+                self.save(&chat.snapshot);
+            }
+            Err(error) => tracing::warn!("cannot take back a prompt a hook blocked: {error}"),
+        }
+    }
+
     /// Third stage of rewind: truncates the conversation according to the file restore result and
     /// the mode. The conversation is recomputed from the snapshot at the end of the occupation,
     /// keeping changes such as input queued during it. The task board follows the conversation;
@@ -263,6 +304,18 @@ impl Agent {
         chat: &mut Chat,
         index: usize,
         message_id: Uuid,
+        candidate: (ChatSnapshot, ChatBookkeeping),
+    ) {
+        self.swap_conversation(chat, index, candidate);
+        self.emit_conversation_rewound(chat, message_id);
+    }
+
+    /// Switches to the conversation truncated before message `index` without telling views,
+    /// for a tail none of them was shown.
+    fn swap_conversation(
+        &self,
+        chat: &mut Chat,
+        index: usize,
         (candidate, mut candidate_bookkeeping): (ChatSnapshot, ChatBookkeeping),
     ) {
         if let Some(recorder) = &self.inner.recorder {
@@ -272,7 +325,6 @@ impl Agent {
         chat.replace_snapshot(candidate);
         chat.bookkeeping = candidate_bookkeeping;
         self.inner.ledger_changes.send_replace(());
-        self.emit_conversation_rewound(chat, message_id);
     }
 
     pub(super) fn emit_conversation_rewound(&self, chat: &mut Chat, message_id: Uuid) {
@@ -429,7 +481,7 @@ pub(super) fn conversation_before(
     candidate.operations = std::mem::take(&mut candidate.operations)
         .into_iter()
         .filter(|operation| {
-            operation.parent_call_id.is_none()
+            (operation.parent_call_id.is_none() && operation.input_message_id.is_none())
                 || super::nested_calls::parent_on_chain(&candidate, operation)
         })
         .collect();

@@ -467,3 +467,40 @@ async fn edit_keeps_crlf_line_endings_and_removes_the_line_break_of_deleted_text
         .unwrap();
     assert_eq!(chat.content("unix.txt"), "keep\nkeep too\n");
 }
+
+/// The replacement text stays required; leaving it out names it and says how to delete or empty.
+#[tokio::test]
+async fn a_missing_replacement_says_how_to_pass_empty_text() {
+    let chat = Chat::new();
+    chat.file("notes.txt", "old\n");
+    chat.read(json!({"file_path":"notes.txt"})).await;
+    for (name, input, message) in [
+        (
+            "Edit",
+            json!({"file_path":"notes.txt","old_string":"old"}),
+            "new_string is required; pass \"\" to delete old_string",
+        ),
+        (
+            "Edit",
+            json!({"file_path":"notes.txt","old_string":"old","new_string":null}),
+            "new_string is required; pass \"\" to delete old_string",
+        ),
+        (
+            "Write",
+            json!({"file_path":"notes.txt"}),
+            "content is required; pass \"\" to write an empty file",
+        ),
+    ] {
+        match chat.run(name, input.clone()).await {
+            Err(ToolError::InvalidInput(error)) => assert_eq!(error, message, "{input}"),
+            other => panic!("{input}: expected invalid input, got {other:?}"),
+        }
+    }
+    assert_eq!(chat.content("notes.txt"), "old\n");
+    chat.edit(
+        json!({"file_path":"notes.txt","old_string":"old","new_string":"","replace_all":null}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(chat.content("notes.txt"), "");
+}

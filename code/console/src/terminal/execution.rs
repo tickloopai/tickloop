@@ -34,6 +34,7 @@ use tickloop_code_client::{LocalAgentClient, RecoveringAgentClient};
 use tickloop_code_daemon::EmbeddedAgentAccess;
 use tickloop_code_settings::new_chat::new_chat_settings;
 use tickloop_harness::model::judgment::jev_key_status_in;
+use tickloop_harness::protocol::hooks::{HookList, HookTrustChange};
 use tickloop_harness::protocol::{
     ApprovalHistoryView, BranchOutcome, BranchRequest, ChatSnapshot, ChatStatus, CommandSnapshot,
     CompactionOutcome, ContextBreakdown, DirectedSummaryOutcome, DirectedSummaryRequest, Event,
@@ -782,6 +783,10 @@ impl ConsoleExecution {
 
     pub(super) fn launch_spec(&self) -> LaunchSpec {
         self.effective_launch()
+    }
+    /// `/clear` left the shown Agent: the New Agent the draft creates starts the session it began.
+    pub(super) fn follow_clear_in_draft(&self) {
+        self.inner.draft.lock().unwrap().follow_clear();
     }
     pub(super) fn access(&self) -> Arc<dyn AgentAccess> {
         self.inner.access.clone()
@@ -2689,8 +2694,7 @@ impl ConsoleExecution {
             arguments,
             tickloop_code_settings::skills::SkillCaller::User,
         )
-        .and_then(tickloop_harness::protocol::InvokedSkill::try_from)
-        .map(|_| ())
+        .and_then(|expanded| expanded.validate())
     }
     fn initial_directory_sources(
         &self,
@@ -4297,6 +4301,50 @@ impl ConsoleExecution {
             ObservationValue::McpServers(servers) => {
                 servers.into_iter().next().ok_or_else(unexpected)
             }
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// The hooks configured for `folder`, read through this View's configuration root.
+    pub(super) async fn hooks(&self, folder: PathBuf) -> Result<HookList, AccessError> {
+        let mut launch = self.effective_launch();
+        launch.folder = folder;
+        match self
+            .inner
+            .access
+            .observe(ObservationRequest::Hooks {
+                launch: Box::new(launch),
+            })
+            .await?
+            .initial
+        {
+            ObservationValue::Hooks(hooks) => Ok(*hooks),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// Changes the trust records of hooks configured for `folder`, while they are still at
+    /// `expected_revision`, and returns the hooks as they then stand.
+    pub(super) async fn write_hook_trust(
+        &self,
+        folder: PathBuf,
+        changes: Vec<HookTrustChange>,
+        expected_revision: String,
+    ) -> Result<HookList, AccessError> {
+        let mut launch = self.effective_launch();
+        launch.folder = folder;
+        match self
+            .command(
+                AgentCommand::WriteHookTrust {
+                    launch: Box::new(launch),
+                    changes,
+                    expected_revision: Some(expected_revision),
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::Hooks(hooks) => Ok(*hooks),
             _ => Err(unexpected()),
         }
     }

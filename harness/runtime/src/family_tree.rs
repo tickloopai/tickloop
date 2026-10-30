@@ -154,6 +154,7 @@ impl Agent {
                 for run in child.parked.values() {
                     run.cancel.cancel();
                 }
+                child.hook_state.cancel_background();
                 mailbox
                     .stopped_runs
                     .entry(id)

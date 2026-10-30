@@ -649,3 +649,54 @@ async fn a_cancelled_search_stops_without_a_result() {
         assert!(matches!(error, ToolError::Cancelled), "{error}");
     }
 }
+
+/// Models fill every optional field; `""` and `null` there mean the field was not given, while
+/// a value that is given is still checked.
+#[tokio::test]
+async fn empty_optional_search_fields_mean_not_given() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    write(root, "log.txt", "match A\n");
+    write(root, "src/main.rs", "// match B\n");
+    assert_eq!(
+        glob(root, json!({"pattern":"**/*.txt","path":""})).await,
+        glob(root, json!({"pattern":"**/*.txt"})).await
+    );
+    let filled = json!({
+        "pattern":"match","output_mode":"content","path":"","type":"","glob":"",
+        "-n":null,"-i":"","-B":"","-A":null,"-C":null,"context":"",
+        "head_limit":"","offset":null,"multiline":""
+    });
+    assert_eq!(
+        grep(root, filled).await,
+        grep(root, json!({"pattern":"match","output_mode":"content"})).await
+    );
+    assert_eq!(
+        grep(root, json!({"pattern":"match","output_mode":"content"})).await,
+        "log.txt:1:match A\nsrc/main.rs:1:// match B"
+    );
+    for input in [
+        json!({"pattern":"match","type":"no-such-type"}),
+        json!({"pattern":"match","head_limit":"many"}),
+    ] {
+        assert!(
+            matches!(
+                run(root, GREP_TOOL_NAME, input.clone()).await,
+                Err(ToolError::InvalidInput(_))
+            ),
+            "{input}"
+        );
+    }
+    match run(
+        root,
+        GREP_TOOL_NAME,
+        json!({"pattern":"match","-i":"maybe"}),
+    )
+    .await
+    {
+        Err(ToolError::InvalidInput(error)) => {
+            assert_eq!(error, "-i: expected a boolean, found \"maybe\"")
+        }
+        other => panic!("expected invalid input, got {other:?}"),
+    }
+}

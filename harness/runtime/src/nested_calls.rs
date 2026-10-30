@@ -115,6 +115,10 @@ pub(crate) struct NestedCalls {
     pending: std::sync::Mutex<std::collections::BTreeMap<String, (usize, String, Value)>>,
     permissions: std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
     completed: Mutex<Vec<(Value, Value)>>,
+    /// A call that needs a person waits durably, suspending the Run at its place in the parent
+    /// call, as an `ExecuteTools` batch's do; otherwise it is denied on a host that keeps
+    /// durable approvals.
+    waits_durably: bool,
 }
 
 tokio::task_local! {
@@ -154,6 +158,13 @@ pub(crate) fn register_permission(id: Uuid) {
 
 pub(crate) fn is_nested() -> bool {
     CURRENT.try_with(|_| true).unwrap_or(false)
+}
+
+/// Whether the call being made inside another call may wait durably for a person.
+pub(crate) fn waits_durably() -> bool {
+    CURRENT
+        .try_with(|scope| scope.waits_durably)
+        .unwrap_or(false)
 }
 pub(crate) fn stop_after_denial(reason: &str) {
     let _ = CURRENT.try_with(|scope| {
@@ -343,6 +354,7 @@ impl NestedCalls {
             .map(|position| operation_start + position);
         let position = position.unwrap_or_else(|| {
             chat.snapshot.operations.push(OperationRecord {
+                input_message_id: None,
                 parent_call_id: Some(self.parent.clone()),
                 parent_call_index: Some(call_index),
                 task_binding: None,
@@ -419,6 +431,10 @@ impl NestedCalls {
         let Some(chat) = chats.get_mut(&self.receipt.chat_id) else {
             return;
         };
+        // The parent call returns: no rebuilt Run goes on with its calls any more.
+        chat.bookkeeping
+            .nested_outcomes
+            .retain(|(run, parent, _), _| *run != self.receipt.run_id || *parent != self.parent);
         let mut approvals = self.agent.inner.approvals.lock().await;
         chat.snapshot
             .permissions
@@ -442,6 +458,7 @@ impl NestedCalls {
             });
             let index = index.unwrap_or_else(|| {
                 chat.snapshot.operations.push(OperationRecord {
+                    input_message_id: None,
                     parent_call_id: Some(self.parent.clone()),
                     parent_call_index: Some(call_index),
                     task_binding: None,
@@ -513,6 +530,7 @@ impl Agent {
         receipt: &Receipt,
         message_id: Uuid,
         parent: String,
+        waits_durably: bool,
         cancel: &CancellationToken,
     ) -> Result<Arc<NestedCalls>, String> {
         let registry = self.prepare_tool_registry(receipt, cancel).await?;
@@ -527,6 +545,7 @@ impl Agent {
             pending: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             permissions: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             completed: Mutex::new(Vec::new()),
+            waits_durably,
         }))
     }
     pub(crate) fn record_nested_operation(
@@ -544,7 +563,7 @@ impl Agent {
         operation: &OperationRecord,
         outcome: Option<&NestedOutcome>,
     ) {
-        if operation.parent_call_id.is_some() {
+        if operation.parent_call_id.is_some() || operation.input_message_id.is_some() {
             self.record_chat_metadata(
                 chat_id,
                 tickloop_harness_transcript::Line::NestedCall(
@@ -600,6 +619,7 @@ impl Agent {
             return;
         };
         let operation = OperationRecord {
+            input_message_id: None,
             parent_call_id: Some(parent.to_owned()),
             parent_call_index: Some(index),
             task_binding: None,
@@ -661,6 +681,7 @@ impl Agent {
             ));
         }
         let operation = OperationRecord {
+            input_message_id: None,
             parent_call_id: None,
             parent_call_index: None,
             task_binding: None,
@@ -681,7 +702,7 @@ impl Agent {
             self.save(&chat.snapshot);
         }
         let scope = self
-            .nested_calls(receipt, message_id, parent.clone(), &cancel)
+            .nested_calls(receipt, message_id, parent.clone(), true, &cancel)
             .await?;
         // One call at a time: a call that waits for a person suspends the whole Run there, and
         // the batch goes on from that call.
@@ -720,9 +741,6 @@ impl Agent {
                 operation.state = OperationState::Completed;
                 operation.result = Some(result.clone());
             }
-            chat.bookkeeping
-                .nested_outcomes
-                .retain(|(run, batch, _), _| *run != receipt.run_id || *batch != parent);
             self.save(&chat.snapshot);
         }
         Ok(ToolCallOutcome {
@@ -735,6 +753,7 @@ impl Agent {
             continue_after_denial: false,
             is_rejected_by_user: false,
             denial: None,
+            hook_feedback: Default::default(),
         })
     }
 }
@@ -743,6 +762,20 @@ pub(crate) fn parent_on_chain(
     snapshot: &tickloop_harness_protocol::ChatSnapshot,
     operation: &OperationRecord,
 ) -> bool {
+    if let Some(input) = operation.input_message_id {
+        return operation.parent_call_id.is_none()
+            && snapshot
+                .messages
+                .iter()
+                .enumerate()
+                .any(|(index, message)| {
+                    message.role == tickloop_harness_protocol::Role::User
+                        && snapshot.prompt_execution_modes.contains_key(&index)
+                        && snapshot.message_runs.get(&index) == Some(&operation.run_id)
+                        && (snapshot.message_ids.get(&index) == Some(&input)
+                            || snapshot.original_message_ids.get(&index) == Some(&input))
+                });
+    }
     operation
         .parent_call_id
         .as_deref()

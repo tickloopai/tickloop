@@ -30,6 +30,7 @@ use crate::transcript::{
 };
 use tickloop_harness_base::private_fs::unix_time_milliseconds;
 use tickloop_harness_base::timestamp::format_timestamp;
+use tickloop_harness_protocol::hooks::HookRunRecord;
 use tickloop_harness_protocol::projection;
 use tickloop_harness_protocol::{
     AgentMessageSource, ApprovalRecord, BranchOrigin, ChatId, ChatSnapshot, CompactBoundary,
@@ -118,9 +119,13 @@ struct SavedApprovals {
     version: u32,
     chat_id: ChatId,
     records: Vec<ApprovalRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hook_runs: Vec<HookRunRecord>,
 }
 
-type DenialWrite = (ChatId, PathBuf, u64, Vec<ApprovalRecord>);
+/// What a Chat's activity history file holds.
+type SavedActivity = (Vec<ApprovalRecord>, Vec<HookRunRecord>);
+type DenialWrite = (ChatId, PathBuf, u64, SavedActivity);
 type DenialWriteResult = (ChatId, u64, Result<(), String>);
 
 fn write_denial_windows(
@@ -131,7 +136,7 @@ fn write_denial_windows(
     let _gate = gate.lock().unwrap();
     writes
         .into_iter()
-        .map(|(chat_id, path, revision, records)| {
+        .map(|(chat_id, path, revision, (records, hook_runs))| {
             if saved_revisions
                 .lock()
                 .unwrap()
@@ -144,6 +149,7 @@ fn write_denial_windows(
                 version: APPROVAL_FILE_VERSION,
                 chat_id,
                 records,
+                hook_runs,
             })
             .map_err(|error| error.to_string())
             .and_then(|bytes| {
@@ -530,7 +536,15 @@ impl ChatRecorder {
                     && saved.records.len() <= MAX_RECENT_DENIALS
                     && saved.records.iter().all(|record| record.chat_id == chat_id) =>
             {
-                Some(saved.records)
+                Some((
+                    saved.records,
+                    saved
+                        .hook_runs
+                        .into_iter()
+                        .filter(|run| run.chat_id == chat_id)
+                        .take(crate::hooks::MAX_RECENT_HOOK_RUNS)
+                        .collect::<Vec<_>>(),
+                ))
             }
             _ => serde_json::from_slice::<SavedDenials>(&contents)
                 .ok()
@@ -541,16 +555,20 @@ impl ChatRecorder {
                         && saved.records.iter().all(|record| record.chat_id == chat_id)
                 })
                 .map(|saved| {
-                    saved
-                        .records
-                        .into_iter()
-                        .map(ApprovalRecord::from_denial)
-                        .collect()
+                    (
+                        saved
+                            .records
+                            .into_iter()
+                            .map(ApprovalRecord::from_denial)
+                            .collect(),
+                        Vec::new(),
+                    )
                 }),
         };
         match records {
-            Some(records) => DenialWindow {
+            Some((records, hook_runs)) => DenialWindow {
                 records: records.into(),
+                hook_runs: hook_runs.into(),
                 ..Default::default()
             },
             None => DenialWindow {
@@ -1530,7 +1548,7 @@ impl ChatRecorder {
                     *chat_id,
                     self.denial_path_for_chat(*chat_id)?,
                     window.revision,
-                    window.records.iter().cloned().collect(),
+                    window.saved_activity(),
                 ))
             })
             .collect();
@@ -1649,6 +1667,10 @@ fn chain_entry(
         task_reminder: snapshot.host_notes.get(&index) == Some(&HostNote::TaskReminder),
         date_change: match snapshot.host_notes.get(&index) {
             Some(HostNote::DateChange(date)) => Some(date.clone()),
+            _ => None,
+        },
+        hook_note: match snapshot.host_notes.get(&index) {
+            Some(HostNote::Hook(event)) => Some(event.name().to_owned()),
             _ => None,
         },
         guidance: match snapshot.host_notes.get(&index) {
@@ -1828,6 +1850,7 @@ fn record_loop(
         loop_state_view: None,
         task_reminder: false,
         date_change: None,
+        hook_note: None,
         guidance: None,
         execution_mode: None,
         is_inherited_prompt: false,
@@ -2163,6 +2186,12 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
             restored
                 .host_notes
                 .insert(index, HostNote::DateChange(date.clone()));
+        } else if let Some(event) = entry
+            .hook_note
+            .as_deref()
+            .and_then(tickloop_harness_protocol::hooks::HookEvent::from_name)
+        {
+            restored.host_notes.insert(index, HostNote::Hook(event));
         } else if let Some(note) = &entry.guidance {
             restored
                 .host_notes
@@ -3486,7 +3515,7 @@ impl Agent {
                         *chat_id,
                         recorder.denial_path_for_chat(*chat_id)?,
                         window.revision,
-                        window.records.iter().cloned().collect(),
+                        window.saved_activity(),
                     ))
                 })
                 .collect::<Vec<DenialWrite>>()
@@ -4225,6 +4254,7 @@ impl Agent {
                 feedback_inputs: HashMap::new(),
                 feedback_cleanup_started: false,
                 user_loops: HashMap::new(),
+                user_skill_preparations: HashMap::new(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,
@@ -4238,6 +4268,10 @@ impl Agent {
                 loaded_from_history: waits == WaitHosting::Process,
                 goal_clock_ms: 0,
                 cache_prefix: Default::default(),
+                hook_state: crate::hooks::ChatHookState::starting_session(
+                    snapshot.delegation.is_none(),
+                    crate::hooks::SessionSource::Resume,
+                ),
             },
         );
         if let Some(context) = snapshot
@@ -4318,7 +4352,22 @@ impl StagedBranch {
         snapshot.last_queue_sequence = snapshot
             .last_queue_sequence
             .max(previous.last_queue_sequence);
-        snapshot.operations = previous.operations.clone();
+        let mut operations = std::mem::take(&mut snapshot.operations)
+            .into_iter()
+            .filter(|operation| operation.input_message_id.is_some())
+            .map(|operation| (operation.id, operation))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        operations.extend(
+            previous
+                .operations
+                .iter()
+                .filter(|operation| {
+                    operation.input_message_id.is_none()
+                        || super::nested_calls::parent_on_chain(&snapshot, operation)
+                })
+                .map(|operation| (operation.id, operation.clone())),
+        );
+        snapshot.operations = operations.into_values().collect();
         snapshot.request_usage = previous.request_usage.clone();
         snapshot.provider_failures = previous.provider_failures.clone();
         snapshot.user_shells = previous.user_shells.clone();

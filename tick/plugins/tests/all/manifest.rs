@@ -42,10 +42,7 @@ fn a_claude_plugin_lists_its_skills_and_the_components_tickloop_does_not_use_yet
             Component::McpServers,
         ])
     );
-    assert_eq!(
-        manifest.unsupported(),
-        vec![Component::Commands, Component::Hooks]
-    );
+    assert!(manifest.unsupported().is_empty());
     assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
     let root = root.canonicalize().unwrap();
     assert_eq!(
@@ -374,7 +371,7 @@ fn component_paths_keep_valid_entries_and_inline_configurations() {
             "commands": {"valid": {"source": "./guide.md"}, "missing": {"source": "./missing.md"}},
             "agents": ["./guide.md", "./missing.md"],
             "outputStyles": "./guide.md",
-            "hooks": {"hooks": {}},
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "check"}]}]},
             "mcpServers": ["./missing.json", {"server": {"command": "server"}}],
             "lspServers": {"rust": {"command": "rust-analyzer"}},
             "settings": {"model": "default"},
@@ -389,9 +386,7 @@ fn component_paths_keep_valid_entries_and_inline_configurations() {
     assert_eq!(
         manifest.unsupported(),
         vec![
-            Component::Commands,
             Component::Agents,
-            Component::Hooks,
             Component::LspServers,
             Component::OutputStyles,
             Component::Channels,
@@ -420,7 +415,7 @@ fn inline_commands_are_recognized_without_a_source_path() {
         &[],
     );
     let manifest = PluginManifest::load(&root, "unused", None).unwrap();
-    assert_eq!(manifest.unsupported(), vec![Component::Commands]);
+    assert!(manifest.unsupported().is_empty());
     assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
 }
 
@@ -568,5 +563,234 @@ fn a_plugin_without_a_hooks_field_declares_only_its_default_hooks_file() {
     assert_eq!(
         PluginManifest::load(&hooked, "unused", None).unwrap().hooks,
         [PluginHooks::File(PathBuf::from("hooks/hooks.json"))]
+    );
+}
+
+fn names(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[test]
+fn hooks_are_supported_per_event_type_and_field_with_the_rest_named_in_warnings() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin(
+        "guard",
+        &json!({
+            "name": "guard",
+            "hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": "check-done"},
+                {"type": "agent", "prompt": "Is it done?"},
+            ]}]},
+        }),
+        &[],
+    );
+    write_json(
+        &root.join("hooks/hooks.json"),
+        &json!({"description": "Guards", "hooks": {
+            "PreToolUse": [{"matcher": "Bash|Edit", "hooks": [
+                {"type": "command", "command": "guard", "timeout": 10, "if": "Bash(rm *)"},
+                {"type": "prompt", "prompt": "Is this safe?"},
+                {"type": "command", "command": "later", "async": true, "once": true},
+                {"type": "command", "command": "review", "asyncRewake": true,
+                 "rewakeMessage": "Review:", "rewakeSummary": "Review found issues"},
+            ]}],
+            "Notification": [{"hooks": [{"type": "command", "command": "notify"}]}],
+            "PermissionRequest": [{"hooks": [{"type": "command", "command": "ask"}]}],
+            "PostToolUse": [{"hooks": [{"type": "http", "url": "https://example.com"}]}],
+        }}),
+    );
+
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+
+    assert!(manifest.components.contains(&Component::Hooks));
+    assert!(manifest.unsupported().is_empty());
+    let support = &manifest.hook_support;
+    assert_eq!(support.runnable, 3);
+    assert_eq!(support.events, names(&["PreToolUse", "Stop"]));
+    assert_eq!(support.types, names(&["command"]));
+    assert_eq!(
+        support.fields,
+        names(&[
+            "asyncRewake",
+            "command",
+            "if",
+            "rewakeMessage",
+            "rewakeSummary",
+            "timeout"
+        ])
+    );
+    assert_eq!(
+        support.unsupported_events,
+        names(&["Notification", "PermissionRequest"])
+    );
+    assert_eq!(
+        support.unsupported_types,
+        names(&["agent", "http", "prompt"])
+    );
+    assert_eq!(support.unsupported_fields, names(&["once"]));
+    assert_eq!(
+        manifest.warnings,
+        [
+            "hook events not supported yet, so their hooks are not used: Notification, \
+             PermissionRequest",
+            "hook types not supported yet, so those hooks are not used: agent, http, prompt",
+            "hook fields not supported yet, so the hooks using them are not used: once",
+        ]
+    );
+}
+
+#[test]
+fn hooks_tickloop_can_run_none_of_stay_an_unsupported_component() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin("notify", &json!({"name": "notify"}), &[]);
+    write_json(
+        &root.join("hooks/hooks.json"),
+        &json!({"hooks": {"Notification": [{"hooks": [{"type": "command", "command": "say"}]}]}}),
+    );
+
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+
+    assert_eq!(manifest.hook_support.runnable, 0);
+    assert_eq!(manifest.unsupported(), vec![Component::Hooks]);
+    assert_eq!(
+        manifest.warnings,
+        ["hook events not supported yet, so their hooks are not used: Notification"]
+    );
+}
+
+#[test]
+fn hooks_that_cannot_be_read_are_ignored_with_a_warning() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin(
+        "broken",
+        &json!({
+            "name": "broken",
+            "hooks": ["./extra.json", {"Stop": [{"hooks": [{"type": "command", "command": ""}]}]}],
+        }),
+        &[],
+    );
+    fs::create_dir_all(root.join("hooks")).unwrap();
+    fs::write(root.join("hooks/hooks.json"), "{not json").unwrap();
+    write_json(&root.join("extra.json"), &json!(["not", "an", "object"]));
+
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+
+    assert_eq!(manifest.hook_support.runnable, 0);
+    assert!(manifest.unsupported().is_empty());
+    assert_eq!(manifest.warnings.len(), 3, "{:?}", manifest.warnings);
+    assert!(
+        manifest.warnings[0]
+            .starts_with("hooks file hooks/hooks.json is ignored: it is not valid JSON"),
+        "{:?}",
+        manifest.warnings
+    );
+    assert_eq!(
+        manifest.warnings[1..],
+        [
+            "hooks file extra.json is ignored: it must hold a JSON object",
+            "hooks in .claude-plugin/plugin.json that do not follow the Claude Code hooks format \
+             are ignored",
+        ]
+    );
+}
+
+#[test]
+fn command_selection_names_recursion_metadata_and_inline_content() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin("commands", &json!({"name":"commands"}), &[]);
+    fs::create_dir_all(root.join("commands/deep/task")).unwrap();
+    fs::write(root.join("commands/check.md"), "check").unwrap();
+    fs::write(root.join("commands/deep/task/SKILL.md"), "skill command").unwrap();
+    fs::write(root.join("commands/deep/task/ignored.md"), "ignored").unwrap();
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    let discovery = tick_plugins::discover_commands(&root, &manifest);
+    assert_eq!(
+        discovery
+            .commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect::<Vec<_>>(),
+        ["check", "deep:task"]
+    );
+    write_json(
+        &root.join(".claude-plugin/plugin.json"),
+        &json!({"name":"commands", "commands": {
+            "renamed":{"source":"./commands/check.md","description":"override"},
+            "inline":{"content":"inline body"}
+        }}),
+    );
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    let discovery = tick_plugins::discover_commands(&root, &manifest);
+    assert_eq!(discovery.commands.len(), 2);
+    assert!(
+        discovery
+            .commands
+            .iter()
+            .any(|command| command.name == "renamed"
+                && command.metadata["description"] == "override")
+    );
+    assert!(
+        !discovery
+            .commands
+            .iter()
+            .any(|command| command.name == "deep:task")
+    );
+    assert!(
+        discovery
+            .commands
+            .iter()
+            .any(|command| command.name == "inline"
+                && command.base_directory == root.canonicalize().unwrap())
+    );
+}
+
+#[test]
+fn command_discovery_rejects_escaping_links_and_stops_directory_cycles() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin("commands", &json!({"name":"commands"}), &[]);
+    fs::create_dir_all(root.join("commands")).unwrap();
+    let outside = fixture.source("outside");
+    fs::write(outside.join("secret.md"), "secret").unwrap();
+    symlink(outside.join("secret.md"), root.join("commands/escape.md")).unwrap();
+    symlink(root.join("commands"), root.join("commands/cycle")).unwrap();
+    symlink(root.join("missing.md"), root.join("commands/missing.md")).unwrap();
+    fs::write(root.join("commands/good.md"), "good").unwrap();
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    let discovery = tick_plugins::discover_commands(&root, &manifest);
+    assert_eq!(discovery.commands.len(), 1);
+    assert_eq!(discovery.commands[0].name, "good");
+    assert_eq!(discovery.warnings.len(), 2);
+}
+
+#[test]
+fn explicit_command_files_keep_their_stem_and_invalid_arrays_are_not_loaded() {
+    let fixture = Fixture::new();
+    let root = fixture.claude_plugin(
+        "commands",
+        &json!({"name":"commands", "commands":"./custom/SKILL.md"}),
+        &[],
+    );
+    fs::create_dir_all(root.join("custom")).unwrap();
+    fs::write(root.join("custom/SKILL.md"), "Guide").unwrap();
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    assert_eq!(
+        tick_plugins::discover_commands(&root, &manifest).commands[0].name,
+        "SKILL"
+    );
+    write_json(
+        &root.join(".claude-plugin/plugin.json"),
+        &json!({"name":"commands", "commands":["./custom/SKILL.md",7]}),
+    );
+    let manifest = PluginManifest::load(&root, "unused", None).unwrap();
+    assert!(
+        tick_plugins::discover_commands(&root, &manifest)
+            .commands
+            .is_empty()
+    );
+    assert!(
+        manifest
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("commands is ignored"))
     );
 }

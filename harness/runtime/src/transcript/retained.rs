@@ -270,7 +270,10 @@ impl RetainedFold {
                         || response_inputs.contains(&entry.input_id)
                         || recent_external_inputs.contains(&entry.input_id)
                 }
-                Line::NestedCall(entry) => entry.operation.parent_call_id.as_ref().is_some_and(|parent| self.chain.keeps_nested_parent(entry.operation.run_id.into(), parent)),
+                Line::NestedCall(entry) => entry.operation.input_message_id.map_or_else(
+                    || entry.operation.parent_call_id.as_ref().is_some_and(|parent| self.chain.keeps_nested_parent(entry.operation.run_id.into(), parent)),
+                    |input| self.chain.keeps_entry(input),
+                ),
                 Line::RecordedEdit(entry) => self.chain.keeps_tool_result(&entry.call_id),
                 Line::Wait(entry) => {
                     matches!(entry.state, WaitState::Open | WaitState::Resolved { .. } | WaitState::Allowed { .. })

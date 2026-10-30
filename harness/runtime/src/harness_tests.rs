@@ -353,6 +353,7 @@ async fn managed_settlement_reports_an_unknown_operation_once_and_keeps_it() {
             .snapshot
             .operations
             .push(tickloop_harness_protocol::OperationRecord {
+                input_message_id: None,
                 parent_call_id: None,
                 parent_call_index: None,
                 task_binding: None,

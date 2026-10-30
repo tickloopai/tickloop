@@ -1234,6 +1234,40 @@
     }
   },
   {
+    "Hooks": {
+      "hooks": [
+        {
+          "key": "k1",
+          "source": {
+            "kind": "plugin",
+            "id": "guard@market"
+          },
+          "file": "/home/user/.tickloop/plugins/cache/guard/hooks/hooks.json",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "command": "${CLAUDE_PLUGIN_ROOT}/check.sh",
+          "resolved_command": "/home/user/.tickloop/plugins/cache/guard/check.sh",
+          "if": "Bash(rm *)",
+          "timeout_secs": 30,
+          "background": {
+            "kind": "async_rewake",
+            "message": "Review:"
+          },
+          "plugin": {
+            "root": "/home/user/.tickloop/plugins/cache/guard",
+            "data": "/home/user/.tickloop/plugins/data/guard"
+          },
+          "hash": "h1",
+          "trust": "pending"
+        }
+      ],
+      "warnings": [
+        "Notification hooks are not supported yet; skipped"
+      ],
+      "revision": "r1"
+    }
+  },
+  {
     "EndedAgents": [
       {
         "record": {

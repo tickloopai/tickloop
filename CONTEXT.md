@@ -76,7 +76,11 @@ _Avoid_: "associated Artifact" (Artifact Association refers specifically to the 
 ### Plugins
 
 **Plugin**:
-An installable unit of components that extend the Agent's available Skills, Tick programs, or MCP Servers. A plugin can also describe components that Tickloop does not yet support. Installation and enablement are separate; enabling a plugin consents to running its programs and MCP Servers, but a plugin grants no additional permissions.
+An installable unit of components that extend the Agent's available Skills (including Commands), Tick programs, MCP Servers, or Hooks. A plugin can also describe components that Tickloop does not yet support. Installation and enablement are separate; enabling a plugin consents to running its programs and MCP Servers, but a plugin grants no additional permissions.
+
+**Plugin Command**:
+A plugin's Markdown instruction registered as a Skill, named `<plugin>:<command>` and invocable through the Skill tool or a slash command.
+_Avoid_: model tool (a Command supplies guidance through Skill), CLI command (a separate executable interface)
 
 **Plugin User Config**:
 Values a plugin declares that the user fills in, such as an API key or a server address, used by its components. Sensitive values are kept with the plugin's credentials and never reach content the model can see.
@@ -118,6 +122,16 @@ _Avoid_: deferred loading (that names the native form only), lazy tools
 
 **Fold**:
 The Tool Search form that asks nothing of the model: three fixed tools, SearchTools, DescribeTools and ExecuteTools, find, describe and call the tools, which never enter the tool list. ExecuteTools runs a batch of independent calls.
+
+### Hooks
+
+**Hook**:
+A user-configured command attached to a fixed event in the Agent's work, supplied by the user's settings, an enabled plugin or the Folder's repository configuration. A Hook is neither a model tool nor a Tick or Shell Tick.
+_Avoid_: Git hook (a separate mechanism)
+
+**Hook Trust**:
+The user's content-bound confirmation that a plugin or repository Hook may run.
+_Avoid_: Working Directory Trust, plugin enablement, tool approval (separate decisions)
 
 ### Loop and Trigger
 

@@ -313,7 +313,11 @@ impl Lifecycle {
             .values()
             .filter(|input| input.record.state == InputState::Accepted)
             .filter_map(|input| {
-                serde_json::from_value::<PendingInput>(input.record.queued.clone()?).ok()
+                let mut pending =
+                    serde_json::from_value::<PendingInput>(input.record.queued.clone()?).ok()?;
+                // PendingInput omits live flags; the ledger retains the accepted invocation kind.
+                pending.is_skill_invocation = matches!(input.record.op, InputOp::Skill);
+                Some(pending)
             })
             // Another attempt at an answer is the continuation of its input, not a queued input.
             .filter(|pending| !pending.task_continuation)
@@ -1192,6 +1196,7 @@ impl Agent {
     }
 
     pub(crate) fn settle_input(&self, chat: &mut Chat, run: RunId, outcome: SettledOutcome) {
+        chat.user_skill_preparations.remove(&run);
         if chat.bookkeeping.lifecycle.settle(run, outcome) {
             self.inner.ledger_changes.send_replace(());
         }

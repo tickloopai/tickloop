@@ -13,7 +13,11 @@ use std::{
 use serde_json::{Map, Value, json};
 use tick_packages::{MANIFEST_FILE_NAME as TICK_PACKAGE_MANIFEST, PackageAuth, PackageManifest};
 
-use crate::{PluginError, printable};
+use crate::{
+    PluginError,
+    hooks::{HookSupport, hook_support},
+    printable,
+};
 
 pub const TICKLOOP_MANIFEST: &str = ".tickloop-plugin/plugin.json";
 pub const CLAUDE_MANIFEST: &str = ".claude-plugin/plugin.json";
@@ -95,7 +99,12 @@ impl Component {
     pub fn is_supported(self) -> bool {
         matches!(
             self,
-            Self::Tick | Self::Skills | Self::McpServers | Self::UserConfig
+            Self::Tick
+                | Self::Skills
+                | Self::Commands
+                | Self::Hooks
+                | Self::McpServers
+                | Self::UserConfig
         )
     }
 
@@ -149,12 +158,16 @@ pub struct PluginManifest {
     pub auth: PackageAuth,
     /// The directories that hold Skills, relative to the plugin root.
     pub skill_paths: Vec<PathBuf>,
+    /// Explicit Commands selection; absent uses the default commands directory.
+    pub commands: Option<Value>,
     pub components: BTreeSet<Component>,
     /// Raw MCP entries; the host resolves variables and interprets transports.
     pub mcp_servers: BTreeMap<String, Value>,
     /// Where the plugin declares hooks: its default hooks file first, then its manifest's `hooks`
     /// field in order. The host reads and interprets them.
     pub hooks: Vec<PluginHooks>,
+    /// Which of the declared hooks Tickloop runs.
+    pub hook_support: HookSupport,
     pub user_config: BTreeMap<String, UserConfigField>,
     /// What was ignored in the manifest, and why.
     pub warnings: Vec<String>,
@@ -227,12 +240,16 @@ impl PluginManifest {
         }
     }
 
-    /// The components the plugin carries that Tickloop does not use yet.
+    /// The components the plugin carries that Tickloop does not use yet, hooks included when
+    /// Tickloop can run none of the declared ones.
     pub fn unsupported(&self) -> Vec<Component> {
         self.components
             .iter()
             .copied()
-            .filter(|component| !component.is_supported())
+            .filter(|component| {
+                !component.is_supported()
+                    || (*component == Component::Hooks && self.hook_support.is_unsupported())
+            })
             .collect()
     }
 
@@ -405,6 +422,7 @@ fn from_document(
     }
     let mcp_servers = read_mcp_servers(root, document.get("mcpServers"), &mut warnings);
     let hooks = hook_declarations(root, document.get("hooks"));
+    let hook_support = hook_support(root, &hooks, source, &mut warnings);
     let user_config = read_user_config(document.get("userConfig"), &mut warnings);
     Ok(PluginManifest {
         name,
@@ -415,9 +433,11 @@ fn from_document(
         tick,
         auth,
         skill_paths,
+        commands: document.get("commands").cloned(),
         components,
         mcp_servers,
         hooks,
+        hook_support,
         user_config,
         warnings,
     })
@@ -458,6 +478,7 @@ fn from_tick_package(
     insert_default_components(root, &mut components, &mut warnings);
     let mcp_servers = read_mcp_servers(root, None, &mut warnings);
     let hooks = hook_declarations(root, None);
+    let hook_support = hook_support(root, &hooks, TICK_PACKAGE_MANIFEST, &mut warnings);
     Ok(PluginManifest {
         name: marketplace_name.map_or(package.name, str::to_owned),
         display_name,
@@ -470,9 +491,11 @@ fn from_tick_package(
         }),
         auth: package.auth,
         skill_paths,
+        commands: None,
         components,
         mcp_servers,
         hooks,
+        hook_support,
         user_config: BTreeMap::new(),
         warnings,
     })
@@ -668,7 +691,7 @@ fn contained_paths(
     paths
 }
 
-fn contained_path(root: &Path, text: &str) -> Result<PathBuf, &'static str> {
+pub(crate) fn contained_path(root: &Path, text: &str) -> Result<PathBuf, &'static str> {
     let Some(relative) = text.strip_prefix("./") else {
         return Err("it must start with ./");
     };

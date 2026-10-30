@@ -201,7 +201,7 @@ impl HostToolProvider for McpToolProvider {
             .ok_or("MCP tool unavailable")?;
         tool.display_validator
             .validate(input)
-            .map_err(|_| format!("invalid {name} input"))
+            .map_err(|error| crate::tool_input::schema_refusal(name, &error))
     }
 
     fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {

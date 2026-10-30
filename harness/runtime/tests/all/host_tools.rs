@@ -1191,3 +1191,104 @@ async fn blocked_host_catalog_capture_does_not_hold_the_chats_lock() {
     agent.shutdown().await;
     responsive.expect("a blocked catalog capture must not hold the Chats lock");
 }
+
+#[derive(Default)]
+struct OptionalFieldsTool {
+    executed: Mutex<Vec<Value>>,
+}
+
+#[async_trait]
+impl HostToolProvider for OptionalFieldsTool {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "search_notes".into(),
+            description: "Search notes.".into(),
+            input_schema: json!({"type":"object","properties":{
+                "query":{"type":"string","minLength":1},
+                "scope":{"type":"string","enum":["all","open"]},
+                "limit":{"type":"integer","minimum":1},
+                "label":{"type":"string","minLength":1},
+                "note":{"type":"string"}
+            },"required":["query"],"additionalProperties":false}),
+        }]
+    }
+
+    fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
+        HostToolPermission::ReadOnly
+    }
+
+    async fn execute(&self, _: ChatId, _: &str, input: Value, _: CancellationToken) -> ToolResult {
+        self.executed.lock().unwrap().push(input);
+        ToolResult {
+            content: "found".into(),
+            is_error: false,
+            output_ref: None,
+        }
+    }
+}
+
+/// Models fill every property of a flat schema: an optional property left `null` or `""` where
+/// its schema cannot take that value was not given, so the call runs without it. Required
+/// properties and values the schema accepts are still judged as written.
+#[tokio::test]
+async fn optional_host_tool_fields_left_empty_are_not_given() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "filled",
+            "search_notes",
+            json!({"query":"q","scope":"","limit":null,"label":"","note":""}),
+        ),
+        call("empty-query", "search_notes", json!({"query":""})),
+        call(
+            "bad-scope",
+            "search_notes",
+            json!({"query":"q","scope":"closed"}),
+        ),
+        text("done"),
+    ]));
+    let provider = Arc::new(OptionalFieldsTool::default());
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_host_tools(provider.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent.submit(chat, "Search".into()).await.unwrap();
+    wait_for_completion(&agent, chat).await;
+
+    assert_eq!(
+        provider.executed.lock().unwrap().as_slice(),
+        [json!({"query":"q","note":""})]
+    );
+    let requests = model.requests.lock().unwrap();
+    let result = |id: &str| {
+        requests
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|content| match content {
+                Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == id => Some((content.text(), *is_error)),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(result("filled"), ("found".into(), false));
+    assert_eq!(
+        result("empty-query"),
+        (
+            "invalid search_notes input: input.query is too short".into(),
+            true
+        )
+    );
+    assert_eq!(
+        result("bad-scope"),
+        (
+            "invalid search_notes input: input.scope has an invalid value; expected one of \"all\", \"open\"".into(),
+            true
+        )
+    );
+}

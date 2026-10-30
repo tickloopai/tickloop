@@ -55,6 +55,7 @@ mod daemon_server;
 mod draft_context;
 mod draft_mcp;
 mod embedded;
+mod hook_trust;
 mod ingress;
 mod ipc;
 mod lifecycle;

@@ -856,3 +856,45 @@ fn a_snapshot_leaves_the_goal_to_its_own_records() {
             .any(|line| matches!(line, Line::Goal(_)))
     );
 }
+
+#[test]
+fn command_input_records_follow_original_identity_through_retained_snapshots() {
+    let mut generator = Generator::new(0);
+    let original = Uuid::new_v4();
+    let physical = Uuid::new_v4();
+    let input = parse(json!({
+        "type":"user", "uuid":physical, "originalMessageId":original, "parentUuid":null,
+        "chatId":generator.chat, "timestamp":TIMESTAMP, "version":"test",
+        "message":{"role":"user","content":[{"type":"text","text":"/demo:check"}]}
+    }));
+    let operation = Line::NestedCall(tickloop_harness_transcript::NestedCallEntry {
+        chat_id: generator.chat,
+        operation: serde_json::from_value(json!({
+            "input_message_id": original, "id":Uuid::new_v4(), "loop_id":Uuid::new_v4(), "run_id":Uuid::new_v4(),
+            "call_id":"prepare", "name":"Bash", "input":{"command":"printf prepared"}, "state":"Completed",
+            "result":{"content":"prepared","is_error":false}
+        })).unwrap(),
+        status: None,
+        images: Vec::new(),
+        sources: Vec::new(),
+    });
+    let mut fold = RetainedFold::default();
+    fold.apply(&input);
+    fold.apply(&operation);
+    let chat_id = generator.chat;
+    let has_operation = |fold: &RetainedFold| {
+        let Line::RetainedSnapshot(snapshot) = fold.snapshot(chat_id) else {
+            unreachable!()
+        };
+        snapshot
+            .lines
+            .iter()
+            .any(|line| matches!(line, Line::NestedCall(_)))
+    };
+    assert!(has_operation(&fold));
+    let retained = fold.snapshot(generator.chat);
+    fold.apply(&retained);
+    assert!(has_operation(&fold));
+    fold.apply(&generator.boundary());
+    assert!(!has_operation(&fold));
+}

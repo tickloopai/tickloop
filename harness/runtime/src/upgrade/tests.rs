@@ -71,6 +71,7 @@ async fn private_checkpoint_roundtrip_retains_fields_that_history_deliberately_o
         )
         .unwrap();
     snapshot.pending_inputs.push(PendingInput {
+        skill_guidance: None,
         receipt: Receipt {
             run_id: Uuid::new_v4().into(),
             ..receipt.clone()
@@ -97,6 +98,7 @@ async fn private_checkpoint_roundtrip_retains_fields_that_history_deliberately_o
         )],
     });
     snapshot.operations.push(OperationRecord {
+        input_message_id: None,
         parent_call_id: None,
         parent_call_index: None,
         id: Uuid::new_v4(),

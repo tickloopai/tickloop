@@ -186,6 +186,7 @@ struct MemorySettings {
     auto_revision: u64,
     has_thinking_selection: bool,
     previous_effort: Option<ReasoningEffort>,
+    hooks: HookList,
 }
 
 impl MemorySettingsStore {
@@ -207,7 +208,18 @@ impl MemorySettingsStore {
     }
 }
 
+impl MemorySettingsStore {
+    /// The hooks every Folder reads from now on.
+    pub fn set_hooks(&self, hooks: HookList) {
+        self.state.lock().unwrap().hooks = hooks;
+    }
+}
+
 impl SettingsStore for MemorySettingsStore {
+    fn hooks(&self, _folder: Option<&Path>) -> HookList {
+        self.state.lock().unwrap().hooks.clone()
+    }
+
     fn read(&self, project: Option<&Path>) -> SettingsSnapshot {
         let state = self.state.lock().unwrap();
         let mut snapshot = state.snapshot.clone();
