@@ -74,6 +74,7 @@ pub(super) async fn family(store: Option<PathBuf>) -> (Agent, Vec<Receipt>) {
 
 pub(super) fn operation(receipt: &Receipt, name: &str, input: Value) -> OperationRecord {
     OperationRecord {
+        input_message_id: None,
         parent_call_id: None,
         parent_call_index: None,
         id: Uuid::new_v4(),

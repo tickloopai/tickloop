@@ -110,6 +110,11 @@ impl PluginUserConfig {
             .collect()
     }
 
+    /// The sensitive values `entry` refers to, as substituted into its text.
+    pub fn secret_texts_for(&self, entry: &Value) -> Vec<String> {
+        self.secrets_for(entry).iter().map(value_text).collect()
+    }
+
     pub fn variables(&self) -> BTreeMap<String, String> {
         self.values
             .iter()

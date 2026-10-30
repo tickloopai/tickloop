@@ -451,5 +451,123 @@
       "store_root": "/home/user/.tickloop",
       "chat_id": "00000000-0000-0000-0000-000000000090"
     }
+  },
+  {
+    "kind": "write_hook_trust",
+    "launch": {
+      "profile": "local",
+      "folder": "/work/project",
+      "config_root": "/home/user/.tickloop",
+      "model": {
+        "connection": {
+          "vendor": "Example",
+          "product": "Example Plan",
+          "kind": "plan",
+          "order": 2,
+          "region": {
+            "name": "Global",
+            "order": 1
+          },
+          "discovery": "provider_api"
+        },
+        "name": "example-plan",
+        "protocol": "messages",
+        "base_url": "https://models.example.test/v1",
+        "model": "example-large",
+        "api_key_env": "EXAMPLE_API_KEY",
+        "max_output_tokens": 32000,
+        "provider": "api",
+        "auth_source": "api_key_env",
+        "provider_id": "example",
+        "provider_name": "Example",
+        "model_id": "example-large",
+        "card": {
+          "id": "example-large",
+          "display_name": "Example Large",
+          "adapter": "messages",
+          "max_output_tokens": 32000,
+          "context_window_tokens": 200000,
+          "thinking": "toggle",
+          "adaptive_by_default": false,
+          "effort_levels": [
+            "low",
+            "high"
+          ],
+          "input_modalities": [
+            "text",
+            "image"
+          ],
+          "thinking_budgets": {
+            "low": 2048,
+            "medium": 8192,
+            "high": 16384
+          }
+        },
+        "input_modalities": [
+          "text",
+          "image"
+        ]
+      },
+      "host_options": {
+        "execution_mode_override": "acceptEdits",
+        "directory_trust": "CallerManaged",
+        "prompt_policy": "Interactive"
+      },
+      "session_persistence": true,
+      "exact_chat": "00000000-0000-0000-0000-0000000000c1",
+      "environment": [
+        {
+          "name": [
+            84,
+            69,
+            82,
+            77
+          ],
+          "value": [
+            120,
+            116,
+            101,
+            114,
+            109,
+            45,
+            50,
+            53,
+            54,
+            99,
+            111,
+            108,
+            111,
+            114
+          ]
+        }
+      ],
+      "host_work_context": {
+        "socket": "/run/herdr.sock",
+        "workspace": "w1"
+      }
+    },
+    "changes": [
+      {
+        "source": {
+          "kind": "plugin",
+          "id": "guard@market"
+        },
+        "key": "k1",
+        "action": {
+          "action": "trust",
+          "hash": "h1"
+        }
+      },
+      {
+        "source": {
+          "kind": "repository"
+        },
+        "key": "k2",
+        "action": {
+          "action": "disable"
+        }
+      }
+    ],
+    "expected_revision": "r1"
   }
 ]

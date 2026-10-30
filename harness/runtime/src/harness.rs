@@ -566,6 +566,9 @@ impl Agent {
                 self.interrupt(chat_id).await?;
             }
         }
+        if let Err(error) = self.settle_managed_hooks(chat_id).await {
+            failures.push(error);
+        }
         // Continue cleanup after each failed stop; Unknown is not a confirmed process exit.
         let cleanup = async {
             let tools = self.chat_tools(chat_id).await?;

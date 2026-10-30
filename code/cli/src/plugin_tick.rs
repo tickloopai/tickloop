@@ -29,6 +29,7 @@ pub(super) async fn install(store: &PluginStore, name: &str) -> Result<(), Strin
         )
     })?;
     report(
+        store,
         &tickloop_tick_installer::install(
             &tickloop_code_settings::package_http::client,
             store,

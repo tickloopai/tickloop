@@ -13,6 +13,7 @@ fn manifest(tick: Option<TickProgram>) -> PluginManifest {
     PluginManifest {
         mcp_servers: Default::default(),
         hooks: Vec::new(),
+        hook_support: Default::default(),
         user_config: Default::default(),
         name: "sample".into(),
         display_name: None,
@@ -21,6 +22,7 @@ fn manifest(tick: Option<TickProgram>) -> PluginManifest {
         format: ManifestFormat::Tickloop,
         tick,
         skill_paths: vec![PathBuf::from("skills")],
+        commands: None,
         components: Default::default(),
         warnings: Vec::new(),
         auth: PackageAuth::None,

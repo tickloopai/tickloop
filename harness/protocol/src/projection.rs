@@ -125,7 +125,8 @@ impl ChatSnapshot {
                 | HostNote::ExecutionMode(_)
                 | HostNote::LoopState
                 | HostNote::TaskReminder
-                | HostNote::DateChange(_) => {}
+                | HostNote::DateChange(_)
+                | HostNote::Hook(_) => {}
             }
         }
         visible

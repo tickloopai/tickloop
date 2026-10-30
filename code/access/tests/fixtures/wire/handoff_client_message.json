@@ -1,7 +1,7 @@
 [
   {
     "Hello": {
-      "major": 37,
+      "major": 40,
       "minor": 0,
       "handoff": {
         "version": 1
@@ -10,7 +10,7 @@
   },
   {
     "Hello": {
-      "major": 37,
+      "major": 40,
       "minor": 0,
       "handoff": {
         "version": 1,

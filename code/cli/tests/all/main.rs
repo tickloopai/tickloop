@@ -15,6 +15,7 @@ mod cli_help;
 mod codex_terminal;
 mod command_consolidation;
 mod graceful_upgrade;
+mod hooks_panel_pty;
 mod hosted_bounds;
 mod hosted_ticks;
 mod managed_acp;

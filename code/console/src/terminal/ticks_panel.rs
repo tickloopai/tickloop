@@ -108,6 +108,8 @@ pub(super) struct InstalledList {
     pub(super) packages: InstalledPlugins,
     pub(super) logins: Vec<LoginState>,
     pub(super) configurations: BTreeMap<String, PluginUserConfig>,
+    /// How many hooks of each package wait for the user to confirm them, by package name.
+    pub(super) hooks_to_confirm: BTreeMap<String, usize>,
 }
 
 #[derive(Debug)]
@@ -133,10 +135,14 @@ pub(super) enum TickPackageResult {
     Installation {
         name: String,
         result: Result<Box<Installation>, String>,
+        /// How many of the installed package's hooks wait for the user to confirm them.
+        hooks_to_confirm: usize,
     },
     Uninstallation {
         name: String,
         result: Result<Uninstalled, String>,
+        /// Whether trust records of the package's hooks were removed with it.
+        forgot_hook_trust: bool,
     },
     Enabled {
         name: String,
@@ -269,9 +275,11 @@ impl TickPackageResult {
             Self::Installation {
                 name,
                 result: Err(error),
+                ..
             } => Notice::failure(format!("Installing {name} failed: {error}")),
             Self::Installation {
                 result: Ok(installation),
+                hooks_to_confirm,
                 ..
             } => {
                 let manifest = &installation.plugin.manifest;
@@ -300,19 +308,29 @@ impl TickPackageResult {
                 if let Some(warning) = unsupported_summary(manifest) {
                     text.push_str(&format!("; {warning}"));
                 }
+                if let Some(hooks) = hooks_to_confirm_summary(*hooks_to_confirm) {
+                    text.push_str(&format!("; {hooks}"));
+                }
                 Notice::success(text)
             }
             Self::Uninstallation {
                 name,
                 result: Err(error),
+                ..
             } => Notice::failure(format!("Uninstalling {name} failed: {error}")),
             Self::Uninstallation {
                 result: Ok(uninstalled),
+                forgot_hook_trust,
                 ..
             } => Notice::success(format!(
-                "Uninstalled {} {}; {}its running Ticks keep running until closed",
+                "Uninstalled {} {}; {}{}its running Ticks keep running until closed",
                 uninstalled.name,
                 uninstalled.version,
+                if *forgot_hook_trust {
+                    "its hook trust records were removed; "
+                } else {
+                    ""
+                },
                 uninstalled
                     .credentials
                     .as_ref()
@@ -1310,6 +1328,16 @@ impl TicksPanel {
         }
     }
 
+    fn hooks_summary(&self, package: &InstalledPlugin) -> String {
+        let Listing::Loaded(list) = &self.installed else {
+            return String::new();
+        };
+        list.hooks_to_confirm
+            .get(package.name())
+            .and_then(|count| hooks_to_confirm_summary(*count))
+            .map_or_else(String::new, |summary| format!(" · {summary}"))
+    }
+
     fn mcp_login_needed(&self, plugin: &str) -> bool {
         self.mcp_states.iter().any(|server| {
             server.state == McpServerState::NeedsLogin
@@ -1506,7 +1534,8 @@ impl TicksPanel {
                                 } else {
                                     ""
                                 },
-                            ) + &self.mcp_summary(package),
+                            ) + &self.mcp_summary(package)
+                                + &self.hooks_summary(package),
                             match login {
                                 LoginState::LoggedIn | LoginState::NotRequired => Role::Success,
                                 LoginState::LoggedOut | LoginState::Expired => Role::Warning,
@@ -1540,6 +1569,15 @@ impl TicksPanel {
                         && let Some(warning) = unsupported_summary(&package.manifest)
                     {
                         lines.push(RoleLine::role(format!("  {warning}"), Role::Warning));
+                    }
+                    if let InstalledEntry::Usable { package, .. } = entry {
+                        for warning in package.manifest.hook_support.warnings() {
+                            lines.extend(
+                                wrap_text(&safe_line(&warning), width.saturating_sub(2).max(1))
+                                    .into_iter()
+                                    .map(|line| RoleLine::role(format!("  {line}"), Role::Warning)),
+                            );
+                        }
                     }
                     (index, lines)
                 })
@@ -1978,6 +2016,15 @@ fn marketplace_error_lines(name: &str, error: &str, width: usize) -> Vec<String>
     text
 }
 
+/// How many hooks wait for the user to confirm them, when any do.
+pub fn hooks_to_confirm_summary(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 hook needs confirming".to_owned()),
+        count => Some(format!("{count} hooks need confirming")),
+    }
+}
+
 fn unsupported_summary(manifest: &PluginManifest) -> Option<String> {
     let unsupported = manifest.unsupported();
     (!unsupported.is_empty()).then(|| {
@@ -2132,6 +2179,7 @@ mod tests {
             manifest: PluginManifest {
                 mcp_servers: Default::default(),
                 hooks: Vec::new(),
+                hook_support: Default::default(),
                 user_config: Default::default(),
                 name: name.into(),
                 display_name: None,
@@ -2143,6 +2191,7 @@ mod tests {
                     protocol: true,
                 }),
                 skill_paths: Vec::new(),
+                commands: None,
                 components: [Component::Tick].into_iter().collect(),
                 warnings: Vec::new(),
                 auth,
@@ -2170,6 +2219,7 @@ mod tests {
             read,
             listing: Ok(InstalledList {
                 configurations: BTreeMap::new(),
+                hooks_to_confirm: BTreeMap::new(),
                 packages: InstalledPlugins {
                     plugins: packages,
                     broken: Vec::new(),
@@ -2413,6 +2463,7 @@ mod tests {
                 marketplace: "tickloop".into(),
                 data: None,
             }),
+            forgot_hook_trust: true,
         });
         let notice = frame(&mut panel)
             .iter()
@@ -2427,7 +2478,8 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             notice,
-            "Uninstalled beta 1.0.0; its saved login stays in /config/credentials/beta; its running Ticks keep running until closed"
+            "Uninstalled beta 1.0.0; its hook trust records were removed; its saved login stays in \
+             /config/credentials/beta; its running Ticks keep running until closed"
         );
     }
 
@@ -2888,10 +2940,12 @@ mod tests {
                     previous_version: "1.0.0".into(),
                 },
             })),
+            hooks_to_confirm: 2,
         });
         let shown = text(&mut panel);
         assert!(
-            shown.contains("Updated Tick alpha@tickloop from 1.0.0 to 2.0.0"),
+            shown.contains("Updated Tick alpha@tickloop from 1.0.0 to 2.0.0;")
+                && shown.contains("2 hooks need confirming"),
             "{shown}"
         );
         assert!(
@@ -2907,6 +2961,7 @@ mod tests {
         panel.apply(TickPackageResult::Installation {
             name: "sample".into(),
             result: Err("cannot download sample 1.0.0 from https://example.com: timed out".into()),
+            hooks_to_confirm: 0,
         });
         assert!(text(&mut panel).contains(
             "Installing sample failed: cannot download sample 1.0.0 from https://example.com: timed out"
@@ -3251,8 +3306,72 @@ mod tests {
                     previous_version: "0.3.0".into(),
                 },
             })),
+            hooks_to_confirm: 0,
         });
-        assert!(text(&mut panel).contains("Updated Tick alpha@tickloop from 0.3.0 to 0.2.0"));
+        let shown = text(&mut panel);
+        assert!(
+            shown.contains("Updated Tick alpha@tickloop from 0.3.0 to 0.2.0")
+                && !shown.contains("hook"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn installed_rows_show_skipped_hook_events_types_and_fields() {
+        let mut package = installed("alpha", "1.0.0", false);
+        package.manifest.hook_support.runnable = 1;
+        package
+            .manifest
+            .hook_support
+            .unsupported_events
+            .insert("Notification".into());
+        package
+            .manifest
+            .hook_support
+            .unsupported_types
+            .insert("prompt".into());
+        package
+            .manifest
+            .hook_support
+            .unsupported_fields
+            .insert("once".into());
+        let mut panel = TicksPanel::new(None, PluginKind::Tick);
+        panel.apply(installed_list(1, vec![(package, LoginState::NotRequired)]));
+        let shown = text(&mut panel);
+        for unsupported in ["Notification", "prompt", "once"] {
+            assert!(shown.contains(unsupported), "{shown}");
+        }
+    }
+
+    #[test]
+    fn installed_rows_show_how_many_hooks_need_confirming() {
+        let mut panel = TicksPanel::new(None, PluginKind::Tick);
+        let TickPackageResult::Installed {
+            listing: Ok(mut list),
+            ..
+        } = installed_list(
+            1,
+            vec![
+                (installed("alpha", "1.0.0", false), LoginState::NotRequired),
+                (installed("beta", "1.0.0", false), LoginState::NotRequired),
+                (installed("gamma", "1.0.0", false), LoginState::NotRequired),
+            ],
+        )
+        else {
+            unreachable!("installed_list lists the packages");
+        };
+        list.hooks_to_confirm = BTreeMap::from([("alpha".into(), 2), ("beta".into(), 1)]);
+        panel.apply(TickPackageResult::Installed {
+            read: 1,
+            listing: Ok(list),
+        });
+        let shown = text(&mut panel);
+        assert!(
+            shown.contains("1.0.0 · no login needed · 2 hooks need confirming")
+                && shown.contains("1.0.0 · no login needed · 1 hook needs confirming"),
+            "{shown}"
+        );
+        assert_eq!(shown.matches("confirming").count(), 2, "{shown}");
     }
 
     #[test]

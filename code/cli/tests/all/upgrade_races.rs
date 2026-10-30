@@ -275,6 +275,7 @@ fn seed_queued_tick(checkpoint: &mut Value) -> Uuid {
     let run_id = Uuid::new_v4();
     let queued_sequence = snapshot["last_queue_sequence"].as_u64().unwrap() + 1;
     let pending = PendingInput {
+        skill_guidance: None,
         receipt: Receipt {
             chat_id: chat_id.into(),
             loop_id: loop_id.into(),

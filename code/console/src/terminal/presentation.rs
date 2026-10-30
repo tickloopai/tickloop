@@ -194,6 +194,7 @@ pub(super) fn transcript_document(
     let tick_labels = super::tick_labels::TickLabels::from_snapshot(snapshot);
     let mut answered = HashSet::new();
     let mut waiting_notice_written = false;
+    let mut displayed_input_operations = HashSet::new();
     for block in &blocks {
         match &block.kind {
             ConversationBlockKind::User { text } => {
@@ -261,6 +262,23 @@ pub(super) fn transcript_document(
                             .and_then(|run| snapshot.user_skill_invocations.get(&run.into()))
                         {
                             writer.runs((user_skill_runs(skill, display), Vec::new()));
+                        }
+                    }
+                }
+                if let ConversationBlockId::MessageContent { message_index, .. } = &block.id
+                    && let Some(run) = block.metadata.run_id
+                {
+                    for operation in &snapshot.operations {
+                        if operation.run_id.uuid() == run
+                            && operation.parent_call_id.is_none()
+                            && operation.input_message_id.is_some_and(|input| {
+                                snapshot.message_ids.get(message_index) == Some(&input)
+                                    || snapshot.original_message_ids.get(message_index)
+                                        == Some(&input)
+                            })
+                            && displayed_input_operations.insert(operation.id)
+                        {
+                            writer.nested_call(operation, approvals.get(run, &operation.call_id));
                         }
                     }
                 }
@@ -2286,6 +2304,9 @@ pub(super) fn permission_context(request: &PermissionRequest) -> Vec<String> {
                 "Enforced by: explicit Ask rule · approval applies once".into()
             }
             PermissionApprovalSource::PermissionPolicy => "Enforced by: permission policy".into(),
+            PermissionApprovalSource::Hook => {
+                "Enforced by: PreToolUse hook · approval applies once".into()
+            }
         });
     }
     if let Some(prepared) = request.file_change.as_deref() {
@@ -2614,17 +2635,7 @@ pub(super) fn local_message_runs(
             result,
             usage,
         } => {
-            runs.push(("\n".into(), None));
-            runs.push((
-                display.glyph(Glyph::ToolCall).into(),
-                Some(match status {
-                    Some(TaskNotificationStatus::Completed) => Role::Success,
-                    Some(TaskNotificationStatus::Failed) => Role::Error,
-                    Some(TaskNotificationStatus::Killed) => Role::Warning,
-                    None => Role::Text,
-                }),
-            ));
-            runs.push((format!(" {}\n", safe_text(summary)), None));
+            runs.extend(task_notification_runs(*status, summary, display));
             if matches!(detail, OutputDetail::Full) {
                 if let Some(result) = result {
                     push_response_block(&mut response, result, detail, display, None);
@@ -2680,6 +2691,26 @@ pub(super) fn local_message_runs(
         }
     }
     (runs, response)
+}
+
+/// Following Claude Code's task notification style: a dot coloured by how the task ended, plain
+/// for a hook that ran in the background, then its summary.
+pub(super) fn task_notification_runs(
+    status: Option<TaskNotificationStatus>,
+    summary: &str,
+    display: DisplayProfile,
+) -> Vec<(String, Option<Role>)> {
+    let role = match status {
+        Some(TaskNotificationStatus::Completed) => Role::Success,
+        Some(TaskNotificationStatus::Failed) => Role::Error,
+        Some(TaskNotificationStatus::Killed) => Role::Warning,
+        None => Role::Text,
+    };
+    vec![
+        ("\n".into(), None),
+        (display.glyph(Glyph::ToolCall).into(), Some(role)),
+        (format!(" {}\n", safe_text(summary)), None),
+    ]
 }
 
 pub(super) fn tick_delivery_runs(
@@ -3588,6 +3619,44 @@ mod tests {
             &AgentColors::default(),
         )
         .plain_text(TRANSCRIPT_WIDTH)
+    }
+
+    #[test]
+    fn command_input_operations_render_once_from_cold_history_with_original_identity() {
+        let input = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let mut snapshot: ChatSnapshot = serde_json::from_value(json!({
+            "id":Uuid::new_v4(),"folder":"/work",
+            "model":{"name":"fixture","protocol":"messages","base_url":"http://127.0.0.1","model":"fixture","api_key_env":"","max_output_tokens":1024},
+            "messages":[{"role":"user","content":[{"type":"text","text":"/demo:check"},{"type":"text","text":"extra input"}]}],"chat_loop":{"id":Uuid::new_v4(),"state":"Idle"},"last_sequence":0
+        })).unwrap();
+        snapshot.message_ids.insert(0, Uuid::new_v4());
+        snapshot.original_message_ids.insert(0, input);
+        snapshot.message_runs.insert(0, run.into());
+        snapshot.operations.push(OperationRecord {
+            input_message_id: Some(input),
+            parent_call_id: None,
+            parent_call_index: None,
+            task_binding: None,
+            id: Uuid::new_v4(),
+            loop_id: snapshot.chat_loop.id,
+            run_id: run.into(),
+            call_id: "prepare".into(),
+            name: "Bash".into(),
+            input: json!({"command":"printf prepared"}),
+            file_change: None,
+            state: OperationState::Completed,
+            result: Some(ToolResult {
+                content: "prepared-output".into(),
+                is_error: false,
+                output_ref: None,
+            }),
+        });
+        let text = transcript_text(&snapshot);
+        assert_eq!(text.matches("printf prepared").count(), 1, "{text}");
+        assert_eq!(text.matches("prepared-output").count(), 1, "{text}");
+        snapshot.original_message_ids.clear();
+        assert!(!transcript_text(&snapshot).contains("prepared-output"));
     }
 
     fn stream_pending_reply(snapshot: &mut ChatSnapshot, text: &str) {

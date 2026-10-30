@@ -134,6 +134,8 @@ pub enum ApprovalPath {
 pub enum DirectApprovalReason {
     /// The Shell ran in the sandbox, which lets Accept Edits and Auto skip approval.
     Sandbox,
+    /// A `PreToolUse` hook from the user's own settings allowed the call.
+    Hook,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -265,6 +267,9 @@ pub struct ApprovalHistoryView {
     pub records: Vec<ApprovalRecord>,
     pub persistence: DenialPersistence,
     pub load_warning: Option<String>,
+    /// The Chat's recent hook runs, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hook_runs: Vec<crate::hooks::HookRunRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

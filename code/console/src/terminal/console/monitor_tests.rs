@@ -5946,12 +5946,14 @@ fn a_shell_completion_flashes_its_row_and_collapsed_entry_before_the_next_snapsh
         .set_monitor_preference(tickloop_code_settings::MonitorPreference::Hidden)
         .unwrap();
     console
-        .write_shell_notification(&tickloop_harness::protocol::TaskNotification {
+        .write_task_notification(&tickloop_harness::protocol::TaskNotification {
             chat_id: chat.into(),
-            task_id: shells.tasks[0].id.into(),
-            tool_use_id: None,
-            output_file: "output.txt".into(),
-            status: tickloop_harness::protocol::TaskNotificationStatus::Completed,
+            shell: Some(tickloop_harness::protocol::ShellTaskEnd {
+                task_id: shells.tasks[0].id.into(),
+                tool_use_id: None,
+                output_file: "output.txt".into(),
+                status: tickloop_harness::protocol::TaskNotificationStatus::Completed,
+            }),
             summary: "make test completed".into(),
         })
         .unwrap();

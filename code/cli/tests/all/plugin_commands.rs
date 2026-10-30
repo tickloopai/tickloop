@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::tick_package_commands::{Fixture, failed, path_text, succeeded};
 
 /// A Claude Code plugin directory `label` with `manifest`, a Skill per name in `skills/`, and the
-/// commands Tickloop does not use yet.
+/// Markdown commands.
 fn claude_plugin(fixture: &Fixture, label: &str, manifest: Value, skills: &[&str]) -> PathBuf {
     let directory = fixture.root.join("sources").join(label);
     fs::create_dir_all(directory.join(".claude-plugin")).unwrap();
@@ -70,13 +70,12 @@ fn a_claude_plugin_installs_lists_toggles_and_uninstalls_through_the_cli() {
         succeeded(&plugin(&fixture, &["install", "--path", &source_path])),
         format!(
             "Installed plugin notes@local 1.0.0 in {root}.\n\
-             Not supported yet, so not used: commands.\n\
              Warning: skills path \"./missing\" is ignored: it does not exist\n"
         )
     );
     assert_eq!(
         succeeded(&plugin(&fixture, &["list"])),
-        "notes@local  1.0.0  enabled  no login needed  not supported yet: commands\n"
+        "notes@local  1.0.0  enabled  no login needed\n"
     );
 
     assert_eq!(
@@ -97,7 +96,7 @@ fn a_claude_plugin_installs_lists_toggles_and_uninstalls_through_the_cli() {
     );
     assert_eq!(
         succeeded(&plugin(&fixture, &["list"])),
-        "notes@local  1.0.0  disabled  no login needed  not supported yet: commands\n"
+        "notes@local  1.0.0  disabled  no login needed\n"
     );
     assert_eq!(
         succeeded(&plugin(&fixture, &["enable", "notes"])),
@@ -166,7 +165,7 @@ fn validate_shows_what_tickloop_reads_from_a_plugin_and_why_one_cannot_be_used()
         succeeded(&plugin(&fixture, &["validate", &path_text(&source)])),
         "Plugin notes 1.0.0, read from .claude-plugin/plugin.json.\n\
          Skills: skills/read, skills/write\n\
-         Not supported yet, so not used: commands.\n\
+         Commands: notes:tidy\n\
          Warning: skills path \"../outside\" is ignored: it must start with ./\n"
     );
 
@@ -174,7 +173,7 @@ fn validate_shows_what_tickloop_reads_from_a_plugin_and_why_one_cannot_be_used()
     fs::create_dir_all(&bare).unwrap();
     assert_eq!(
         succeeded(&plugin(&fixture, &["validate", &path_text(&bare)])),
-        "Plugin bare-plugin, read from its directory.\nSkills: none\n"
+        "Plugin bare-plugin, read from its directory.\nSkills: none\nCommands: none\n"
     );
 
     fs::write(source.join(".claude-plugin/plugin.json"), r#"{"name": 7}"#).unwrap();
@@ -632,11 +631,115 @@ fn uninstalling_a_plugin_forgets_only_its_hook_trust_records() {
     )
     .unwrap();
 
-    succeeded(&plugin(&fixture, &["uninstall", "guard"]));
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["uninstall", "guard"])),
+        "Uninstalled plugin guard@local local.\nIts hook trust records were removed.\n"
+    );
 
     let settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
     assert_eq!(
         settings,
         json!({"theme": "dark", "hookTrust": {"plugins": {"other@local": record}}})
+    );
+}
+
+/// A plugin without commands whose hooks Tickloop runs in part.
+fn hooked_plugin(fixture: &Fixture) -> PathBuf {
+    let source = fixture.root.join("sources/guard");
+    for (path, contents) in [
+        (
+            ".claude-plugin/plugin.json",
+            json!({"name": "guard", "version": "1.0.0"}),
+        ),
+        (
+            "hooks/hooks.json",
+            json!({"hooks": {
+                "PreToolUse": [{"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/check", "timeout": 5},
+                    {"type": "command", "command": "later", "once": true},
+                ]}],
+                "Stop": [{"hooks": [
+                    {"type": "command", "command": "done"},
+                    {"type": "prompt", "prompt": "Done?"},
+                ]}],
+                "Notification": [{"hooks": [{"type": "command", "command": "notify"}]}],
+            }}),
+        ),
+    ] {
+        fs::create_dir_all(source.join(path).parent().unwrap()).unwrap();
+        fs::write(source.join(path), contents.to_string()).unwrap();
+    }
+    source
+}
+
+const HOOK_WARNINGS: &str = "\
+    Warning: hook events not supported yet, so their hooks are not used: Notification\n\
+    Warning: hook types not supported yet, so those hooks are not used: prompt\n\
+    Warning: hook fields not supported yet, so the hooks using them are not used: once\n";
+
+#[test]
+fn plugin_hooks_show_how_many_need_confirming_instead_of_being_unsupported() {
+    let fixture = Fixture::new();
+    let source = hooked_plugin(&fixture);
+    let root = installed_root(&fixture, "guard");
+
+    assert_eq!(
+        succeeded(&plugin(
+            &fixture,
+            &["install", "--path", &path_text(&source)]
+        )),
+        format!(
+            "Installed plugin guard@local 1.0.0 in {root}.\n\
+             2 hooks need confirming.\n\
+             {HOOK_WARNINGS}"
+        )
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["list"])),
+        "guard@local  1.0.0  enabled  no login needed  2 hooks need confirming; hook events not supported yet, so their hooks are not used: Notification; hook types not supported yet, so those hooks are not used: prompt; hook fields not supported yet, so the hooks using them are not used: once\n"
+    );
+    succeeded(&plugin(&fixture, &["disable", "guard"]));
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["list"])),
+        "guard@local  1.0.0  disabled  no login needed  2 hooks need confirming; hook events not supported yet, so their hooks are not used: Notification; hook types not supported yet, so those hooks are not used: prompt; hook fields not supported yet, so the hooks using them are not used: once\n"
+    );
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["uninstall", "guard"])),
+        "Uninstalled plugin guard@local 1.0.0.\n"
+    );
+}
+
+#[test]
+fn validate_lists_the_hook_events_types_and_fields_tickloop_runs_and_those_it_does_not() {
+    let fixture = Fixture::new();
+    let source = hooked_plugin(&fixture);
+
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["validate", &path_text(&source)])),
+        format!(
+            "Plugin guard 1.0.0, read from .claude-plugin/plugin.json.\n\
+             Skills: none\n\
+             Commands: none\n\
+             Hooks: 2 supported | events: PreToolUse, Stop | types: command | fields: command, timeout\n\
+             Hooks not supported yet: events: Notification | types: prompt | fields: once\n\
+             {HOOK_WARNINGS}"
+        )
+    );
+
+    fs::write(
+        source.join("hooks/hooks.json"),
+        json!({"hooks": {"Notification": [{"hooks": [{"type": "command", "command": "say"}]}]}})
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        succeeded(&plugin(&fixture, &["validate", &path_text(&source)])),
+        "Plugin guard 1.0.0, read from .claude-plugin/plugin.json.\n\
+         Skills: none\n\
+         Commands: none\n\
+         Not supported yet, so not used: hooks.\n\
+         Hooks: 0 supported | events: none | types: none | fields: none\n\
+         Hooks not supported yet: events: Notification | types: none | fields: none\n\
+         Warning: hook events not supported yet, so their hooks are not used: Notification\n"
     );
 }

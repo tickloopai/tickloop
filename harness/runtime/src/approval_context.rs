@@ -28,7 +28,7 @@ use input_projection::{InputPurpose, project_tool_input};
 pub(super) use reply_history::ReplyHistory;
 pub(super) use reply_history::capture as capture_reply_history;
 
-pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v11";
+pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v12";
 pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v19";
 /// Images carry no review evidence in serialized text; their base64 never enters the snapshot.
 const IMAGE_PLACEHOLDER: &str = "[image omitted from the approval context]";
@@ -115,6 +115,8 @@ pub(super) enum HistoricalToolOutcome {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct HistoricalToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_input_message_id: Option<Uuid>,
     pub run_id: Option<Uuid>,
     pub call_id: String,
     pub tool: String,
@@ -248,6 +250,51 @@ pub(super) fn recovered_tool_history(
         if source_id.is_some_and(|id| !observed_messages.insert(id)) {
             continue;
         }
+        for prior in &snapshot.operations {
+            let Some(input_message_id) = prior.input_message_id else {
+                continue;
+            };
+            if message.role != Role::User
+                || (source_id != Some(input_message_id)
+                    && index.and_then(|index| snapshot.message_ids.get(&index).copied())
+                        != Some(input_message_id))
+                || prior.id >= operation.id
+                || !super::nested_calls::parent_on_chain(snapshot, prior)
+            {
+                continue;
+            }
+            let Some(input) =
+                project_tool_input(&prior.name, &prior.input, InputPurpose::Historical)
+            else {
+                continue;
+            };
+            if input_projection::is_incomplete(&input) {
+                history.complete = false;
+            }
+            history.calls.push(HistoricalToolCall {
+                host_input_message_id: Some(input_message_id),
+                run_id: Some(prior.run_id.into()),
+                call_id: prior.call_id.clone(),
+                tool: prior.name.clone(),
+                input,
+                resolved_path: prior
+                    .input
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute()),
+                outcome: match prior.state {
+                    tickloop_harness_protocol::OperationState::Unknown => {
+                        HistoricalToolOutcome::OutcomeUnknown
+                    }
+                    _ => match &prior.result {
+                        Some(result) if result.is_error => HistoricalToolOutcome::ReturnedError,
+                        Some(_) => HistoricalToolOutcome::ReturnedSuccess,
+                        None => HistoricalToolOutcome::NotObserved,
+                    },
+                },
+            });
+        }
         for (block, content) in message.content.iter().enumerate() {
             match content {
                 Content::ToolUse { id, name, input }
@@ -283,6 +330,7 @@ pub(super) fn recovered_tool_history(
                         _ => None,
                     };
                     let call = HistoricalToolCall {
+                        host_input_message_id: None,
                         run_id: run,
                         call_id: id.clone(),
                         tool: name.clone(),
@@ -877,6 +925,82 @@ mod tests {
     use super::*;
     use tickloop_harness_protocol::{Message, ModelConfig, OperationState};
 
+    #[test]
+    fn command_input_history_is_host_observed_ordered_and_scoped_to_retained_inputs() {
+        let run = tickloop_ids::generate();
+        let input = tickloop_ids::generate();
+        let mut snapshot = crate::empty_snapshot(
+            Uuid::new_v4().into(),
+            Some("/project".into()),
+            ModelConfig::unselected(),
+        );
+        snapshot.messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![Content::Text {
+                    text: "/demo:check".into(),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![Content::ToolUse {
+                    id: "model".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command":"printf model"}),
+                }],
+            },
+        ];
+        snapshot.message_ids.insert(0, Uuid::new_v4());
+        snapshot.original_message_ids.insert(0, input);
+        snapshot
+            .prompt_execution_modes
+            .insert(0, tickloop_harness_protocol::ExecutionMode::FullAccess);
+        snapshot.message_runs.insert(0, run.into());
+        snapshot.message_runs.insert(1, run.into());
+        let mut prior = OperationRecord {
+            input_message_id: Some(input),
+            parent_call_id: None,
+            parent_call_index: None,
+            task_binding: None,
+            id: tickloop_ids::generate(),
+            loop_id: snapshot.chat_loop.id,
+            run_id: run.into(),
+            call_id: "prepare".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command":"printf prepare", "cwd":"/project"}),
+            file_change: None,
+            state: OperationState::Unknown,
+            result: None,
+        };
+        snapshot.operations.push(prior.clone());
+        prior.id = tickloop_ids::generate();
+        prior.call_id = "current".into();
+        snapshot.operations.push(prior.clone());
+        let history = tool_history(&snapshot, &prior);
+        assert_eq!(
+            history
+                .calls
+                .iter()
+                .map(|call| call.call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["prepare", "model"]
+        );
+        assert_eq!(history.calls[0].host_input_message_id, Some(input));
+        assert!(matches!(
+            history.calls[0].outcome,
+            HistoricalToolOutcome::OutcomeUnknown
+        ));
+        assert!(history.calls[1].host_input_message_id.is_none());
+        snapshot.messages.remove(0);
+        snapshot.message_runs.clear();
+        assert!(
+            tool_history(&snapshot, &prior)
+                .calls
+                .iter()
+                .all(|call| call.host_input_message_id.is_none())
+        );
+    }
+
     /// A child weighs its root's goal as the user's only while the root's goal is still the one,
     /// at the revision, it was delegated under, the user's and unfinished.
     #[test]
@@ -939,6 +1063,7 @@ mod tests {
             "a grandchild inherits it"
         );
         let operation = OperationRecord {
+            input_message_id: None,
             parent_call_id: None,
             parent_call_index: None,
             task_binding: None,
@@ -1126,6 +1251,7 @@ mod tests {
             snapshot.message_runs.insert(index, run.into());
         }
         let operation = OperationRecord {
+            input_message_id: None,
             parent_call_id: None,
             parent_call_index: None,
             task_binding: None,

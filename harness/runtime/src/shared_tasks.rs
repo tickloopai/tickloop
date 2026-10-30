@@ -1310,9 +1310,14 @@ impl Agent {
                 .find(|task| task.id == previous.task_id)
                 .cloned();
             drop(chats);
-            let delivery = self
-                .deliver_task_assignment(receipt, root_id, loop_id, mutation_id, cancel)
-                .await;
+            let delivery = Box::pin(self.deliver_task_assignment(
+                receipt,
+                root_id,
+                loop_id,
+                mutation_id,
+                cancel,
+            ))
+            .await;
             return Ok(ToolResult {
                 content: model_json(
                     &ids,
@@ -1476,9 +1481,9 @@ impl Agent {
         self.persist_task_boards(root).await?;
         self.publish_task_board(&mut chats, root_id, loop_id);
         drop(chats);
-        let delivery = self
-            .deliver_task_assignment(receipt, root_id, loop_id, mutation_id, cancel)
-            .await;
+        let delivery =
+            Box::pin(self.deliver_task_assignment(receipt, root_id, loop_id, mutation_id, cancel))
+                .await;
         Ok(ToolResult {
             content: model_json(
                 &ids,

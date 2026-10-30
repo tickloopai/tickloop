@@ -21,7 +21,7 @@ async fn handles_use_short_description_fallback_and_reserve_parent_keywords() {
         call(
             "two",
             "Subagent",
-            json!({"task":"Audit another report","description":"Audit revenue growth"}),
+            json!({"task":"Audit another report","name":"","description":"Audit revenue growth"}),
         ),
         text("two done"),
         call(
@@ -59,12 +59,7 @@ async fn handles_use_short_description_fallback_and_reserve_parent_keywords() {
 
 #[tokio::test]
 async fn invalid_handles_never_create_a_child_or_reserve_a_name() {
-    for name in [
-        json!(""),
-        json!("line\nbreak"),
-        json!("x".repeat(161)),
-        json!(5),
-    ] {
+    for name in [json!("line\nbreak"), json!("x".repeat(161)), json!(5)] {
         let directory = tempfile::tempdir().unwrap();
         let core = Agent::new_embedded(
             config(),

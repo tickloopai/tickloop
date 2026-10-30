@@ -53,6 +53,8 @@ struct ChatCheckpoint {
     family_generation: u64,
     start_new_tool_result_message: bool,
     #[serde(default)]
+    pending_session_start: Option<crate::hooks::SessionSource>,
+    #[serde(default)]
     mode_before_plan: Option<tickloop_harness_protocol::ExecutionMode>,
     #[serde(default)]
     ceiling_mode_before_plan: Option<tickloop_harness_protocol::ExecutionMode>,
@@ -62,6 +64,8 @@ struct ChatCheckpoint {
     launch_rules: Vec<PermissionRule>,
     #[serde(default)]
     ceiling_launch_rules: Vec<PermissionRule>,
+    #[serde(default)]
+    user_skill_preparations: Option<HashMap<RunId, command_skills::UserSkillPreparation>>,
     deferred_messages: Vec<Message>,
     feedback_inputs: HashMap<RunId, feedback_inbox::FeedbackIdentity>,
     output_style: OutputStyle,
@@ -158,6 +162,7 @@ impl Agent {
                 bookkeeping: chat.bookkeeping.clone(),
                 family_generation: chat.family_generation,
                 start_new_tool_result_message: chat.start_new_tool_result_message,
+                pending_session_start: chat.hook_state.session.session_start,
                 mode_before_plan: chat.snapshot.policy.mode_before_plan,
                 ceiling_mode_before_plan: chat
                     .snapshot
@@ -173,6 +178,7 @@ impl Agent {
                     .unwrap_or_default(),
                 goal_clock_ms: chat.goal_clock_ms,
                 goal_recorded_tokens: chat.goal_recorded_tokens,
+                user_skill_preparations: Some(chat.user_skill_preparations.clone()),
                 deferred_messages: chat.deferred_messages.clone(),
                 feedback_inputs: chat.feedback_inputs.clone(),
                 output_style: chat.output_style,
@@ -366,6 +372,30 @@ impl Agent {
                     ));
                 }
             };
+            // Before command preprocessing, queued Skills were already activated. Only an old
+            // authenticated checkpoint may carry that state forward; history never rebuilds a plan.
+            let user_skill_preparations =
+                saved.user_skill_preparations.clone().unwrap_or_else(|| {
+                    snapshot
+                        .pending_inputs
+                        .iter()
+                        .filter(|pending| pending.is_skill_invocation)
+                        .map(|pending| pending.receipt.run_id)
+                        .chain(saved.waiting.iter().map(|receipt| receipt.run_id))
+                        .filter(|run| {
+                            snapshot
+                                .user_skill_invocations
+                                .get(run)
+                                .is_some_and(|invocation| {
+                                    snapshot.invoked_skills.iter().any(|skill| {
+                                        skill.name == invocation.name
+                                            && skill.source == invocation.source
+                                    })
+                                })
+                        })
+                        .map(|run| (run, command_skills::UserSkillPreparation::Complete))
+                        .collect()
+                });
             let announced_loop_state =
                 crate::loop_state_notes::restored(&snapshot, &saved.bookkeeping);
             self.inner.chats.lock().await.insert(
@@ -404,6 +434,7 @@ impl Agent {
                     feedback_inputs: saved.feedback_inputs.clone(),
                     feedback_cleanup_started: false,
                     user_loops: HashMap::new(),
+                    user_skill_preparations,
                     deferred_messages: saved.deferred_messages.clone(),
                     user_cancelled_runs: HashSet::new(),
                     output_style: saved.output_style,
@@ -417,6 +448,11 @@ impl Agent {
                     loaded_from_history: false,
                     goal_clock_ms: saved.goal_clock_ms,
                     cache_prefix: Default::default(),
+                    hook_state: {
+                        let mut state = crate::hooks::ChatHookState::default();
+                        state.session.session_start = saved.pending_session_start;
+                        state
+                    },
                 },
             );
         }

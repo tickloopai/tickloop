@@ -1138,12 +1138,20 @@ impl EmbeddedAgentAccess {
                         .map_err(agent_access_error)?;
                     chat
                 } else {
-                    self.inner
+                    let chat = self
+                        .inner
                         .agent
                         .create_chat_with_launch_rules(launch.folder.clone(), launch_rules)
                         .await
-                        .map_err(agent_access_error)?
-                        .uuid()
+                        .map_err(agent_access_error)?;
+                    if launch.after_clear {
+                        self.inner
+                            .agent
+                            .start_session_after_clear(chat)
+                            .await
+                            .map_err(agent_access_error)?;
+                    }
+                    chat.uuid()
                 };
                 if !launch.additional_directories.is_empty() {
                     self.inner
@@ -1533,6 +1541,15 @@ impl EmbeddedAgentAccess {
             AgentCommand::FlushTranscripts => Box::pin(async move {
                 self.inner.agent.flush_transcripts().await;
                 Ok(CommandResult::Done)
+            }),
+            AgentCommand::WriteHookTrust {
+                launch,
+                changes,
+                expected_revision,
+            } => Box::pin(async move {
+                crate::hook_trust::write_trust(&launch, changes, expected_revision)
+                    .await
+                    .map(|hooks| CommandResult::Hooks(Box::new(hooks)))
             }),
             AgentCommand::UpgradeRuntime { .. } => {
                 Box::pin(std::future::ready(Err(AccessError::new(
@@ -2644,6 +2661,15 @@ impl AgentAccess for EmbeddedAgentAccess {
                 ObservationValue::McpServers(vec![
                     crate::draft_mcp::connect(&launch, &name).await?,
                 ]),
+                Cursor {
+                    daemon_epoch: self.inner.epoch,
+                    execution: None,
+                    sequence: 0,
+                },
+                None,
+            )),
+            ObservationRequest::Hooks { launch } => Ok(Observation::single(
+                ObservationValue::Hooks(Box::new(crate::hook_trust::hooks(&launch).await?)),
                 Cursor {
                     daemon_epoch: self.inner.epoch,
                     execution: None,
