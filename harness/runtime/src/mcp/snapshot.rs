@@ -140,8 +140,10 @@ impl Entry {
             let Ok(validator) = jsonschema::validator_for(&tool.schema) else {
                 continue;
             };
+            // The annotations count: a call a host admits because its tool only reads is sent
+            // only while the tool says so.
             let fingerprint = Sha256::digest(
-                serde_json::to_vec(&(&tool.original, &tool.schema, &definition))
+                serde_json::to_vec(&(&tool.original, &tool.schema, &definition, &tool.annotations))
                     .expect("tool serializes"),
             )
             .into();

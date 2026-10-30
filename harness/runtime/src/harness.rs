@@ -54,6 +54,8 @@ pub struct HarnessOptions {
     pub task_tools: Option<bool>,
     pub waits: WaitHosting,
     pub citation_style: CitationStyle,
+    /// Which model Auto review asks.
+    pub auto_review_model: AutoReviewModel,
     /// Instructions the host adds to every conversation's system prompt, as a section of their
     /// own after the Output Style; `None` adds nothing.
     pub system_prompt_addition: Option<String>,
@@ -95,6 +97,7 @@ impl HarnessOptions {
             task_tools: None,
             waits: WaitHosting::Process,
             citation_style: CitationStyle::default(),
+            auto_review_model: AutoReviewModel::default(),
             system_prompt_addition: None,
             request_gates: Vec::new(),
             time_zone: None,
@@ -125,6 +128,20 @@ pub enum CitationStyle {
     #[default]
     MarkdownLinks,
     Numbered,
+}
+
+/// Which model Auto review asks about an action.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AutoReviewModel {
+    /// The reviewer the host set with `Agent::set_auto_reviewer`, else the auxiliary
+    /// permission-check model of the Chat's model provider, else the Chat's own model.
+    #[default]
+    Configured,
+    /// The model the reviewing Run's Chat uses at the moment of each review, with its own key
+    /// source: a model switch deferred while a Run went on or waited counts once it applies,
+    /// when that Run has ended. Nothing else stands in for it, neither another reviewer, nor
+    /// Jev whatever the Auto settings prefer, nor another key.
+    ChatModel,
 }
 
 /// Who keeps a Run that waits for a person. The waits are recorded either way.

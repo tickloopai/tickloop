@@ -17,6 +17,8 @@ pub enum PausePoint {
     /// Remembering a saved login whose token could not be used, once it found the login the
     /// entry's own and before it takes it up.
     Invalidation,
+    /// A prepared call's check just before it is sent, after it was admitted.
+    Revalidate,
 }
 
 type Gate = (mpsc::Sender<()>, mpsc::Receiver<()>);

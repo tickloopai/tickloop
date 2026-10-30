@@ -56,9 +56,11 @@ pub struct PreparedHostCall {
     /// A token-free identity of what the call reaches, which an approval given for it is bound
     /// to: for an MCP call, the server's configuration and account and the tool as listed.
     target: Option<String>,
-    /// Under Durable Approval, the call goes to Auto review before a person when no rule decides
-    /// it, as its server's host chose.
-    auto_review_unruled: bool,
+    /// Under Durable Approval, who admits the call when no rule decides it, as its server's host
+    /// chose.
+    unruled: tickloop_harness_protocol::mcp::McpUnruled,
+    /// The tool's declaration the call was prepared against says the tool only reads.
+    is_declared_read_only: bool,
     /// The call reaches only a remote service, such as an MCP server over HTTP, and touches no
     /// local file: Auto review needs no Folder for it.
     is_remote: bool,
@@ -101,7 +103,8 @@ impl PreparedHostCall {
             policy_identity: None,
             mcp_server: None,
             target: None,
-            auto_review_unruled: false,
+            unruled: Default::default(),
+            is_declared_read_only: false,
             is_remote: false,
             local_read: None,
         }
@@ -125,13 +128,25 @@ impl PreparedHostCall {
         self.target.as_deref()
     }
 
-    pub(crate) fn with_auto_review_unruled(mut self, auto_review: bool) -> Self {
-        self.auto_review_unruled = auto_review;
+    pub(crate) fn with_unruled(
+        mut self,
+        unruled: tickloop_harness_protocol::mcp::McpUnruled,
+        is_declared_read_only: bool,
+    ) -> Self {
+        self.unruled = unruled;
+        self.is_declared_read_only = is_declared_read_only;
         self
     }
 
     pub(crate) fn auto_reviews_unruled(&self) -> bool {
-        self.auto_review_unruled
+        self.unruled == tickloop_harness_protocol::mcp::McpUnruled::AutoReview
+    }
+
+    /// Whether the call runs without a person when no rule decides it: its server's host admits
+    /// unruled calls of tools that only read, and its tool's declaration says so.
+    pub(crate) fn admits_unruled_read_only(&self) -> bool {
+        self.unruled == tickloop_harness_protocol::mcp::McpUnruled::AllowReadOnly
+            && self.is_declared_read_only
     }
 
     pub(crate) fn with_remote(mut self, is_remote: bool) -> Self {

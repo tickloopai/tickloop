@@ -2033,7 +2033,10 @@ async fn admission_provider_over(
     server: &McpService,
     unruled: Arc<Mutex<tickloop_harness_protocol::mcp::McpUnruled>>,
     over_stdio: bool,
-) -> Arc<tickloop_harness_runtime::mcp::McpToolProvider> {
+) -> (
+    Arc<tickloop_harness_runtime::mcp::McpToolProvider>,
+    tickloop_harness_runtime::mcp::McpConnections,
+) {
     use tickloop_harness_protocol::mcp::{McpServerConfig, McpTransport, ToolExposure};
     use tickloop_harness_runtime::mcp::{
         HostCapabilities, McpConnections, McpServerState, McpToolProvider,
@@ -2079,10 +2082,11 @@ async fn admission_provider_over(
     })
     .await
     .expect("the server connects");
-    Arc::new(McpToolProvider::new(
-        connections,
+    let provider = Arc::new(McpToolProvider::new(
+        connections.clone(),
         Arc::new(move || vec![config()]),
-    ))
+    ));
+    (provider, connections)
 }
 
 /// A Chat with a Folder under Durable Approval, whose server `review` admits its unruled calls
@@ -2092,6 +2096,7 @@ struct Reviewed {
     chat: ChatId,
     reviewer: Arc<ScriptedModel>,
     unruled: Arc<Mutex<tickloop_harness_protocol::mcp::McpUnruled>>,
+    connections: tickloop_harness_runtime::mcp::McpConnections,
     _folder: tempfile::TempDir,
 }
 
@@ -2125,7 +2130,7 @@ async fn reviewed_over(
     over_stdio: bool,
 ) -> Reviewed {
     let unruled = Arc::new(Mutex::new(unruled));
-    let tools = admission_provider_over(server, unruled.clone(), over_stdio).await;
+    let (tools, connections) = admission_provider_over(server, unruled.clone(), over_stdio).await;
     let mut options = options(PromptPolicy::DurableApproval);
     options.host.directory_trust = tickloop_harness_protocol::DirectoryTrustPolicy::CallerManaged;
     let agent = Agent::with_seams(
@@ -2154,6 +2159,7 @@ async fn reviewed_over(
         chat,
         reviewer,
         unruled,
+        connections,
         _folder: folder,
     }
 }
@@ -2341,6 +2347,7 @@ async fn changing_who_admits_unruled_calls_keeps_the_connection() {
         reviewer,
         unruled,
         _folder,
+        ..
     } = reviewed(
         &server,
         McpUnruled::Person,
@@ -2508,6 +2515,7 @@ async fn changing_who_admits_unruled_calls_leaves_a_call_being_decided_alone() {
         reviewer,
         unruled,
         _folder,
+        ..
     } = reviewed(
         &server,
         McpUnruled::Person,
@@ -3661,7 +3669,7 @@ async fn hooked(
     replies: Vec<Vec<Content>>,
 ) -> Agent {
     use tickloop_harness_protocol::mcp::McpUnruled;
-    let tools =
+    let (tools, _) =
         admission_provider_over(server, Arc::new(Mutex::new(McpUnruled::Person)), false).await;
     let mut options = options(PromptPolicy::DurableApproval);
     options.settings = Some(settings.clone());
@@ -3843,4 +3851,744 @@ async fn a_call_allowed_after_a_rebuild_keeps_what_its_hooks_decided() {
         }
         answering.shutdown().await;
     }
+}
+
+/// The tools `read`, declared as only reading when `read_only`, and `write`, declared as
+/// changing things.
+fn declared_tools(read_only: bool) -> serde_json::Value {
+    json!([
+        {"name": "read", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": read_only}},
+        {"name": "write", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": false}},
+        {"name": "ping", "inputSchema": {"type": "object"}},
+    ])
+}
+
+/// The `q` of each call of `tool` the server received, in order.
+fn served_by(server: &McpService, tool: &str) -> Vec<String> {
+    server
+        .calls()
+        .iter()
+        .filter(|call| call["params"]["name"] == tool)
+        .map(|call| {
+            call["params"]["arguments"]["q"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// A server whose host admits unruled calls of tools that only read: a call of a tool its
+/// declaration says only reads runs without anyone asked or reviewing it; a call of any other
+/// tool goes to the person. A rule still decides first.
+#[tokio::test]
+async fn allow_read_only_runs_what_its_declaration_says_only_reads_and_asks_for_the_rest() {
+    use tickloop_harness_protocol::mcp::McpUnruled;
+    let server = McpService::start().await;
+    server.set_tools(declared_tools(true));
+    server.set_result(json!({"content": [{"type": "text", "text": "MCP_OK"}]}));
+    let Reviewed {
+        agent,
+        chat,
+        reviewer,
+        _folder,
+        ..
+    } = reviewed_in(
+        &server,
+        McpUnruled::AllowReadOnly,
+        vec![
+            call("r", "mcp__review__read", json!({"q": "read"})),
+            call("w", "mcp__review__write", json!({"q": "write"})),
+        ],
+        Vec::new(),
+        false,
+    )
+    .await;
+    let admissions = watch_admissions(&agent);
+    let turn = agent
+        .advance(chat, prompt("Read, then write.", Delivery::Queue))
+        .await
+        .unwrap();
+    let TurnOutcome::Waiting(TurnWait::Permission(request)) = outcome(&turn).await else {
+        panic!("the write waits for the person");
+    };
+    assert_eq!(request.name, "mcp__review__write");
+    assert_eq!(served_by(&server, "read"), ["read"], "the read ran unasked");
+    assert!(served_by(&server, "write").is_empty());
+    assert_eq!(
+        *admissions.lock().unwrap(),
+        ["asked mcp__review__write".to_string()]
+    );
+    assert!(reviewer.requests.lock().unwrap().is_empty());
+    agent.shutdown().await;
+
+    // A Deny rule wins over the declaration.
+    let server = McpService::start().await;
+    server.set_tools(declared_tools(true));
+    let reviewed = reviewed_in(
+        &server,
+        McpUnruled::AllowReadOnly,
+        vec![
+            call("r", "mcp__review__read", json!({"q": "read"})),
+            text(DONE),
+        ],
+        Vec::new(),
+        false,
+    )
+    .await;
+    reviewed
+        .agent
+        .set_permission_rules(
+            reviewed.chat,
+            vec![PermissionRule {
+                id: Uuid::new_v4(),
+                decision: Decision::Deny,
+                tool: "mcp__review__read".into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let turn = reviewed
+        .agent
+        .advance(reviewed.chat, prompt("Read.", Delivery::Queue))
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome(&turn).await,
+        TurnOutcome::Completed { .. }
+    ));
+    assert!(server.calls().is_empty(), "a Deny rule wins");
+    reviewed.agent.shutdown().await;
+}
+
+/// A server that changes a tool's declaration between the admission of a call that only read
+/// and its dispatch: the call is not sent, and the model calling the tool again is put to the
+/// person under the new declaration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_read_only_never_sends_a_call_whose_declaration_changed_before_dispatch() {
+    use tickloop_harness_protocol::mcp::McpUnruled;
+    use tickloop_harness_runtime::mcp::test_pauses::{PausePoint, pause_next};
+    let server = McpService::start().await;
+    server.set_tools(declared_tools(true));
+    server.set_result(json!({"content": [{"type": "text", "text": "MCP_OK"}]}));
+    let Reviewed {
+        agent,
+        chat,
+        connections,
+        _folder,
+        ..
+    } = reviewed_in(
+        &server,
+        McpUnruled::AllowReadOnly,
+        vec![
+            call("first", "mcp__review__read", json!({"q": "first"})),
+            call("again", "mcp__review__read", json!({"q": "again"})),
+        ],
+        Vec::new(),
+        false,
+    )
+    .await;
+    let pause = pause_next(PausePoint::Revalidate, SERVER);
+    let turn = agent
+        .advance(chat, prompt("Read the service.", Delivery::Queue))
+        .await
+        .unwrap();
+    let entered = pause.entered;
+    tokio::task::spawn_blocking(move || {
+        entered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the admitted call is checked before it is sent")
+    })
+    .await
+    .unwrap();
+    // The server now says `read` changes things; another call carries its list change.
+    server.set_tools(declared_tools(false));
+    server.notify_tools_changed();
+    let lists = server
+        .methods()
+        .iter()
+        .filter(|method| *method == "tools/list")
+        .count();
+    connections
+        .call("mcp__review__ping", json!({}), CancellationToken::new())
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while server
+            .methods()
+            .iter()
+            .filter(|method| *method == "tools/list")
+            .count()
+            == lists
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the tools are listed again");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    pause.release.send(()).unwrap();
+    let TurnOutcome::Waiting(TurnWait::Permission(request)) = outcome(&turn).await else {
+        panic!("the call made again waits for the person");
+    };
+    assert_eq!(request.input, json!({"q": "again"}));
+    assert!(
+        served_by(&server, "read").is_empty(),
+        "no call of the changed tool ran unasked"
+    );
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let first = snapshot
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } if tool_use_id == "first" => Some(content.text().into_owned()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(first.contains("declaration changed"), "{first}");
+    agent.shutdown().await;
+}
+
+/// A server that tells mid-Run that a tool no longer only reads: the call made before ran
+/// unasked, and the call made after is put to the person.
+#[tokio::test]
+async fn allow_read_only_asks_once_a_list_change_says_the_tool_changes_things() {
+    use tickloop_harness_protocol::mcp::McpUnruled;
+    let server = McpService::start().await;
+    server.set_tools(declared_tools(true));
+    server.set_result(json!({"content": [{"type": "text", "text": "MCP_OK"}]}));
+    let Reviewed {
+        agent,
+        chat,
+        _folder,
+        ..
+    } = reviewed_in(
+        &server,
+        McpUnruled::AllowReadOnly,
+        vec![
+            call("first", "mcp__review__read", json!({"q": "first"})),
+            call("second", "mcp__review__read", json!({"q": "second"})),
+        ],
+        Vec::new(),
+        false,
+    )
+    .await;
+    // The first call's response carries the list change.
+    server.set_tools(declared_tools(false));
+    server.notify_tools_changed();
+    let turn = agent
+        .advance(chat, prompt("Read the service twice.", Delivery::Queue))
+        .await
+        .unwrap();
+    let reached = outcome(&turn).await;
+    let TurnOutcome::Waiting(TurnWait::Permission(request)) = reached else {
+        panic!("the second call waits for the person");
+    };
+    assert_eq!(request.input, json!({"q": "second"}));
+    assert_eq!(served_by(&server, "read"), ["first"]);
+    agent.shutdown().await;
+}
+
+/// Whether `request` is an Auto review's request.
+fn is_review(request: &tickloop_harness_model::ModelRequest) -> bool {
+    request.structured_output.is_some()
+        && format!("{:?}", request.messages).contains("security classifier")
+}
+
+/// A model that holds each request until the test lets it answer.
+struct HeldModel {
+    inner: ScriptedModel,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl tickloop_harness_model::ModelClient for HeldModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_harness_model::ModelRequest,
+        deltas: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
+        self.inner.generate_title(request, deltas, cancel).await
+    }
+
+    fn identity(&self) -> tickloop_harness_protocol::ModelIdentity {
+        self.inner.identity()
+    }
+
+    async fn complete(
+        &self,
+        request: tickloop_harness_model::ModelRequest,
+        deltas: tokio::sync::mpsc::UnboundedSender<tickloop_harness_model::ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<tickloop_harness_model::ModelOutput, tickloop_harness_model::ModelError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.inner.complete(request, deltas, cancel).await
+    }
+}
+
+/// With Auto review set to the Chat's model, each review asks the model the Chat uses at that
+/// moment, never the host's reviewer: a model switch made while a Run went on applies once the
+/// Run ends, and the next Run's reviews ask the new model.
+#[tokio::test]
+async fn auto_review_with_the_chats_model_follows_a_deferred_model_switch() {
+    use tickloop_harness_protocol::ModelChange;
+    use tickloop_harness_protocol::mcp::McpUnruled;
+    use tickloop_harness_runtime::AutoReviewModel;
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name": "read", "inputSchema": {"type": "object"}}]));
+    server.set_result(json!({"content": [{"type": "text", "text": "MCP_OK"}]}));
+    let (tools, _) =
+        admission_provider_over(&server, Arc::new(Mutex::new(McpUnruled::AutoReview)), false).await;
+    let first = Arc::new(HeldModel {
+        inner: ScriptedModel::new(vec![
+            call("first", "mcp__review__read", json!({"q": "first"})),
+            verdict(false),
+            text(DONE),
+        ]),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let second = Arc::new(ScriptedModel::new(vec![
+        call("second", "mcp__review__read", json!({"q": "second"})),
+        verdict(false),
+        text(DONE),
+    ]));
+    let models = ChosenModels::new(first.clone());
+    let mut options = options(PromptPolicy::DurableApproval);
+    options.auto_review_model = AutoReviewModel::ChatModel;
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: Some(Arc::new(InMemoryTranscriptStore::new())),
+            environment: None,
+            models: models.clone(),
+        },
+        options,
+    )
+    .unwrap();
+    agent.install_host_tools(tools).unwrap();
+    let host_reviewer = Arc::new(ScriptedModel::new(Vec::new()));
+    agent.set_auto_reviewer(host_reviewer.clone()).await;
+    let chat = agent.create_chat_without_folder().await.unwrap();
+
+    let turn = agent
+        .advance(chat, prompt("Read the service.", Delivery::Queue))
+        .await
+        .unwrap();
+    first.entered.notified().await;
+    let mut switched = config();
+    switched.name = "second fixture".into();
+    models.choose(second.clone());
+    assert_eq!(
+        agent.set_model(chat, switched).await.unwrap(),
+        ModelChange::Pending
+    );
+    // The Run goes on: its call, the call's review and its last answer, each with the first model.
+    for _ in 0..2 {
+        first.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), first.entered.notified())
+            .await
+            .expect("the first model is asked again");
+    }
+    first.release.notify_one();
+    assert!(matches!(
+        outcome(&turn).await,
+        TurnOutcome::Completed { .. }
+    ));
+    let turn = agent
+        .advance(chat, prompt("Read it again.", Delivery::Queue))
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome(&turn).await,
+        TurnOutcome::Completed { .. }
+    ));
+
+    assert_eq!(served_by(&server, "read"), ["first", "second"]);
+    assert!(
+        host_reviewer.requests.lock().unwrap().is_empty(),
+        "the host's reviewer is never asked"
+    );
+    let reviews = |model: &ScriptedModel| {
+        model
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| is_review(request))
+            .count()
+    };
+    assert_eq!(
+        reviews(&first.inner),
+        1,
+        "the Run that went on reviews with the model it used"
+    );
+    assert_eq!(
+        reviews(&second),
+        1,
+        "the next Run reviews with the new model"
+    );
+    agent.shutdown().await;
+}
+
+/// The text of the result of the call `call_id` in `messages`.
+fn result_of(messages: &[tickloop_harness_protocol::Message], call_id: &str) -> String {
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } if tool_use_id == call_id => Some(content.text().into_owned()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// A server that says its tools changed and then fails to list them: a tool it declared as
+/// only reading is no longer run unasked, neither by a call that waited for the listing nor by
+/// one a later Run makes, as the declaration it was admitted under may no longer hold.
+#[tokio::test]
+async fn allow_read_only_runs_nothing_of_tools_that_could_not_be_listed_again() {
+    use tickloop_harness_protocol::mcp::McpUnruled;
+    let server = McpService::start().await;
+    server.set_tools(declared_tools(true));
+    server.set_result(json!({"content": [{"type": "text", "text": "MCP_OK"}]}));
+    let Reviewed {
+        agent,
+        chat,
+        _folder,
+        ..
+    } = reviewed_in(
+        &server,
+        McpUnruled::AllowReadOnly,
+        vec![
+            call("first", "mcp__review__read", json!({"q": "first"})),
+            call("waited", "mcp__review__read", json!({"q": "waited"})),
+            text(DONE),
+            call("later", "mcp__review__read", json!({"q": "later"})),
+            text(DONE),
+        ],
+        Vec::new(),
+        false,
+    )
+    .await;
+    // The first call's response carries the list change; the listing fails.
+    server.set_directory_error(Some(json!({"code": -32603, "message": "listing broke"})));
+    server.notify_tools_changed();
+    let turn = agent
+        .advance(chat, prompt("Read the service twice.", Delivery::Queue))
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome(&turn).await,
+        TurnOutcome::Completed { .. }
+    ));
+    let turn = agent
+        .advance(chat, prompt("Read it again.", Delivery::Queue))
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome(&turn).await,
+        TurnOutcome::Completed { .. }
+    ));
+    assert_eq!(served_by(&server, "read"), ["first"]);
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    for call_id in ["waited", "later"] {
+        let result = result_of(&snapshot.messages, call_id);
+        assert!(
+            result.contains("could not be listed again"),
+            "{call_id}: {result}"
+        );
+    }
+    agent.shutdown().await;
+}
+
+/// A call admitted because its tool only read is not sent when, before dispatch, the server
+/// says its tools changed and they cannot be listed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_read_only_never_sends_a_call_whose_tools_could_not_be_listed_before_dispatch() {
+    use tickloop_harness_protocol::mcp::McpUnruled;
+    use tickloop_harness_runtime::mcp::test_pauses::{PausePoint, pause_next};
+    let server = McpService::start().await;
+    server.set_tools(declared_tools(true));
+    server.set_result(json!({"content": [{"type": "text", "text": "MCP_OK"}]}));
+    let Reviewed {
+        agent,
+        chat,
+        connections,
+        _folder,
+        ..
+    } = reviewed_in(
+        &server,
+        McpUnruled::AllowReadOnly,
+        vec![
+            call("first", "mcp__review__read", json!({"q": "first"})),
+            text(DONE),
+        ],
+        Vec::new(),
+        false,
+    )
+    .await;
+    let pause = pause_next(PausePoint::Revalidate, SERVER);
+    let turn = agent
+        .advance(chat, prompt("Read the service.", Delivery::Queue))
+        .await
+        .unwrap();
+    let entered = pause.entered;
+    tokio::task::spawn_blocking(move || {
+        entered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the admitted call is checked before it is sent")
+    })
+    .await
+    .unwrap();
+    server.set_directory_error(Some(json!({"code": -32603, "message": "listing broke"})));
+    server.notify_tools_changed();
+    let lists = server
+        .methods()
+        .iter()
+        .filter(|method| *method == "tools/list")
+        .count();
+    connections
+        .call("mcp__review__ping", json!({}), CancellationToken::new())
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while server
+            .methods()
+            .iter()
+            .filter(|method| *method == "tools/list")
+            .count()
+            == lists
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the tools are listed again");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    pause.release.send(()).unwrap();
+    assert!(matches!(
+        outcome(&turn).await,
+        TurnOutcome::Completed { .. }
+    ));
+    assert!(served_by(&server, "read").is_empty());
+    let result = result_of(&agent.snapshot(chat).await.unwrap().messages, "first");
+    assert!(result.contains("could not be listed again"), "{result}");
+    agent.shutdown().await;
+}
+
+/// A judgment adapter that records each request and answers as told.
+struct CountedJudgment {
+    requests: std::sync::atomic::AtomicUsize,
+    fails: bool,
+}
+
+#[async_trait::async_trait]
+impl tickloop_harness_model::judgment::JudgmentClient for CountedJudgment {
+    fn model(&self) -> &str {
+        "fixture-jev"
+    }
+
+    async fn evaluate(
+        &self,
+        request: &tickloop_harness_model::judgment::EvaluationRequest,
+        cancel: CancellationToken,
+    ) -> Result<
+        tickloop_harness_model::judgment::Evaluation,
+        tickloop_harness_model::judgment::JudgmentError,
+    > {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fails {
+            return Err(tickloop_harness_model::ModelError::TimedOut.into());
+        }
+        let recording = tickloop_harness_test_support::judgment::RecordingJudgment {
+            requests: Mutex::new(Vec::new()),
+        };
+        recording.evaluate(request, cancel).await
+    }
+}
+
+/// With Auto review set to the Chat's model, Jev is never asked, whatever the Auto settings
+/// prefer and whether a Jev adapter would answer or fail: the Chat's model reviews.
+#[tokio::test]
+async fn auto_review_with_the_chats_model_never_asks_jev() {
+    use tickloop_harness_policy::AutoSettings;
+    use tickloop_harness_policy::settings::{MemorySettingsStore, SettingsStore};
+    use tickloop_harness_protocol::mcp::McpUnruled;
+    use tickloop_harness_protocol::{AutoReviewerPreference, AutoSettingsRevision};
+    use tickloop_harness_runtime::AutoReviewModel;
+    for fails in [false, true] {
+        let server = McpService::start().await;
+        server.set_tools(json!([{"name": "read", "inputSchema": {"type": "object"}}]));
+        server.set_result(json!({"content": [{"type": "text", "text": "MCP_OK"}]}));
+        let (tools, _) =
+            admission_provider_over(&server, Arc::new(Mutex::new(McpUnruled::AutoReview)), false)
+                .await;
+        let model = Arc::new(ScriptedModel::new(vec![
+            call("read", "mcp__review__read", json!({"q": "read"})),
+            verdict(false),
+            text(DONE),
+        ]));
+        let mut snapshot = MemorySettingsStore::default().read(None);
+        snapshot.auto = Ok((
+            AutoSettings {
+                reviewer: AutoReviewerPreference::Jev,
+                ..Default::default()
+            },
+            AutoSettingsRevision::new("1".into()),
+        ));
+        let mut options = options(PromptPolicy::DurableApproval);
+        options.auto_review_model = AutoReviewModel::ChatModel;
+        options.settings = Some(Arc::new(MemorySettingsStore::new(snapshot)));
+        let agent = Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: Some(Arc::new(InMemoryTranscriptStore::new())),
+                environment: None,
+                models: ChosenModels::new(model.clone()),
+            },
+            options,
+        )
+        .unwrap();
+        agent.install_host_tools(tools).unwrap();
+        let jev = Arc::new(CountedJudgment {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+            fails,
+        });
+        agent.set_judgment_client(jev.clone()).await;
+        let chat = agent.create_chat_without_folder().await.unwrap();
+        let turn = agent
+            .advance(chat, prompt("Read the service.", Delivery::Queue))
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome(&turn).await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert_eq!(
+            jev.requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{fails}: Jev is never asked"
+        );
+        assert_eq!(served_by(&server, "read"), ["read"], "{fails}");
+        assert_eq!(
+            model
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| is_review(request))
+                .count(),
+            1,
+            "{fails}: the Chat's model reviewed"
+        );
+        agent.shutdown().await;
+    }
+}
+
+/// With Auto review set to the Chat's model, a model switch made while a Run waits for the
+/// person is deferred: once the person answers, the Run goes on reviewing with the model it
+/// used, and the next Run reviews with the new model.
+#[tokio::test]
+async fn auto_review_with_the_chats_model_keeps_the_model_of_a_run_that_waited_through_a_switch() {
+    use tickloop_harness_protocol::ModelChange;
+    use tickloop_harness_protocol::mcp::McpUnruled;
+    use tickloop_harness_runtime::AutoReviewModel;
+    let server = McpService::start().await;
+    server.set_tools(json!([{"name": "read", "inputSchema": {"type": "object"}}]));
+    server.set_result(json!({"content": [{"type": "text", "text": "MCP_OK"}]}));
+    let unruled = Arc::new(Mutex::new(McpUnruled::Person));
+    let (tools, _) = admission_provider_over(&server, unruled.clone(), false).await;
+    let first = Arc::new(ScriptedModel::new(vec![
+        call("asked", "mcp__review__read", json!({"q": "asked"})),
+        call("reviewed", "mcp__review__read", json!({"q": "reviewed"})),
+        verdict(false),
+        text(DONE),
+    ]));
+    let second = Arc::new(ScriptedModel::new(vec![
+        call("next", "mcp__review__read", json!({"q": "next"})),
+        verdict(false),
+        text(DONE),
+    ]));
+    let models = ChosenModels::new(first.clone());
+    let mut options = options(PromptPolicy::DurableApproval);
+    options.auto_review_model = AutoReviewModel::ChatModel;
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: Some(Arc::new(InMemoryTranscriptStore::new())),
+            environment: None,
+            models: models.clone(),
+        },
+        options,
+    )
+    .unwrap();
+    agent.install_host_tools(tools).unwrap();
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    let turn = agent
+        .advance(chat, prompt("Read the service twice.", Delivery::Queue))
+        .await
+        .unwrap();
+    let TurnOutcome::Waiting(TurnWait::Permission(request)) = outcome(&turn).await else {
+        panic!("the first call waits for the person");
+    };
+    // From the next call on, the server's unruled calls go to Auto review.
+    *unruled.lock().unwrap() = McpUnruled::AutoReview;
+    let mut switched = config();
+    switched.name = "second fixture".into();
+    models.choose(second.clone());
+    assert_eq!(
+        agent.set_model(chat, switched).await.unwrap(),
+        ModelChange::Pending
+    );
+    let reply = agent
+        .advance(chat, answer(&request, PermissionReply::AllowOnce))
+        .await
+        .unwrap();
+    assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
+    agent.settled_input(chat, turn.input_id()).await.unwrap();
+    let turn = agent
+        .advance(chat, prompt("Read it again.", Delivery::Queue))
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome(&turn).await,
+        TurnOutcome::Completed { .. }
+    ));
+    assert_eq!(served_by(&server, "read"), ["asked", "reviewed", "next"]);
+    let reviews = |model: &ScriptedModel| {
+        model
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| is_review(request))
+            .count()
+    };
+    assert_eq!(
+        reviews(&first),
+        1,
+        "the Run that waited reviews with its model"
+    );
+    assert_eq!(
+        reviews(&second),
+        1,
+        "the next Run reviews with the new model"
+    );
+    agent.shutdown().await;
 }

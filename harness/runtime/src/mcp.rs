@@ -113,6 +113,11 @@ const MAX_SERVER_TEXT_CHARACTERS: usize = 2048;
 const RESOURCES_UNAVAILABLE: &str = "MCP resources unavailable";
 const CONNECTION_CLOSED: &str = "MCP connection closed";
 const CONNECTION_TIMED_OUT: &str = "MCP connection timed out";
+/// Why a call is not sent: its server said its tools changed, and they could not be listed again.
+const TOOLS_UNLISTED: &str =
+    "MCP tool directory changed and could not be listed again; call not dispatched";
+/// Why an admitted call was not sent: its tool's declaration changed after it was decided.
+const DECLARATION_CHANGED: &str = "the MCP tool's declaration changed before dispatch, so the call was not sent; call the tool again to have it decided under its new declaration";
 const CONNECTION_UNAVAILABLE: &str = "MCP connection is unavailable";
 const TOOLS_RELIST_FAILED: &str =
     "MCP tools could not be listed again; the last listed tools remain";
@@ -126,6 +131,10 @@ struct Connection {
     /// `None` when the server does not provide resources.
     resources: Option<ResourceDirectory>,
     warnings: RwLock<Vec<String>>,
+    /// The server said its tools changed and they could not be listed again: the tools it
+    /// listed before are shown still, but no call of them is sent until a listing succeeds or
+    /// the server connects again.
+    is_unlisted: AtomicBool,
     /// Cancelled when a call finds the connection unusable, so that it is opened again.
     lost: CancellationToken,
 }
@@ -1331,7 +1340,8 @@ impl McpConnections {
             .collect()
     }
     /// Resolves a call against the current tools. While the tool's server connects or connects
-    /// again, the call waits for it, at most for the connection timeout and until cancelled.
+    /// again, or lists its tools again after it said they changed, the call waits for it, at most
+    /// for the connection timeout and until cancelled.
     async fn prepare_ready(
         &self,
         name: &str,
@@ -1361,8 +1371,23 @@ impl McpConnections {
                 .unwrap()
                 .clone()
                 .filter(|connection| !connection.lost.is_cancelled());
+            // A call is prepared against the tools as the server last said they are: a list
+            // change being listed again is waited for, so the call is decided under it.
+            let is_listing = connection.as_ref().is_some_and(|connection| {
+                connection.revision.load(Ordering::SeqCst)
+                    != connection.catalog_revision.load(Ordering::SeqCst)
+            });
+            // No call is prepared against tools the server said changed and that could not be
+            // listed again.
+            if !is_listing
+                && connection
+                    .as_ref()
+                    .is_some_and(|connection| connection.is_unlisted.load(Ordering::SeqCst))
+            {
+                return Err(TOOLS_UNLISTED.into());
+            }
             match (state, connection) {
-                (McpServerState::Connected, Some(_)) => {
+                (McpServerState::Connected, Some(_)) if !is_listing => {
                     return Ok(PreparedMcpCall {
                         target: entry.call_target(&tool),
                         entry,
@@ -1388,6 +1413,8 @@ impl McpConnections {
     /// the same server, leaves a call prepared before it valid, as a call may wait long for its
     /// approval.
     fn revalidate(&self, call: &PreparedMcpCall) -> Result<Arc<Connection>, String> {
+        #[cfg(feature = "test-support")]
+        test_pauses::wait(test_pauses::PausePoint::Revalidate, &call.entry.config.name);
         if call.entry.cancel.is_cancelled()
             || !self
                 .inner
@@ -1415,6 +1442,9 @@ impl McpConnections {
         {
             return Err("MCP tool directory changed before dispatch".into());
         }
+        if connection.is_unlisted.load(Ordering::SeqCst) {
+            return Err(TOOLS_UNLISTED.into());
+        }
         let current = call.entry.snapshot.read().unwrap().clone();
         if !current
             .tools
@@ -1424,6 +1454,11 @@ impl McpConnections {
                     && tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Hidden
             })
         {
+            // The same login reaches a tool whose declaration changed: the call was decided under
+            // the old one, so it is decided again when the model calls the tool again.
+            if call.entry.call_target(&call.tool) == call.target {
+                return Err(DECLARATION_CHANGED.into());
+            }
             return Err("MCP tool or login changed before dispatch".into());
         }
         Ok(connection)

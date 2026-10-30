@@ -29,8 +29,8 @@ use task_board_history::ConversationChange;
 pub use task_board_history::{TaskBoardQueryError, task_boards_at};
 
 pub use harness::{
-    CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, PersonWait, PersonWaitKind,
-    Quiescence, SearchDefaults, SubagentLaunch, ToolPolicy, WaitHosting, Waits,
+    AutoReviewModel, CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, PersonWait,
+    PersonWaitKind, Quiescence, SearchDefaults, SubagentLaunch, ToolPolicy, WaitHosting, Waits,
     durable_chat_host_rules,
 };
 mod hook_transcript;
@@ -402,6 +402,7 @@ struct Inner {
     environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
     tool_policy: ToolPolicy,
     citation_style: CitationStyle,
+    auto_review_model: AutoReviewModel,
     host_rules: Vec<PermissionRule>,
     /// The host's own section of every conversation's system prompt.
     system_prompt_addition: Option<String>,
@@ -1845,7 +1846,12 @@ impl Agent {
             facts
         });
         let preferred = auto_settings.reviewer;
-        let configured_reviewer = self.inner.auto_reviewer.lock().await.clone();
+        // The Chat's own model reviews in place of any other when the host chose it, with the
+        // client this review captured from the Chat: whatever model the Chat uses now.
+        let configured_reviewer = match self.inner.auto_review_model {
+            AutoReviewModel::Configured => self.inner.auto_reviewer.lock().await.clone(),
+            AutoReviewModel::ChatModel => Some(chat_client.clone()),
+        };
         let has_isolated_reviewer = configured_reviewer.is_some();
         let has_judgment_adapter = self.inner.judgment.lock().await.is_some();
         let llm_client = if let Some(client) = configured_reviewer {
@@ -1873,8 +1879,11 @@ impl Agent {
                 crate::context::context_window(&snapshot),
             )
         };
-        let use_jev = preferred == tickloop_harness_protocol::AutoReviewerPreference::Jev
-            || (has_judgment_adapter && !has_isolated_reviewer);
+        // The Chat's own model is the only reviewer the host chose: Jev is neither bound, asked
+        // nor fallen back from.
+        let use_jev = self.inner.auto_review_model == AutoReviewModel::Configured
+            && (preferred == tickloop_harness_protocol::AutoReviewerPreference::Jev
+                || (has_judgment_adapter && !has_isolated_reviewer));
         let assess = |run: auto_approval::ReviewerRun,
                       fallback_from: Option<ApprovalReviewerKind>,
                       fallback_failure: Option<ApprovalFailureKind>,
@@ -2290,6 +2299,7 @@ impl Agent {
             waits,
             system_prompt_addition,
             citation_style,
+            auto_review_model,
             request_gates,
             time_zone,
             scheduled_task_expiry,
@@ -2359,6 +2369,7 @@ impl Agent {
                 environment,
                 tool_policy,
                 citation_style,
+                auto_review_model,
                 host_rules,
                 system_prompt_addition,
                 web_search_settings,

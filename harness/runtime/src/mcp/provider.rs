@@ -337,8 +337,9 @@ impl HostToolProvider for McpToolProvider {
             .connections
             .prepare_ready(name, input.clone(), &cancel)
             .await?;
-        let auto_review_unruled = *call.entry.unruled.read().unwrap()
-            == tickloop_harness_protocol::mcp::McpUnruled::AutoReview;
+        let unruled = *call.entry.unruled.read().unwrap();
+        // The declaration this call was prepared against; its target binds the call to it.
+        let is_declared_read_only = call.tool.annotations["readOnlyHint"] == true;
         // The reviewer learns which server and tool the call reaches, never what the server
         // writes of its tool: a description or annotation could argue for its own approval.
         let facts = tickloop_harness_protocol::PreparedApprovalFacts {
@@ -359,7 +360,7 @@ impl HostToolProvider for McpToolProvider {
         )
         .with_mcp_server(call.entry.config.name.clone())
         .with_target(call.target.clone())
-        .with_auto_review_unruled(auto_review_unruled)
+        .with_unruled(unruled, is_declared_read_only)
         .with_remote(is_remote)
         .with_approval_facts(facts)
         .with_payload(call))

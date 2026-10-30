@@ -355,6 +355,7 @@ pub(super) async fn serve(
                     state_changed.notify_waiters();
                 }
                 let listed = matches!(tools, Ok(Ok(_)));
+                connection.is_unlisted.store(!listed, Ordering::SeqCst);
                 {
                     let mut warnings = connection.warnings.write().unwrap();
                     warnings.retain(|warning| warning != TOOLS_RELIST_FAILED);
@@ -370,6 +371,8 @@ pub(super) async fn serve(
                     entry.publish_metadata();
                 }
                 connection.catalog_revision.store(revision, Ordering::SeqCst);
+                // A call waiting to be prepared against the listed tools goes on.
+                state_changed.notify_waiters();
             }
             _ = async { resources_changed.as_ref().unwrap().notified().await }, if resources_changed.is_some() => {
                 if *entry.state.read().unwrap() != McpServerState::Connected {
@@ -589,6 +592,7 @@ async fn open(
             instructions,
             resources,
             warnings: RwLock::new(Vec::new()),
+            is_unlisted: AtomicBool::new(false),
             lost: CancellationToken::new(),
         },
         service,

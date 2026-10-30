@@ -1967,14 +1967,23 @@ impl Agent {
                     Decision::Allow
                 }
                 // Durable Approval hands a third-party call no rule decides to a person, unless its
-                // server's host chose Auto review first, and a call a person allowed while its Run
-                // waited is not reviewed again.
+                // server's host chose Auto review first or admits a tool its declaration says
+                // only reads, and a call a person allowed while its Run waited is not reviewed
+                // again.
+                Decision::Check if is_granted => Decision::Ask,
                 Decision::Check
-                    if is_granted
-                        || is_durable_third_party
-                            && !prepared_host_call
-                                .as_ref()
-                                .is_some_and(|call| call.auto_reviews_unruled()) =>
+                    if is_durable_third_party
+                        && prepared_host_call
+                            .as_ref()
+                            .is_some_and(|call| call.admits_unruled_read_only()) =>
+                {
+                    Decision::Allow
+                }
+                Decision::Check
+                    if is_durable_third_party
+                        && !prepared_host_call
+                            .as_ref()
+                            .is_some_and(|call| call.auto_reviews_unruled()) =>
                 {
                     Decision::Ask
                 }

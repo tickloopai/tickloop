@@ -3698,3 +3698,110 @@ async fn mcp_calls_drop_unset_optional_arguments_and_name_refused_ones() {
         "{final_messages}"
     );
 }
+
+/// A server that says its tools changed and then fails to list them keeps showing the tools it
+/// listed before, but no call of them is sent: not a call made while the listing ran, nor one
+/// made after it failed. Once the server connects again and lists them, calls are sent again.
+#[tokio::test]
+async fn tools_that_could_not_be_listed_again_are_not_called_until_listed() {
+    let server = McpService::start().await;
+    server.set_tools(json!([
+        {"name":"old","inputSchema":{"type":"object"}},
+        {"name":"ping","inputSchema":{"type":"object"}},
+    ]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let config = McpServerConfig {
+        unruled: Default::default(),
+        exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
+        tool_exposure: Vec::new(),
+        description: String::new(),
+        sensitive_values: Vec::new(),
+        disabled: false,
+        name: "unlisted".into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: BTreeMap::new(),
+        },
+        oauth: Default::default(),
+        timeout_ms: 5000,
+    };
+    connections.reconcile(vec![config.clone()]).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.snapshot()[0].state != McpServerState::Connected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let lists = || {
+        server
+            .methods()
+            .iter()
+            .filter(|method| *method == "tools/list")
+            .count()
+    };
+    let calls_of = |name: &str| {
+        server
+            .calls()
+            .iter()
+            .filter(|call| call["params"]["name"] == name)
+            .count()
+    };
+    let refused = |result: HostCallResult| match result {
+        HostCallResult::NotDispatched(reason) => reason.contains("could not be listed again"),
+        _ => false,
+    };
+
+    server.set_directory_error(Some(json!({"code": -32603, "message": "listing broke"})));
+    server.notify_tools_changed();
+    let before = lists();
+    assert!(matches!(
+        connections
+            .call("mcp__unlisted__ping", json!({}), CancellationToken::new())
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    // A call made while the listing runs waits for it, and is refused when it fails.
+    assert!(refused(
+        connections
+            .call("mcp__unlisted__old", json!({}), CancellationToken::new())
+            .await
+    ));
+    assert!(lists() > before);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A call made once the listing failed is refused too.
+    assert!(refused(
+        connections
+            .call("mcp__unlisted__old", json!({}), CancellationToken::new())
+            .await
+    ));
+    assert_eq!(calls_of("old"), 0);
+
+    // Connecting again lists the tools afresh, and their calls are sent again.
+    server.set_directory_error(None);
+    assert!(
+        connections
+            .reconnect(vec![config.clone()], "unlisted")
+            .await
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.snapshot()[0].state != McpServerState::Connected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        connections
+            .call("mcp__unlisted__old", json!({}), CancellationToken::new())
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    assert_eq!(calls_of("old"), 1);
+    connections.shutdown().await;
+}

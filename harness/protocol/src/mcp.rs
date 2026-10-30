@@ -43,6 +43,11 @@ pub enum McpUnruled {
     Person,
     /// Auto review first: what it admits runs, and what it does not admit goes to the person.
     AutoReview,
+    /// A call of a tool whose declaration, as the call was prepared against it, says the tool
+    /// only reads (`readOnlyHint`) runs; any other goes to the person. A host's opt-in exception
+    /// to annotations granting nothing: the call is sent only while the tool's declaration is
+    /// still the one that admitted it.
+    AllowReadOnly,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
