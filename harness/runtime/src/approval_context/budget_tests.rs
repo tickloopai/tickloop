@@ -87,6 +87,7 @@ impl Session {
             run,
         );
         let operation = OperationRecord {
+            input_message_id: None,
             parent_call_id: None,
             parent_call_index: None,
             task_binding: None,

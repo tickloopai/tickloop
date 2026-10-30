@@ -3839,6 +3839,7 @@ impl Agent {
                 feedback_inputs: HashMap::new(),
                 feedback_cleanup_started: false,
                 user_loops: HashMap::new(),
+                user_skill_preparations: HashMap::new(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,
@@ -3936,7 +3937,22 @@ impl StagedBranch {
         snapshot.last_queue_sequence = snapshot
             .last_queue_sequence
             .max(previous.last_queue_sequence);
-        snapshot.operations = previous.operations.clone();
+        let mut operations = std::mem::take(&mut snapshot.operations)
+            .into_iter()
+            .filter(|operation| operation.input_message_id.is_some())
+            .map(|operation| (operation.id, operation))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        operations.extend(
+            previous
+                .operations
+                .iter()
+                .filter(|operation| {
+                    operation.input_message_id.is_none()
+                        || super::nested_calls::parent_on_chain(&snapshot, operation)
+                })
+                .map(|operation| (operation.id, operation.clone())),
+        );
+        snapshot.operations = operations.into_values().collect();
         snapshot.request_usage = previous.request_usage.clone();
         snapshot.provider_failures = previous.provider_failures.clone();
         snapshot.user_shells = previous.user_shells.clone();

@@ -201,6 +201,7 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
             .unwrap();
         assert_eq!(prepared.input(), &original);
         let mut operation = OperationRecord {
+            input_message_id: None,
             parent_call_id: None,
             parent_call_index: None,
             id: serde_json::from_value(log["operation_id"].clone()).unwrap(),

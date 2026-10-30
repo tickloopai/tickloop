@@ -929,6 +929,7 @@ fn observation_values_keep_their_recorded_wire() {
             ObservationValue::TaskToolsSetting(true),
             ObservationValue::TaskToolsSetting(false),
             ObservationValue::Operation(Some(Box::new(OperationRecord {
+                input_message_id: None,
                 parent_call_id: None,
                 parent_call_index: None,
                 task_binding: None,

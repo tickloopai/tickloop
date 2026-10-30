@@ -114,6 +114,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_new_input_resumes_receivin
         }
         chat.snapshot.last_queue_sequence = 1;
         chat.snapshot.pending_inputs.push(PendingInput {
+            skill_guidance: None,
             receipt: Receipt {
                 chat_id,
                 loop_id,

@@ -61,6 +61,9 @@ pub struct RemoteSkillDefinition {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct InvokedSkill {
+    /// Whether the original command required Shell preprocessing, even after completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_preprocessing: Option<bool>,
     pub name: String,
     pub content: String,
     pub source: SkillSource,

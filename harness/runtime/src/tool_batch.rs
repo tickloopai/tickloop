@@ -149,7 +149,21 @@ impl Agent {
         let chats = self.inner.chats.lock().await;
         chats
             .get(&receipt.chat_id)
-            .map(|chat| run_call_ids(&chat.snapshot, receipt.run_id))
+            .map(|chat| {
+                let mut ids = run_call_ids(&chat.snapshot, receipt.run_id);
+                ids.extend(
+                    chat.snapshot
+                        .operations
+                        .iter()
+                        .filter(|operation| {
+                            operation.run_id == receipt.run_id
+                                && operation.input_message_id.is_some()
+                                && super::nested_calls::parent_on_chain(&chat.snapshot, operation)
+                        })
+                        .map(|operation| operation.call_id.clone()),
+                );
+                ids
+            })
             .unwrap_or_default()
     }
 
@@ -440,7 +454,7 @@ impl Agent {
 
     /// Runs one call under `call_cancel` and appends its result; a result that ends the Run
     /// cancels `run_cancel`.
-    async fn execute_and_commit_tool_call(
+    pub(super) async fn execute_and_commit_tool_call(
         &self,
         receipt: &Receipt,
         batch: &ToolBatch,
@@ -595,6 +609,84 @@ impl Agent {
         Ok(())
     }
 
+    pub(super) async fn complete_input_call(
+        &self,
+        receipt: &Receipt,
+        call: &ProposedToolCall,
+        outcome: Result<ToolCallOutcome, super::tool_execution::ToolCallError>,
+        cancel: &CancellationToken,
+    ) -> Result<tickloop_harness_protocol::ToolResult, String> {
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(record) = error.denial {
+                    self.record_final_denial(*record).await;
+                }
+                ToolCallOutcome::not_admitted(error.message)
+            }
+        };
+        let completion = self
+            .complete_call(receipt, &call.call_id, &call.name, Ok(outcome))
+            .await?;
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats
+            .get_mut(&receipt.chat_id)
+            .ok_or("chat is unavailable")?;
+        if Agent::release_of(chat, receipt.run_id).is_cancelled() {
+            return Err(super::suspension::RUN_RELEASED.into());
+        }
+        if !completion.result.tool.is_error
+            && let Some(tool_use) = monitor_members::ToolUse::of(&call.name, &call.input)
+        {
+            self.mark_tool_use(chat, tool_use);
+        }
+        self.apply_completed_host_effect(chat, receipt, &call.call_id, completion.host_effect);
+        if let Some(operation) = chat.snapshot.operations.iter_mut().find(|operation| {
+            operation.run_id == receipt.run_id && operation.call_id == call.call_id
+        }) {
+            operation.result = Some(completion.result.tool.clone());
+            self.record_nested_operation(receipt.chat_id, operation);
+        } else {
+            let operation = tickloop_harness_protocol::OperationRecord {
+                input_message_id: crate::command_skills::input_message_id(),
+                parent_call_id: None,
+                parent_call_index: None,
+                task_binding: None,
+                id: tickloop_ids::generate(),
+                loop_id: receipt.loop_id,
+                run_id: receipt.run_id,
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                input: call.input.clone(),
+                file_change: None,
+                state: OperationState::Failed,
+                result: Some(completion.result.tool.clone()),
+            };
+            self.record_nested_operation(receipt.chat_id, &operation);
+            chat.snapshot.operations.push(operation);
+        }
+        self.save(&chat.snapshot);
+        self.emit(
+            chat,
+            receipt,
+            EventKind::ToolCompleted {
+                call_id: call.call_id.clone(),
+                result: completion.result.tool.clone(),
+                sources: completion.sources.unwrap_or_default(),
+            },
+        );
+        if completion.result.ends_run {
+            chat.user_cancelled_runs.insert(receipt.run_id);
+        }
+        if chat.user_cancelled_runs.contains(&receipt.run_id) {
+            cancel.cancel();
+            return Err(completion.result.tool.content);
+        }
+        let mut result = completion.result.tool;
+        result.content = completion.result.content.text().into_owned();
+        Ok(result)
+    }
+
     pub(super) async fn complete_nested_call(
         &self,
         receipt: &Receipt,
@@ -744,29 +836,37 @@ impl Agent {
         })
     }
 
+    pub(super) async fn finish_tool_results(
+        &self,
+        receipt: &Receipt,
+    ) -> Result<Option<Usage>, String> {
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&receipt.chat_id).unwrap();
+        self.flush_deferred_messages(chat, MessageBoundary::ToolResults)
+            .map_err(|error| error.to_string())?;
+        let stopped_by_hook = chat.hook_state.take_stop(receipt.run_id);
+        if stopped_by_hook
+            || matches!(
+                chat.snapshot.subagent_reports.get(&receipt.run_id),
+                Some(SubagentReport::Delivered { .. })
+            )
+        {
+            return chat
+                .snapshot
+                .request_usage
+                .run_conversation_usage(receipt.run_id)
+                .map(Some)
+                .map_err(|error| error.to_string());
+        }
+        Ok(None)
+    }
+
     /// The end of a batch: deferred local messages and messages queued to the Run's Loop join
     /// the conversation, and the next model request is prepared, unless the Run's Subagent
     /// report was delivered.
     async fn finish_batch(&self, receipt: &Receipt) -> Result<BatchExit, String> {
-        {
-            let mut chats = self.inner.chats.lock().await;
-            let chat = chats.get_mut(&receipt.chat_id).unwrap();
-            self.flush_deferred_messages(chat, MessageBoundary::ToolResults)
-                .map_err(|error| error.to_string())?;
-            let stopped_by_hook = chat.hook_state.take_stop(receipt.run_id);
-            if stopped_by_hook
-                || matches!(
-                    chat.snapshot.subagent_reports.get(&receipt.run_id),
-                    Some(SubagentReport::Delivered { .. })
-                )
-            {
-                return chat
-                    .snapshot
-                    .request_usage
-                    .run_conversation_usage(receipt.run_id)
-                    .map(BatchExit::Ended)
-                    .map_err(|error| error.to_string());
-            }
+        if let Some(usage) = self.finish_tool_results(receipt).await? {
+            return Ok(BatchExit::Ended(usage));
         }
         self.merge_queued_messages(receipt)
             .await

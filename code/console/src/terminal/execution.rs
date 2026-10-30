@@ -2693,8 +2693,7 @@ impl ConsoleExecution {
             arguments,
             tickloop_code_settings::skills::SkillCaller::User,
         )
-        .and_then(tickloop_harness::protocol::InvokedSkill::try_from)
-        .map(|_| ())
+        .and_then(|expanded| expanded.validate())
     }
     fn initial_directory_sources(
         &self,

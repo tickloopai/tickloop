@@ -488,7 +488,7 @@ pub(super) fn skill_candidates(registry: &SkillRegistry) -> Arc<[CompletionCandi
         .user_definitions()
         .map(|skill| CompletionCandidate {
             command: format!("/{}", skill.name),
-            arguments: "[ARGUMENTS]".into(),
+            arguments: super::safe_line(skill.argument_hint.as_deref().unwrap_or("[ARGUMENTS]")),
             description: super::safe_line(&format!(
                 "{} · {}",
                 skill.source.display_label(),
@@ -1112,6 +1112,29 @@ mod tests {
         assert!(!completion.is_open());
         completion.update("!git status");
         assert!(!completion.is_open());
+    }
+
+    #[test]
+    fn plugin_command_completion_uses_its_hint_and_invocation_flags() {
+        use tickloop_code_settings::skills::CommandDocument;
+        use tickloop_harness::protocol::SkillSource;
+        let mut registry = SkillRegistry::default();
+        for (name, visible) in [("check", true), ("hidden", false)] {
+            registry.register_command(CommandDocument {
+                name: name.into(), markdown: format!("---\ndescription: Check code\nargument-hint: <target> [mode]\nuser-invocable: {visible}\n---\nCheck"),
+                source: SkillSource::Plugin { plugin: "review".into(), path: format!("/plugin/{name}.md").into() },
+                base_directory: "/plugin".into(), metadata: Default::default(),
+                public_config: Default::default(),
+            }, &[]);
+        }
+        let candidates = skill_candidates(&registry);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].command, "/review:check");
+        assert_eq!(candidates[0].arguments, "<target> [mode]");
+        let mut completion = Completion::default();
+        completion.set_skills(candidates);
+        completion.update("/review:ch");
+        assert!(completion.is_open());
     }
 
     fn skill(command: &str) -> CompletionCandidate {

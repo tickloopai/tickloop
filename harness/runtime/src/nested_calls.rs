@@ -244,6 +244,7 @@ impl NestedCalls {
             operation.run_id == self.receipt.run_id && operation.call_id == call_id
         }) {
             let operation = OperationRecord {
+                input_message_id: None,
                 parent_call_id: Some(self.parent.clone()),
                 parent_call_index: Some(call_index),
                 task_binding: None,
@@ -319,6 +320,7 @@ impl NestedCalls {
             });
             let index = index.unwrap_or_else(|| {
                 chat.snapshot.operations.push(OperationRecord {
+                    input_message_id: None,
                     parent_call_id: Some(self.parent.clone()),
                     parent_call_index: Some(call_index),
                     task_binding: None,
@@ -411,7 +413,7 @@ impl Agent {
         chat_id: tickloop_harness_protocol::ChatId,
         operation: &OperationRecord,
     ) {
-        if operation.parent_call_id.is_some() {
+        if operation.parent_call_id.is_some() || operation.input_message_id.is_some() {
             self.record_chat_metadata(
                 chat_id,
                 tickloop_harness_transcript::Line::NestedCall(
@@ -460,6 +462,7 @@ impl Agent {
             ));
         }
         let operation = OperationRecord {
+            input_message_id: None,
             parent_call_id: None,
             parent_call_index: None,
             task_binding: None,
@@ -544,6 +547,20 @@ pub(crate) fn parent_on_chain(
     snapshot: &tickloop_harness_protocol::ChatSnapshot,
     operation: &OperationRecord,
 ) -> bool {
+    if let Some(input) = operation.input_message_id {
+        return operation.parent_call_id.is_none()
+            && snapshot
+                .messages
+                .iter()
+                .enumerate()
+                .any(|(index, message)| {
+                    message.role == tickloop_harness_protocol::Role::User
+                        && snapshot.prompt_execution_modes.contains_key(&index)
+                        && snapshot.message_runs.get(&index) == Some(&operation.run_id)
+                        && (snapshot.message_ids.get(&index) == Some(&input)
+                            || snapshot.original_message_ids.get(&index) == Some(&input))
+                });
+    }
     operation
         .parent_call_id
         .as_deref()

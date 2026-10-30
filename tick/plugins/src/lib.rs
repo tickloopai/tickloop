@@ -6,6 +6,7 @@
 //! granted.
 
 mod catalog;
+mod commands;
 mod git;
 mod hooks;
 mod http;
@@ -20,6 +21,7 @@ mod store;
 use std::{ffi::OsStr, io, path::PathBuf};
 
 pub use catalog::{MarketplaceCatalog, MarketplacePlugin, MarketplacePluginSource};
+pub use commands::{CommandDiscovery, PluginCommand, discover_commands};
 pub use git::{GitCheckout, GitClient};
 pub use hooks::{COMMAND_HOOK_TYPE, HOOK_EVENTS, HookSupport, UNSUPPORTED_COMMAND_FIELDS};
 pub use manifest::{

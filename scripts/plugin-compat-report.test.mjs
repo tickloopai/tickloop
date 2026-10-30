@@ -65,7 +65,9 @@ if (identity !== manifest.name) console.log(\`Its manifest calls it \${manifest.
 const skills = existsSync(join(directory, "skills")) ? readdirSync(join(directory, "skills")).sort().map(name => "skills/" + name) : [];
 console.log(\`Skills: \${skills.length ? skills.join(", ") : "none"}\`);
 if (manifest.executable) console.log(\`Tick program: \${manifest.executable} (speaks the Tick protocol)\`);
-const unsupported = [["commands", "commands"], [".mcp.json", "MCP servers"]].filter(([file]) => existsSync(join(directory, file))).map(([, label]) => label);
+const commands = existsSync(join(directory, "commands")) ? readdirSync(join(directory, "commands")).sort().map(name => name.replace(/\\.md$/, "")) : [];
+console.log(\`Commands: \${commands.length ? commands.join(", ") : "none"}\`);
+const unsupported = [[".mcp.json", "MCP servers"]].filter(([file]) => existsSync(join(directory, file))).map(([, label]) => label);
 if (unsupported.length) console.log(\`Not supported yet, so not used: \${unsupported.join(", ")}.\`);
 `);
   chmodSync(path, 0o755);
@@ -141,8 +143,9 @@ test("the output of tickloop plugin validate is read line by line", () => {
   assert.deepEqual(parseValidateOutput([
     "Plugin notes 1.0.0, read from .claude-plugin/plugin.json.",
     "Skills: skills/read, skills/write",
+    "Commands: summarize",
     "Tick program: bin/tick-notes (speaks the Tick protocol)",
-    "Not supported yet, so not used: commands, MCP servers.",
+    "Not supported yet, so not used: MCP servers.",
     "Warning: skills path \"../outside\" is ignored: it must start with ./",
     "",
   ].join("\n")), {
@@ -151,14 +154,15 @@ test("the output of tickloop plugin validate is read line by line", () => {
     version: "1.0.0",
     format: ".claude-plugin/plugin.json",
     skills: ["skills/read", "skills/write"],
+    commands: ["summarize"],
     tick: { executable: "bin/tick-notes", kind: "speaks the Tick protocol" },
     mcp: [],
     hooks: null,
-    unsupported: ["commands", "MCP servers"],
+    unsupported: ["MCP servers"],
     warnings: ["skills path \"../outside\" is ignored: it must start with ./"],
   });
   assert.deepEqual(parseValidateOutput("Plugin bare-plugin, read from its directory.\nSkills: none\n"), {
-    name: "bare-plugin", displayName: null, version: null, format: "its directory", skills: [], tick: null, mcp: [], hooks: null, unsupported: [], warnings: [],
+    name: "bare-plugin", displayName: null, version: null, format: "its directory", skills: [], commands: [], tick: null, mcp: [], hooks: null, unsupported: [], warnings: [],
   });
 });
 
@@ -188,7 +192,7 @@ test("a Claude marketplace in a git repository reports every plugin's source, st
   });
   assert.deepEqual(
     { revision: plugins.notes.revision, format: plugins.notes.manifestFormat, skills: plugins.notes.skills, unsupported: plugins.notes.unsupportedComponents },
-    { revision: fixture.marketplaceCommit.slice(0, 12), format: ".claude-plugin/plugin.json", skills: ["skills/read"], unsupported: ["commands"] },
+    { revision: fixture.marketplaceCommit.slice(0, 12), format: ".claude-plugin/plugin.json", skills: ["skills/read"], unsupported: [] },
   );
   assert.deepEqual(
     { revision: plugins.remote.revision, version: plugins.remote.version, used: plugins.remote.supportedComponents, unsupported: plugins.remote.unsupportedComponents },
@@ -221,8 +225,8 @@ test("a Claude marketplace in a git repository reports every plugin's source, st
       url: { plugins: 3, installable: 1, invalid: 0, "not fetchable": 2, "unsupported source": 0 },
     },
     manifestFormats: { ".claude-plugin/plugin.json": 2, "marketplace entry": 2 },
-    supportedComponents: { skills: 4 },
-    unsupportedComponents: { "MCP servers": 1, commands: 1 },
+    supportedComponents: { skills: 4, commands: 1 },
+    unsupportedComponents: { "MCP servers": 1 },
     hooks: { plugins: 0, fully: 0, partly: 0, none: 0, supportedHooks: 0, unsupportedEvents: {}, unsupportedTypes: {}, unsupportedFields: {} },
   });
   assert.equal(git(fixture.monorepo, "status", "--porcelain"), "", "the plugin sources stay untouched");
@@ -231,7 +235,7 @@ test("a Claude marketplace in a git repository reports every plugin's source, st
   const markdown = renderMarkdown(report);
   assert.match(markdown, /^# Plugin compatibility: fixture-market$/m);
   assert.match(markdown, /^\| Installable \| 4 \|$/m);
-  assert.match(markdown, /^\| commands \| 1 \| not yet \|$/m);
+  assert.match(markdown, /^\| commands \| 1 \| yes \|$/m);
   assert.match(markdown, new RegExp(`^\\| sub \\| git-subdir \\S+ plugins/sub #main \\| installable \\| ${fixture.monorepoCommit.slice(0, 12)} \\| marketplace entry \\| 0.3.0 \\| skills \\|`, "m"));
   assert.match(markdown, /^\| from-npm \| npm @example\/plugin \| unsupported source \|/m);
 });
@@ -304,7 +308,7 @@ test("the built tickloop reads the fixture marketplace the same way", { skip: !e
     { installable: report.totals.installable, invalid: report.totals.invalid, notFetchable: report.totals.notFetchable, unsupportedSource: report.totals.unsupportedSource },
     { installable: 4, invalid: 1, notFetchable: 3, unsupportedSource: 1 },
   );
-  assert.deepEqual(plugins.notes.unsupportedComponents, ["commands"]);
+  assert.deepEqual(plugins.notes.unsupportedComponents, []);
   assert.deepEqual(plugins.remote.unsupportedComponents, []);
   assert.deepEqual({ format: plugins.sub.manifestFormat, skills: plugins.sub.skills }, { format: "marketplace entry", skills: ["skills/draft"] });
   assert.match(plugins.broken.errors[0], /name .* must be a string/);

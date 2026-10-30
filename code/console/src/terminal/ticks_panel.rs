@@ -2191,6 +2191,7 @@ mod tests {
                     protocol: true,
                 }),
                 skill_paths: Vec::new(),
+                commands: None,
                 components: [Component::Tick].into_iter().collect(),
                 warnings: Vec::new(),
                 auth,

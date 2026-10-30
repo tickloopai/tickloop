@@ -107,6 +107,7 @@ pub mod upgrade;
 mod web_fetch;
 use tool_batch::{BatchExit, RunStart, ToolBatch};
 use tool_execution::{ToolCallOutcome, ToolInvocation, ToolRegistry};
+mod command_skills;
 mod commands;
 mod permission_management;
 mod plan;
@@ -152,6 +153,7 @@ use tickloop_harness_base::output_style::OutputStyle;
 use tickloop_harness_model::{
     ModelClient, ModelConfigExt, ModelError, ModelFailureKind, ModelRequest, ModelResponseRejection,
 };
+use tickloop_harness_protocol::ToolResult;
 use tickloop_harness_protocol::local_messages;
 use tickloop_harness_protocol::{
     AgentHostOptions, AgentMessageSource, ApprovalAssessmentDetails, ApprovalFailureKind,
@@ -504,6 +506,7 @@ struct Chat {
     /// Shared with the tool registry of each model request, whose Skill calls expand against the
     /// listing that request sent even when the Chat's Skills are read again meanwhile.
     skills: Arc<tickloop_harness_policy::skills::SkillRegistry>,
+    user_skill_preparations: HashMap<RunId, command_skills::UserSkillPreparation>,
     /// Following Claude Code, replacement decisions are kept only at runtime and rebuilt from
     /// content replacement entries in the Transcript on resume.
     content_replacements: tool_results::ContentReplacementState,
@@ -591,7 +594,7 @@ struct SubmissionOptions {
     trigger_lease: Option<(loop_lease::LeaseHolding, loop_lease::TriggerBoundary)>,
     /// The source's own change for the delivery, made as it is accepted.
     trigger_commit: Option<wakeup::SourceCommit>,
-    invoked_skill: Option<tickloop_harness_protocol::InvokedSkill>,
+    invoked_skill: Option<tickloop_harness_policy::skills::SkillExpansion>,
     /// What the user's `/loop` schedules, when the input is one.
     user_loop: Option<tickloop_harness_policy::loop_skill::LoopSchedule>,
     /// The Run the input is answered by, when its caller chose it ahead.
@@ -697,6 +700,18 @@ fn mergeable_inputs<'chat>(chat: &'chat Chat, active: &Receipt) -> Vec<&'chat Pe
         {
             continue;
         }
+        if pending.is_skill_invocation
+            && match chat.user_skill_preparations.get(&pending.receipt.run_id) {
+                Some(command_skills::UserSkillPreparation::Pending(expansion)) => {
+                    !expansion.shell_commands.is_empty()
+                }
+                Some(command_skills::UserSkillPreparation::Started) => true,
+                Some(command_skills::UserSkillPreparation::Complete) => false,
+                None => !command_skills::ordinary_guidance_is_active(chat, pending.receipt.run_id),
+            }
+        {
+            is_behind_held_prompt = true;
+        }
         if hooks::is_user_prompt(pending) {
             is_behind_held_prompt |= chat.hook_state.session.holds_prompt(pending.receipt.run_id);
             if is_behind_held_prompt {
@@ -713,6 +728,7 @@ fn queue_continuation(chat: &mut Chat, receipt: Receipt) {
     chat.snapshot.last_queue_sequence += 1;
     let queued_sequence = chat.snapshot.last_queue_sequence;
     chat.snapshot.pending_inputs.push(PendingInput {
+        skill_guidance: None,
         receipt,
         input: String::new(),
         contexts: Vec::new(),
@@ -1330,43 +1346,87 @@ impl Agent {
         &self,
         receipt: &Receipt,
         skills: &tickloop_harness_policy::skills::SkillRegistry,
-        input: &serde_json::Value,
-    ) -> Result<tickloop_harness_protocol::ToolResult, String> {
-        #[derive(Deserialize)]
+        operation: &OperationRecord,
+        assistant_message_id: Uuid,
+        cancel: CancellationToken,
+    ) -> Result<ToolResult, String> {
+        #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct SkillInput {
             skill: String,
             args: Option<String>,
         }
-
-        let input = serde_json::from_value::<SkillInput>(input.clone()).map_err(|error| {
-            format!(
-                "invalid {} input: {error}",
-                tickloop_harness_policy::skills::SKILL_TOOL_NAME
-            )
-        })?;
+        let input: SkillInput = serde_json::from_value(operation.input.clone())
+            .map_err(|error| format!("invalid Skill input: {error}"))?;
         if input.skill.starts_with("tickloop-artifacts:") {
             return self
                 .remote_skill_tool(receipt, &input.skill, input.args.as_deref().unwrap_or(""))
                 .await;
         }
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats
-            .get_mut(&receipt.chat_id)
-            .ok_or_else(|| "chat is unavailable".to_string())?;
-        let invoked = skills
+        let mut expanded = skills
             .expand(
                 &input.skill,
                 input.args.as_deref().unwrap_or(""),
                 tickloop_harness_policy::skills::SkillCaller::Model,
             )
-            .and_then(tickloop_harness_protocol::InvokedSkill::try_from)
+            .map_err(|error| error.to_string())?;
+        if !expanded.shell_commands.is_empty() {
+            let scope = self
+                .nested_calls(
+                    receipt,
+                    assistant_message_id,
+                    operation.call_id.clone(),
+                    &cancel,
+                )
+                .await?;
+            let mut outputs = Vec::new();
+            let mut failure = None;
+            for (index, shell) in expanded.shell_commands.iter().enumerate() {
+                let child = cancel.child_token();
+                let outcome = scope
+                    .execute(
+                        index,
+                        "Bash".into(),
+                        command_skills::shell_input(&expanded.name, &shell.command),
+                        child.clone(),
+                    )
+                    .await;
+                let result = self
+                    .skill_shell_output(receipt, &outcome.call_id, &outcome.result)
+                    .await;
+                if outcome.status != nested_calls::NestedStatus::Completed || result.is_err() {
+                    child.cancel();
+                    failure = Some(
+                        result
+                            .err()
+                            .unwrap_or_else(|| outcome.result.content.clone()),
+                    );
+                    break;
+                }
+                outputs.push(result.unwrap());
+            }
+            scope.finish().await;
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            expanded
+                .complete_shells(&outputs)
+                .map_err(|error| error.to_string())?;
+        }
+        let invoked = tickloop_harness_protocol::InvokedSkill::try_from(expanded)
             .map_err(|error| error.to_string())?;
         let name = invoked.name.clone();
         let origin = invoked.source.display_label();
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats
+            .get_mut(&receipt.chat_id)
+            .ok_or("chat is unavailable")?;
+        if cancel.is_cancelled() {
+            return Err("Skill preparation cancelled; guidance was not activated".into());
+        }
         let changed = record_invoked_skill(chat, invoked);
         self.save(&chat.snapshot);
-        Ok(tickloop_harness_protocol::ToolResult {
+        Ok(ToolResult {
             content: if changed {
                 format!("Launching skill: {name} [{origin}]")
             } else {
@@ -2622,7 +2682,10 @@ impl Agent {
                     &skill.arguments,
                     tickloop_harness_policy::skills::SkillCaller::User,
                 )
-                .and_then(tickloop_harness_protocol::InvokedSkill::try_from)
+                .and_then(|expanded| {
+                    expanded.validate()?;
+                    Ok(expanded)
+                })
                 .map_err(|error| AgentError::Invalid(error.to_string()))?
         };
         let input = if skill.arguments.trim().is_empty() {
@@ -2720,7 +2783,10 @@ impl Agent {
                 arguments,
                 tickloop_harness_policy::skills::SkillCaller::User,
             )
-            .and_then(tickloop_harness_protocol::InvokedSkill::try_from)
+            .and_then(|expanded| {
+                expanded.validate()?;
+                Ok(expanded)
+            })
             .map(|_| ())
             .map_err(|error| AgentError::Invalid(error.to_string()))
     }
@@ -3029,7 +3095,7 @@ impl Agent {
         if let Some(user_loop) = user_loop {
             chat.user_loops.insert(run_id.into(), user_loop);
         }
-        if let Some(mut invoked_skill) = invoked_skill {
+        if let Some(invoked_skill) = invoked_skill {
             chat.snapshot.user_skill_invocations.insert(
                 run_id.into(),
                 tickloop_harness_protocol::UserSkillInvocation {
@@ -3037,12 +3103,25 @@ impl Agent {
                     source: invoked_skill.source.clone(),
                 },
             );
-            if invoked_skill.source == tickloop_harness_protocol::SkillSource::BuiltIn
-                && chat.skills.is_user_only(&invoked_skill.name)
-            {
-                invoked_skill.run_id = Some(run_id.into());
+            if invoked_skill.shell_commands.is_empty() {
+                let mut invoked = tickloop_harness_protocol::InvokedSkill::try_from(invoked_skill)
+                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
+                if invoked.source == tickloop_harness_protocol::SkillSource::BuiltIn
+                    && chat.skills.is_user_only(&invoked.name)
+                {
+                    invoked.run_id = Some(run_id.into());
+                }
+                record_invoked_skill(chat, invoked);
+                chat.user_skill_preparations.insert(
+                    run_id.into(),
+                    command_skills::UserSkillPreparation::Complete,
+                );
+            } else {
+                chat.user_skill_preparations.insert(
+                    run_id.into(),
+                    command_skills::UserSkillPreparation::Pending(invoked_skill),
+                );
             }
-            record_invoked_skill(chat, invoked_skill);
         } else if trigger_source.is_none() && agent_message.is_none() {
             carry_user_skills_past_sign_in(chat, loop_id, run_id.into());
         }
@@ -3106,7 +3185,28 @@ impl Agent {
         chat.snapshot.last_queue_sequence += 1;
         let queued_sequence = chat.snapshot.last_queue_sequence;
         let directed_origin = directed_human.clone();
+        let skill_guidance = chat
+            .snapshot
+            .user_skill_invocations
+            .get(&receipt.run_id)
+            .and_then(|invocation| {
+                matches!(
+                    chat.user_skill_preparations.get(&receipt.run_id),
+                    Some(command_skills::UserSkillPreparation::Complete)
+                )
+                .then(|| {
+                    chat.snapshot
+                        .invoked_skills
+                        .iter()
+                        .find(|skill| {
+                            skill.name == invocation.name && skill.source == invocation.source
+                        })
+                        .cloned()
+                })
+                .flatten()
+            });
         let queued = PendingInput {
+            skill_guidance,
             receipt: receipt.clone(),
             input,
             contexts,
@@ -3778,7 +3878,6 @@ impl Agent {
         is_awaiting_model: &mut bool,
     ) -> Result<Usage, String> {
         self.complete_file_history_snapshots(receipt.chat_id).await;
-        let mut used_calls = self.calls_on_chain(&receipt).await;
         let mut request = match start {
             RunStart::Request(request) => {
                 Box::pin(self.checkpoint_pending_prompt(&receipt))
@@ -3795,7 +3894,15 @@ impl Agent {
                 if let hooks::PromptGate::End = prompt_gate {
                     return Ok(Usage::default());
                 }
-                request
+                if self.prepare_user_skill(&receipt, &cancel).await? {
+                    if let Some(usage) = self.finish_tool_results(&receipt).await? {
+                        return Ok(usage);
+                    }
+                    let chats = self.inner.chats.lock().await;
+                    self.continuation_request(&chats[&receipt.chat_id])?
+                } else {
+                    request
+                }
             }
             RunStart::Resume { at, result } => {
                 *is_awaiting_model = false;
@@ -3805,6 +3912,7 @@ impl Agent {
                 }
             }
         };
+        let mut used_calls = self.calls_on_chain(&receipt).await;
         loop {
             Box::pin(self.stop_at_safe_point(&receipt, None)).await?;
             self.checkpoint_feedback_inputs(receipt.chat_id).await?;
@@ -6034,6 +6142,7 @@ impl NewChat {
             pending_model_thinking: None,
             tools,
             skills,
+            user_skill_preparations: HashMap::new(),
             content_replacements: Default::default(),
             file_history,
             watching_commands: false,

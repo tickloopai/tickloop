@@ -454,7 +454,7 @@ pub(super) fn conversation_before(
     candidate.operations = std::mem::take(&mut candidate.operations)
         .into_iter()
         .filter(|operation| {
-            operation.parent_call_id.is_none()
+            (operation.parent_call_id.is_none() && operation.input_message_id.is_none())
                 || super::nested_calls::parent_on_chain(&candidate, operation)
         })
         .collect();

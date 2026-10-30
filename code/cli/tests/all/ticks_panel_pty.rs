@@ -650,7 +650,7 @@ fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
             frame,
             "notes",
             "local · enabled · 1.0.0 · no login needed · 1 MCP server · 1 hook needs confirming",
-        ) && frame.contains("Not supported yet: commands")
+        ) && !frame.contains("Not supported yet: commands")
     });
     assert!(
         !frame.contains("Not supported yet: MCP") && !frame.contains("commands, hooks"),
