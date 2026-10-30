@@ -12,10 +12,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::*;
 
+/// Runs a Chat's Shells through its bound Port, or on this machine when the Port runs none for a
+/// Folder here. A Folder only in the environment never falls back to this machine.
 pub(crate) struct EnvironmentShellHost {
     execution: crate::chat_execution::ChatExecution,
     local: Arc<dyn ShellHost>,
 }
+
+/// The refusal of a Shell for a Folder whose environment runs none.
+const NO_SHELLS: &str = "this Chat's execution environment runs no commands";
 
 impl EnvironmentShellHost {
     pub(crate) fn new(
@@ -38,6 +43,9 @@ impl ShellHost for EnvironmentShellHost {
             .port()
             .map_err(|error| ToolError::Rejected(error.to_string()))?;
         if !bound.capabilities.shells {
+            if bound.folder_in_environment() {
+                return Err(ToolError::Rejected(NO_SHELLS.into()));
+            }
             return self.local.prepare_stop(task, reason).await;
         }
         prepare_stop(bound.port, self.execution.authority().clone(), task, reason)
@@ -53,6 +61,9 @@ impl ShellHost for EnvironmentShellHost {
             .port()
             .map_err(|error| ToolError::Rejected(error.to_string()))?;
         if !bound.capabilities.shells {
+            if bound.folder_in_environment() {
+                return Err(ToolError::Rejected(NO_SHELLS.into()));
+            }
             return self.local.prepare(request).await;
         }
         prepare_shell(
@@ -70,6 +81,11 @@ impl ShellHost for EnvironmentShellHost {
             .port()
             .map_err(|error| ShellStartError::NotStarted(ToolError::Rejected(error.to_string())))?;
         if !bound.capabilities.shells {
+            if bound.folder_in_environment() {
+                return Err(ShellStartError::NotStarted(ToolError::Rejected(
+                    NO_SHELLS.into(),
+                )));
+            }
             return self.local.start(launch).await;
         }
         let port = bound.port;

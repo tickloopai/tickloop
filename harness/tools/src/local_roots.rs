@@ -45,7 +45,7 @@ impl LocalRoots {
                 .iter()
                 .map(|directory| (directory.as_str(), false)),
         );
-        Self::with_roots(directories, FileAccess::ReadWrite)
+        Self::with_roots(directories, FileAccess::ReadWrite, FileAccess::ReadWrite)
     }
 
     /// The Folder and Additional Directories of `workspace`.
@@ -61,19 +61,21 @@ impl LocalRoots {
         )
     }
 
-    /// The Harness's own directories of a Chat as roots that can be read and written, with nothing
-    /// outside them.
-    pub fn harness_directories(directories: &[&Path]) -> Self {
+    /// The Harness's own directories of a Chat as roots the file tools reach with `access`, with
+    /// nothing outside them.
+    pub fn harness_directories(directories: &[&Path], access: FileAccess) -> Self {
         Self::with_roots(
             directories
                 .iter()
                 .filter_map(|directory| Some((directory.to_str()?, false))),
+            access,
             FileAccess::None,
         )
     }
 
     fn with_roots<'d>(
         directories: impl Iterator<Item = (&'d str, bool)>,
+        access: FileAccess,
         outside_roots: FileAccess,
     ) -> Self {
         let mut roots: Vec<FileRoot> = Vec::new();
@@ -88,7 +90,7 @@ impl LocalRoots {
                 name: unique_root_name(&display_path, &roots),
                 local_path: Some(PathBuf::from(&display_path)),
                 display_path,
-                access: FileAccess::ReadWrite,
+                access,
                 is_folder,
             });
         }
@@ -147,8 +149,22 @@ impl LocalRoots {
         query: FileQuery,
         cancel: &CancellationToken,
     ) -> Result<FileInspection, ExecutionError> {
+        let (query, exclusions) = query.into_query_and_exclusions();
+        if !exclusions.is_empty() && !query.is_enumeration() {
+            return Err(ExecutionError::new(
+                error_code::INVALID_INPUT,
+                "exclusions require a directory query",
+            ));
+        }
+        let excluded = exclusions
+            .iter()
+            .map(|path| {
+                self.location(path, FileAccess::Read)
+                    .map(|(root, below)| root.join(below))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let (root, below) = self.location(query.path(), FileAccess::Read)?;
-        self.inspect_at(&root, &below, query, cancel)
+        self.inspect_at(&root, &below, query, cancel, &excluded)
             .map_err(|error| execution_error(error, false))
     }
 
@@ -158,6 +174,7 @@ impl LocalRoots {
         below: &str,
         query: FileQuery,
         cancel: &CancellationToken,
+        excluded: &[PathBuf],
     ) -> Result<FileInspection, LocalFileError> {
         if let FileQuery::Resolve(_) = query {
             let real = local_files::resolve_anywhere(root, below)?;
@@ -176,7 +193,11 @@ impl LocalRoots {
             return Ok(FileInspection::Resolved(ResolvedPath { path, kind }));
         }
         let target = local_files::resolve_existing(root, below)?;
+        if excluded.iter().any(|path| target.starts_with(path)) {
+            return Err(LocalFileError::OutsideRoot(target));
+        }
         Ok(match query {
+            FileQuery::Excluding { .. } => unreachable!("exclusions were separated"),
             FileQuery::Resolve(_) => unreachable!("answered above"),
             FileQuery::Stat(_) => FileInspection::Stat(file_stat(&local_files::stat(&target)?)),
             FileQuery::Read { offset, limit, .. } => {
@@ -187,7 +208,8 @@ impl LocalRoots {
                 })
             }
             FileQuery::List { limit, .. } => {
-                let (entries, truncated) = local_files::list_directory(&target, limit)?;
+                let (entries, truncated) =
+                    local_files::list_directory_excluding(&target, limit, excluded)?;
                 FileInspection::List(DirectoryListing {
                     entries: entries
                         .into_iter()
@@ -199,17 +221,19 @@ impl LocalRoots {
                     truncated,
                 })
             }
-            FileQuery::Glob { query, .. } => FileInspection::Glob(local_files::glob(
+            FileQuery::Glob { query, .. } => FileInspection::Glob(local_files::glob_excluding(
                 &real_root(root)?,
                 &target,
                 &query,
                 cancel,
+                excluded,
             )?),
-            FileQuery::Grep { query, .. } => FileInspection::Grep(local_files::grep(
+            FileQuery::Grep { query, .. } => FileInspection::Grep(local_files::grep_excluding(
                 &real_root(root)?,
                 &target,
                 &query,
                 cancel,
+                excluded,
             )?),
         })
     }
@@ -257,7 +281,7 @@ impl FileHost for LocalRoots {
     }
 
     async fn inspect(&self, query: FileQuery) -> Result<FileInspection, ExecutionError> {
-        if !matches!(query, FileQuery::Glob { .. } | FileQuery::Grep { .. }) {
+        if !query.is_search() {
             return self.inspect_blocking(query, &CancellationToken::new());
         }
         let roots = self.clone();
@@ -492,7 +516,7 @@ mod tests {
         for index in 0..SEARCHED_FILES {
             std::fs::write(directory.path().join(format!("output-{index}.txt")), "").unwrap();
         }
-        let roots = LocalRoots::harness_directories(&[directory.path()]);
+        let roots = LocalRoots::harness_directories(&[directory.path()], FileAccess::ReadWrite);
         let root = roots.capabilities().roots()[0].name.clone();
         let query = FileQuery::Glob {
             path: FilePath::in_root(root.clone(), "").unwrap(),

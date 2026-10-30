@@ -148,9 +148,7 @@ impl Agent {
                 from: ExecutionMode::Plan,
             } => {
                 let plan_file = chat
-                    .snapshot
-                    .folder
-                    .as_deref()
+                    .local_folder()
                     .and_then(|folder| {
                         crate::plan::current_plan_file(
                             &chat.bookkeeping,

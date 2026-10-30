@@ -62,6 +62,7 @@ impl crate::Agent {
                     call.input().clone(),
                     crate::session_permissions::capture_workspace_scope(
                         &crate::configured_workspace_for_chat(chat),
+                        &chat.execution.files(),
                     )
                     .map_err(|e| e.to_string())?,
                 )

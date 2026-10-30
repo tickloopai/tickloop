@@ -1122,6 +1122,7 @@ impl EmbeddedAgentAccess {
                     self.inner
                         .agent
                         .check_user_skill(&launch.folder, name, arguments)
+                        .await
                         .map_err(agent_access_error)?;
                 }
                 let chat = if let Some(chat) = launch.exact_chat {

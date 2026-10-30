@@ -315,10 +315,15 @@ impl Agent {
             .store(checkpoint.task_tools_enabled, Ordering::SeqCst);
         for saved in &checkpoint.chats {
             let mut snapshot = saved.snapshot.clone();
+            let execution = self.bind_recorded_directories(&snapshot).await?;
+            let local_folder = snapshot
+                .folder
+                .clone()
+                .filter(|_| !execution.folder_in_environment());
             // What a policy never records comes back from where a load fills it in, except what
             // only the checkpoint carries.
             self.apply_host_rules(&mut snapshot.policy);
-            snapshot.policy.plan_without_auto = self.plan_without_auto(snapshot.folder.as_deref());
+            snapshot.policy.plan_without_auto = self.plan_without_auto(local_folder.as_deref());
             snapshot.policy.launch_rules = saved.launch_rules.clone();
             snapshot.policy.mode_before_plan = saved.mode_before_plan;
             if let Some(delegation) = &mut snapshot.delegation {
@@ -328,7 +333,7 @@ impl Agent {
                 ceiling.launch_rules = saved.ceiling_launch_rules.clone();
                 ceiling.mode_before_plan = saved.ceiling_mode_before_plan;
             }
-            if let Some(folder) = &snapshot.folder {
+            if let Some(folder) = &local_folder {
                 self.require_working_directory_trust(folder)?;
             }
             let client = {
@@ -344,28 +349,36 @@ impl Agent {
             };
             self.adopt_upgrade_transcript(&snapshot, &saved.bookkeeping)
                 .await?;
-            let (tools, execution) = self.create_chat_tools(&snapshot).await;
+            let tools = self.chat_tools_on(&snapshot, &execution);
             for (path, read) in live_snapshot::restore_reads(saved.file_reads.clone())
                 .map_err(AgentError::Invalid)?
             {
                 tools.file_reads().record(path, read);
             }
-            let skills = self.discover_skills(snapshot.folder.as_deref());
-            let file_history = match (&snapshot.folder, saved.file_history.clone()) {
-                (Some(folder), Some(saved)) => Some(
+            let skills = self.discover_skills(local_folder.as_deref());
+            if snapshot.folder.is_some() && saved.file_history.is_none() {
+                return Err(AgentError::Invalid(
+                    "a Chat's Folder changed during Worker upgrade".into(),
+                ));
+            }
+            let file_history = saved
+                .file_history
+                .clone()
+                .map(|saved_history| {
                     FileHistory::from_upgrade(
-                        self.file_history_directory(snapshot.id, folder),
-                        saved,
+                        self.file_history_directory(
+                            snapshot.id,
+                            snapshot.folder.as_deref().unwrap_or(Path::new("/")),
+                            execution.folder_in_environment() || snapshot.folder.is_none(),
+                        ),
+                        saved_history,
                     )
-                    .map_err(AgentError::Invalid)?,
-                ),
-                (None, None) => None,
-                _ => {
-                    return Err(AgentError::Invalid(
-                        "a Chat's Folder changed during Worker upgrade".into(),
-                    ));
-                }
-            };
+                    .map_err(AgentError::Invalid)
+                })
+                .transpose()?;
+            if let Some(history) = &file_history {
+                history.protect_from(&tools);
+            }
             let announced_loop_state =
                 crate::loop_state_notes::restored(&snapshot, &saved.bookkeeping);
             self.inner.chats.lock().await.insert(
@@ -373,7 +386,11 @@ impl Agent {
                 Chat {
                     ids: tickloop_ids::IdContext::new(),
                     snapshot,
-                    bookkeeping: saved.bookkeeping.clone(),
+                    bookkeeping: {
+                        let mut bookkeeping = saved.bookkeeping.clone();
+                        bookkeeping.environment_folder = execution.folder_in_environment();
+                        bookkeeping
+                    },
                     family_generation: saved.family_generation,
                     family_stopping: false,
                     task_checkpoint_pending: false,

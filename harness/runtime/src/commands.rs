@@ -148,8 +148,10 @@ impl Agent {
             .clone())
     }
 
+    /// Watches the commands of `tools` until the Chat replaces them and their commands are gone.
     pub(super) async fn watch_commands(&self, chat_id: ChatId, tools: Arc<Tools>) {
         let mut updates = tools.subscribe_commands();
+        let tools = Arc::downgrade(&tools);
         let agent = self.clone();
         self.inner.tasks.spawn(async move {
             loop {
@@ -157,7 +159,7 @@ impl Agent {
                     _=agent.inner.shutdown.cancelled()=>break,
                     update=updates.recv()=>match update {
                         Ok(command)=>agent.record_watched_command(chat_id,command).await,
-                        Err(broadcast::error::RecvError::Lagged(_))=>{for command in tools.commands().await {agent.record_watched_command(chat_id,command).await;}},
+                        Err(broadcast::error::RecvError::Lagged(_))=>{let Some(tools)=tools.upgrade() else {break};for command in tools.commands().await {agent.record_watched_command(chat_id,command).await;}},
                         Err(broadcast::error::RecvError::Closed)=>break,
                     }
                 }

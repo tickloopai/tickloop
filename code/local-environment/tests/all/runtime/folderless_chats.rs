@@ -401,7 +401,7 @@ async fn a_folderless_chat_refuses_local_shells_files_and_attachments() {
 }
 
 #[tokio::test]
-async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_folder() {
+async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_allows_folderless_chats() {
     let models = || ChosenModels::new(Arc::new(ScriptedModel::new(vec![text("answer")])));
     let options = || HarnessOptions {
         ..HarnessOptions::local(tickloop_harness::test_support::config())
@@ -437,7 +437,9 @@ async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_
         options(),
     )
     .unwrap();
-    assert!(local.create_chat_without_folder().await.is_err());
+    // An Agent with an Execution Environment also has Chats without a Folder (ticket 08).
+    let without_folder = local.create_chat_without_folder().await.unwrap();
+    assert_eq!(local.snapshot(without_folder).await.unwrap().folder, None);
     local.shutdown().await;
     let settings_root = tempfile::tempdir().unwrap();
     let with_settings = Agent::with_seams(
@@ -488,11 +490,11 @@ async fn local_folder_apis_refuse_a_folderless_harness_before_reading_anything()
         Reach::PublicAddresses,
     );
     let refused = |result: Result<(), AgentError>| matches!(result, Err(AgentError::Invalid(message)) if message.starts_with("Unsupported: this Agent has no Execution Environment"));
-    assert!(refused(agent.check_user_skill(
-        project.path(),
-        "project-workflow",
-        ""
-    )));
+    assert!(refused(
+        agent
+            .check_user_skill(project.path(), "project-workflow", "")
+            .await
+    ));
     // A missing path proves the refusal comes before canonicalization.
     assert!(refused(
         agent

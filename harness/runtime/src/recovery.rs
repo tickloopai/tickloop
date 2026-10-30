@@ -11,17 +11,20 @@ use tickloop_harness_protocol::{
 use tickloop_harness_tools::ASK_USER_QUESTION_TOOL_NAME;
 use tickloop_ids::IdContext;
 
+/// Rechecks only directories the admitted Port reports on this machine.
 pub(super) fn before_resume(
     snapshot: &mut ChatSnapshot,
     loop_id: LoopId,
     state_root: Option<&std::path::Path>,
+    execution: &super::chat_execution::ChatExecution,
 ) -> Result<(), AgentError> {
-    // A Chat without a Folder has no local directory or credential to check.
+    // A Chat without a Folder on this machine has no local directory or credential to check.
     if snapshot.folder.is_some() {
         for directory in snapshot
             .folder
             .iter()
             .chain(&snapshot.additional_directories)
+            .filter(|path| execution.is_local_directory(path))
         {
             let resolved = directory.canonicalize().map_err(|_| {
                 AgentError::Invalid(format!(
@@ -36,8 +39,10 @@ pub(super) fn before_resume(
                 )));
             }
         }
-        validate_model_for_resume_in_root(&snapshot.model, state_root)
-            .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        if !execution.folder_in_environment() {
+            validate_model_for_resume_in_root(&snapshot.model, state_root)
+                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        }
     }
     for pending in &mut snapshot.pending_inputs {
         if pending.receipt.loop_id == loop_id

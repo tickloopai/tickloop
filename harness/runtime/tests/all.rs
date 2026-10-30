@@ -37,6 +37,9 @@ mod concurrent_chats;
 #[path = "all/explicit_ask_scopes.rs"]
 mod explicit_ask_scopes;
 
+#[path = "all/environment_folders.rs"]
+mod environment_folders;
+
 #[path = "all/file_tools.rs"]
 mod file_tools;
 

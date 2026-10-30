@@ -2,9 +2,7 @@ use std::path::PathBuf;
 
 use tickloop_harness_policy::AutoSettings;
 use tickloop_harness_policy::settings::{SettingsStoreError, SettingsUpdate};
-use tickloop_harness_tools::permissions::{
-    canonical_directory, launch_rule_views, rule_views, validate_rule,
-};
+use tickloop_harness_tools::permissions::{launch_rule_views, rule_views, validate_rule};
 
 use super::{Agent, AgentError, ChatBookkeeping, require_folder};
 use tickloop_harness_protocol::{
@@ -31,25 +29,42 @@ impl Agent {
         self.require_root_chat(chat_id, "add launch directories")
             .await?;
         let _settings_gate = self.inner.settings_writes.lock().await;
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let folder = require_folder(&chat.snapshot)?.to_path_buf();
-        let mut changed = false;
         for path in directories {
+            let (folder, mut additional) = {
+                let chats = self.inner.chats.lock().await;
+                let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+                (
+                    require_folder(&chat.snapshot)?.to_path_buf(),
+                    chat.snapshot.additional_directories.clone(),
+                )
+            };
             let path = folder.join(path);
-            match canonical_directory(path.clone()) {
-                Ok(path) => {
-                    if !chat.snapshot.additional_directories.contains(&path) {
-                        chat.snapshot.additional_directories.push(path.clone());
-                    }
-                    changed |= chat
+            let existing = additional.clone();
+            additional.push(path.clone());
+            match self
+                .set_working_directories_locked(chat_id, Some(folder), additional, None, true)
+                .await
+            {
+                Ok(()) => {
+                    let mut chats = self.inner.chats.lock().await;
+                    let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+                    let path = if chat.execution.is_local_directory(&path) {
+                        path.canonicalize().unwrap_or(path)
+                    } else {
+                        path
+                    };
+                    let sources = chat
                         .bookkeeping
                         .additional_directory_sources
-                        .entry(path)
-                        .or_default()
-                        .insert(
-                            tickloop_harness_protocol::AdditionalDirectorySource::LaunchArgument,
-                        );
+                        .entry(path.clone())
+                        .or_default();
+                    if !existing.contains(&path) {
+                        sources.clear();
+                    }
+                    sources.insert(
+                        tickloop_harness_protocol::AdditionalDirectorySource::LaunchArgument,
+                    );
+                    self.save(&chat.snapshot);
                 }
                 Err(reason) => self
                     .inner
@@ -64,13 +79,6 @@ impl Agent {
                     )),
             }
         }
-        if changed {
-            chat.snapshot.policy.revision += 1;
-            chat.execution
-                .follow(self.inner.environment.as_ref(), &chat.snapshot)
-                .await;
-        }
-        self.save(&chat.snapshot);
         Ok(())
     }
 
@@ -88,7 +96,18 @@ impl Agent {
             require_folder(&chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot)?
                 .to_path_buf()
         };
-        let (saved_rules, warnings, project_rules) = self.read_project_rules(&workdir).await?;
+        let local_project = {
+            let chats = self.inner.chats.lock().await;
+            chats
+                .get(&chat_id)
+                .ok_or(AgentError::NotFound)?
+                .local_folder()
+                .map(std::path::Path::to_path_buf)
+        };
+        let (saved_rules, warnings, project_rules) = match local_project {
+            Some(project) => self.read_project_rules(&project).await?,
+            None => (None, Vec::new(), String::new()),
+        };
         let (auto_settings, auto_settings_revision) = self.auto_settings_snapshot().await?;
         let jev_key_status = self.jev_key_status().await?;
         let auto_reviewer_health = self
@@ -221,76 +240,47 @@ impl Agent {
             }
             PermissionChange::AddDirectory { path } => {
                 let workdir = latest.working_directory.clone();
-                self.require_working_directory_trust(&workdir)?;
-                let path = canonical_directory(if path.is_absolute() {
-                    path
-                } else {
-                    workdir.join(path)
-                })
-                .map_err(|reason| PermissionChangeError::Invalid(reason.into()))?;
-                let mut chats = self.inner.chats.lock().await;
-                let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-                if chat.snapshot.policy.revision != expected_revision.local()
-                    || chat.snapshot.folder.as_ref() != Some(&workdir)
-                {
-                    drop(chats);
-                    let latest = self.permissions_view_locked(chat_id).await?;
-                    return Err(PermissionChangeError::Conflict {
-                        latest: Box::new(latest),
-                    });
-                }
-                if chat.snapshot.additional_directories.contains(&path) {
+                let path = workdir.join(path);
+                let mut additional = latest.additional_directories.clone();
+                if additional.contains(&path) {
                     return Err(PermissionChangeError::Invalid(
                         "directory is already configured".into(),
                     ));
                 }
-                chat.bookkeeping
-                    .additional_directory_sources
-                    .entry(path.clone())
-                    .or_default()
-                    .insert(tickloop_harness_protocol::AdditionalDirectorySource::Session);
-                chat.snapshot.additional_directories.push(path);
-                chat.snapshot.policy.revision += 1;
-                chat.execution
-                    .follow(self.inner.environment.as_ref(), &chat.snapshot)
-                    .await;
-                self.save(&chat.snapshot);
+                additional.push(path);
+                self.change_permission_directories(
+                    chat_id,
+                    workdir,
+                    additional,
+                    expected_revision.local(),
+                )
+                .await?;
             }
             PermissionChange::RemoveDirectory { path } => {
                 let workdir = latest.working_directory.clone();
-                self.require_working_directory_trust(&workdir)?;
-                let path = if path.is_absolute() {
-                    path
-                } else {
-                    workdir.join(path)
-                };
-                let path = path.canonicalize().unwrap_or(path);
-                let mut chats = self.inner.chats.lock().await;
-                let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-                if chat.snapshot.policy.revision != expected_revision.local()
-                    || chat.snapshot.folder.as_ref() != Some(&workdir)
+                let mut path = workdir.join(path);
                 {
-                    drop(chats);
-                    let latest = self.permissions_view_locked(chat_id).await?;
-                    return Err(PermissionChangeError::Conflict {
-                        latest: Box::new(latest),
-                    });
+                    let chats = self.inner.chats.lock().await;
+                    let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+                    if chat.execution.is_local_directory(&path) {
+                        path = path.canonicalize().unwrap_or(path);
+                    }
                 }
-                let old_len = chat.snapshot.additional_directories.len();
-                chat.snapshot
-                    .additional_directories
-                    .retain(|existing| existing != &path);
-                if old_len == chat.snapshot.additional_directories.len() {
+                let mut additional = latest.additional_directories.clone();
+                let count = additional.len();
+                additional.retain(|existing| existing != &path);
+                if count == additional.len() {
                     return Err(PermissionChangeError::Invalid(
                         "directory is not configured".into(),
                     ));
                 }
-                chat.bookkeeping.additional_directory_sources.remove(&path);
-                chat.snapshot.policy.revision += 1;
-                chat.execution
-                    .follow(self.inner.environment.as_ref(), &chat.snapshot)
-                    .await;
-                self.save(&chat.snapshot);
+                self.change_permission_directories(
+                    chat_id,
+                    workdir,
+                    additional,
+                    expected_revision.local(),
+                )
+                .await?;
             }
             PermissionChange::SelectReviewer { reviewer } => {
                 if latest.preferred_reviewer == reviewer {
@@ -358,6 +348,24 @@ impl Agent {
         self.permissions_view_locked(chat_id)
             .await
             .map_err(Into::into)
+    }
+
+    async fn change_permission_directories(
+        &self,
+        chat_id: ChatId,
+        folder: PathBuf,
+        additional: Vec<PathBuf>,
+        revision: u64,
+    ) -> Result<(), PermissionChangeError> {
+        match self
+            .set_working_directories_locked(chat_id, Some(folder), additional, Some(revision), true)
+            .await
+        {
+            Err(AgentError::Busy) => Err(PermissionChangeError::Conflict {
+                latest: Box::new(self.permissions_view_locked(chat_id).await?),
+            }),
+            result => result.map_err(Into::into),
+        }
     }
 
     pub(super) async fn apply_rule_change(

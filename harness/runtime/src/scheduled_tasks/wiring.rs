@@ -204,7 +204,7 @@ fn run_input(
     if prompt == DEFAULT_INSTRUCTIONS_PROMPT {
         return match settings.map_or_else(
             || MaintenanceInstructions.instructions(),
-            |settings| settings.loop_instructions(chat.snapshot.folder.as_deref()),
+            |settings| settings.loop_instructions(chat.local_folder()),
         ) {
             Ok(instructions) => (
                 instructions.prompt(),

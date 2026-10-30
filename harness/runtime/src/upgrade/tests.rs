@@ -613,7 +613,7 @@ async fn an_unsupported_retained_shell_reports_a_blocker_without_discarding_its_
             tickloop_harness_tools::ChatDirectory {
                 task_output: output.join("tasks"),
                 chat: output,
-                family_temp: family,
+                family_temp: Some(family),
             },
             host.clone(),
             Arc::new(crate::environment::file_host::EnvironmentFileHost::new(

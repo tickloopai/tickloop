@@ -881,7 +881,9 @@ impl ChatRecorder {
         let old_links = std::mem::take(&mut log.links);
         let milliseconds = unix_time_milliseconds().max(log.last_entry_milliseconds + 1);
         let timestamp = format_timestamp(milliseconds);
-        let git_branch = folder.and_then(current_git_branch);
+        let git_branch = folder
+            .filter(|_| !compacted_bookkeeping.environment_folder)
+            .and_then(current_git_branch);
         let mut lines = Vec::new();
         let mut parent = None;
         // The compaction boundary breaks the conversation chain, so Loop entries before the
@@ -1102,6 +1104,17 @@ impl ChatRecorder {
     /// message; appending content blocks to the last message (parallel tool results), written as a
     /// new entry marked as continuing that message; and rewind truncating the conversation, synced
     /// to the written entries beforehand by `truncate`.
+    pub(super) fn directories_changed(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+    ) {
+        if let Some(log) = self.logs.lock().unwrap().get_mut(&snapshot.id) {
+            log.recorded_loop = None;
+        }
+        self.enqueue_sync(snapshot, bookkeeping);
+    }
+
     fn sync_chat(
         &self,
         snapshot: &ChatSnapshot,
@@ -1162,7 +1175,11 @@ impl ChatRecorder {
                 entry.is_visible_in_transcript_only = false;
                 entry.usage = None;
                 entry.git_branch = git_branch
-                    .get_or_insert_with(|| folder.and_then(current_git_branch))
+                    .get_or_insert_with(|| {
+                        folder
+                            .filter(|_| !bookkeeping.environment_folder)
+                            .and_then(current_git_branch)
+                    })
                     .clone();
                 entry.contexts = None;
                 entry.execution_mode = None;
@@ -1228,7 +1245,11 @@ impl ChatRecorder {
                 entry.logical_parent_uuid = parent;
             }
             entry.git_branch = git_branch
-                .get_or_insert_with(|| folder.and_then(current_git_branch))
+                .get_or_insert_with(|| {
+                    folder
+                        .filter(|_| !bookkeeping.environment_folder)
+                        .and_then(current_git_branch)
+                })
                 .clone();
             entry.is_meta = is_meta;
             parent = Some(entry.uuid);
@@ -3711,7 +3732,7 @@ impl Agent {
 
     /// The conversation a loaded chain restores, before it joins this instance: what resuming a
     /// Chat and selecting another of its branches share.
-    fn restore_conversation(
+    async fn restore_conversation(
         &self,
         chat_id: ChatId,
         loaded: &mut LoadedTranscript,
@@ -3747,19 +3768,14 @@ impl Agent {
             self.scheduled_now(),
         )?;
         let folder = recovered.snapshot.folder.clone();
-        match (&folder, &self.inner.environment) {
-            (Some(folder), Some(_)) => self.require_working_directory_trust(folder)?,
-            (None, None) => {}
-            (Some(_), None) => return Err(AgentError::Invalid(super::NO_ENVIRONMENT.into())),
-            (None, Some(_)) => {
-                return Err(AgentError::Invalid(
-                    "a restored Chat without a Folder needs a Harness without an environment"
-                        .into(),
-                ));
-            }
-        }
+        // A Folder only in the Execution Environment is the environment's to judge; one on this
+        // machine must still be trusted. A Chat without a Folder restores in any Agent.
+        let execution = self.bind_recorded_directories(&recovered.snapshot).await?;
+        let folder_in_environment = execution.folder_in_environment();
+        recovered.bookkeeping.environment_folder = folder_in_environment;
         let plans_directory = folder
             .as_deref()
+            .filter(|_| !folder_in_environment)
             .map(|folder| self.plans_directory(folder).path().to_path_buf());
         let plan_checkpoints = restored.without(&removed).plan_checkpoints();
         let plan_warnings = super::plan::rebuild_plans_and_progress(
@@ -3795,6 +3811,8 @@ impl Agent {
             plan_checkpoints,
             plans_directory,
             folder,
+            folder_in_environment,
+            execution,
             content_replacements,
             replacement_records,
         })
@@ -3825,13 +3843,22 @@ impl Agent {
             folder,
             content_replacements,
             ..
-        } = self.restore_conversation(chat_id, &mut loaded, chat_id, WaitHosting::Process, None)?;
-        let file_history = folder.as_deref().map(|folder| {
-            FileHistory::restore(
-                self.file_history_directory(chat_id, folder),
-                file_history_snapshots(&loaded),
-            )
-        });
+        } = self
+            .restore_conversation(chat_id, &mut loaded, chat_id, WaitHosting::Process, None)
+            .await?;
+        let file_history = folder
+            .as_deref()
+            .or_else(|| loaded.chain.iter().find_map(|entry| entry.cwd.as_deref()))
+            .map(|folder| {
+                FileHistory::restore(
+                    self.file_history_directory(
+                        chat_id,
+                        folder,
+                        bookkeeping.environment_folder || snapshot.folder.is_none(),
+                    ),
+                    file_history_snapshots(&loaded),
+                )
+            });
         let recorded_loop =
             recorded_loop_entry(&snapshot, &bookkeeping, &plan_checkpoints, records_loop);
         let recorded_lifecycle = bookkeeping.lifecycle.revision();
@@ -3914,13 +3941,18 @@ impl Agent {
             plan_checkpoints,
             plans_directory,
             mut folder,
+            folder_in_environment,
+            execution,
             content_replacements,
             replacement_records,
-        } = self.restore_conversation(chat_id, &mut loaded, source_chat_id, waits, family)?;
+        } = self
+            .restore_conversation(chat_id, &mut loaded, source_chat_id, waits, family)
+            .await?;
         // Mutually exclusive with settings writes until the Chat joins this process, so persistent
         // rule changes written meanwhile do not miss this Chat.
         let _settings_gate = self.inner.settings_writes.lock().await;
-        let (mut client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
+        let (mut client, output_style) =
+            self.apply_chat_defaults(&mut snapshot, &mut bookkeeping, folder_in_environment);
         if chat_id == source_chat_id
             && self.inner.tool_policy.is_managed()
             && let Some(entry) = loaded.metadata.acp_session.as_ref()
@@ -3981,12 +4013,19 @@ impl Agent {
             snapshot.policy.mode = ExecutionMode::Plan;
             snapshot.chat_loop.recover_state(LoopState::WaitingPlan);
         }
-        let mut file_history = folder.as_deref().map(|folder| {
-            FileHistory::restore(
-                self.file_history_directory(source_chat_id, folder),
-                file_history_snapshots(&loaded),
-            )
-        });
+        let mut file_history = folder
+            .as_deref()
+            .or_else(|| loaded.chain.iter().find_map(|entry| entry.cwd.as_deref()))
+            .map(|folder| {
+                FileHistory::restore(
+                    self.file_history_directory(
+                        source_chat_id,
+                        folder,
+                        bookkeeping.environment_folder || snapshot.folder.is_none(),
+                    ),
+                    file_history_snapshots(&loaded),
+                )
+            });
         let mut denial_window = DenialWindow::default();
         match target {
             RestoreTarget::Resume => {
@@ -4033,8 +4072,11 @@ impl Agent {
                 // the new Chat's directory, and successfully copied snapshots are re-recorded under
                 // the new chatId.
                 if let (Some(history), Some(folder)) = (file_history.take(), folder.as_deref()) {
-                    let (copied, recorded) =
-                        history.copy_to(self.file_history_directory(chat_id, folder));
+                    let (copied, recorded) = history.copy_to(self.file_history_directory(
+                        chat_id,
+                        folder,
+                        bookkeeping.environment_folder || snapshot.folder.is_none(),
+                    ));
                     file_history = Some(copied);
                     for snapshot in &recorded {
                         recorder.record_file_history_snapshot(
@@ -4059,8 +4101,17 @@ impl Agent {
         self.checkpoint_transcript(&snapshot, &bookkeeping)
             .await
             .map_err(AgentError::Storage)?;
-        let (tools, execution) = self.create_chat_tools(&snapshot).await;
-        let skills = self.discover_skills(folder.as_deref());
+        self.follow_admitted_directories(&execution, &mut snapshot)
+            .await?;
+        let tools = self.chat_tools_on(&snapshot, &execution);
+        if let Some(history) = &file_history {
+            history.protect_from(&tools);
+        }
+        let skills = self.discover_skills(
+            folder
+                .as_deref()
+                .filter(|_| !execution.folder_in_environment()),
+        );
         self.inner
             .subagent_registry
             .lock()
@@ -4152,6 +4203,9 @@ struct RestoredConversation {
     plan_checkpoints: Vec<super::plan::PlanCheckpoint>,
     plans_directory: Option<PathBuf>,
     folder: Option<PathBuf>,
+    /// Whether the Folder is only in the Execution Environment.
+    folder_in_environment: bool,
+    execution: super::chat_execution::ChatExecution,
     content_replacements: super::tool_results::ContentReplacementState,
     replacement_records: Vec<ContentReplacementRecord>,
 }
@@ -4215,9 +4269,13 @@ impl StagedBranch {
         }
         chat.replace_snapshot(snapshot);
         chat.bookkeeping = self.bookkeeping;
+        chat.bookkeeping.environment_folder = current.execution.folder_in_environment();
         chat.bookkeeping.citation_sources = current.bookkeeping.citation_sources.clone();
         chat.content_replacements = self.content_replacements;
         chat.file_history = self.file_history;
+        if let Some(history) = &chat.file_history {
+            history.protect_from(&chat.tools);
+        }
         chat.start_new_tool_result_message = false;
         chat.branch_reservation = None;
         chat.active = None;

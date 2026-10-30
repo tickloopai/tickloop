@@ -33,7 +33,7 @@ fn operation(
         &json!({"content": content, "file_path": path}),
     )
     .unwrap();
-    SessionPermissionOperation::from_prepared(&prepared, workspace).unwrap()
+    SessionPermissionOperation::from_prepared(&prepared, workspace, &Default::default()).unwrap()
 }
 
 #[test]
@@ -90,7 +90,8 @@ fn web_fetch_grants_cover_the_host_whatever_the_path_and_prompt() {
             &json!({"url": url, "prompt": prompt}),
         )
         .unwrap();
-        SessionPermissionOperation::from_prepared(&prepared, &workspace).unwrap()
+        SessionPermissionOperation::from_prepared(&prepared, &workspace, &Default::default())
+            .unwrap()
     };
     let source = owner(Uuid::new_v4(), Uuid::new_v4());
     let mut context = SessionPermissionContext::default();
@@ -143,7 +144,8 @@ fn frozen_denials_preserve_normalized_host_and_workspace_without_copying_allowan
             &json!({"url":format!("https://{host}/{path}"),"prompt":path}),
         )
         .unwrap();
-        SessionPermissionOperation::from_prepared(&prepared, workspace).unwrap()
+        SessionPermissionOperation::from_prepared(&prepared, workspace, &Default::default())
+            .unwrap()
     };
     let mut context = SessionPermissionContext::default();
     context
@@ -375,11 +377,14 @@ fn normalized_constructor_rejects_ambiguous_tools_and_canonicalizes_roots() {
             root.path().to_path_buf(),
         ],
     );
-    let scope = capture_workspace_scope(&workspace).unwrap();
-    let reordered_scope = capture_workspace_scope(&make_workspace(
-        root.path(),
-        vec![root.path().to_path_buf(), additional.path().to_path_buf()],
-    ))
+    let scope = capture_workspace_scope(&workspace, &Default::default()).unwrap();
+    let reordered_scope = capture_workspace_scope(
+        &make_workspace(
+            root.path(),
+            vec![root.path().to_path_buf(), additional.path().to_path_buf()],
+        ),
+        &Default::default(),
+    )
     .unwrap();
     assert_eq!(scope, reordered_scope);
     let operation = SessionPermissionOperation::from_normalized(
@@ -408,7 +413,8 @@ fn normalized_constructor_rejects_ambiguous_tools_and_canonicalizes_roots() {
     let file = root.path().join("not-a-directory");
     std::fs::write(&file, "data").unwrap();
     assert_eq!(
-        capture_workspace_scope(&make_workspace(&file, Vec::new())).unwrap_err(),
+        capture_workspace_scope(&make_workspace(&file, Vec::new()), &Default::default())
+            .unwrap_err(),
         SessionPermissionError::InvalidWorkspace(file)
     );
 }

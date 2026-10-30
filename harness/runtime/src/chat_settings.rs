@@ -60,6 +60,7 @@ impl Agent {
         &self,
         snapshot: &mut ChatSnapshot,
         bookkeeping: &mut ChatBookkeeping,
+        folder_in_environment: bool,
     ) -> (Arc<dyn ModelClient>, OutputStyle) {
         let client = {
             let selected = self
@@ -70,7 +71,8 @@ impl Agent {
             snapshot.model = selected.config.clone();
             selected.client.clone()
         };
-        let output_style = self.apply_new_chat_settings(snapshot, bookkeeping);
+        let output_style =
+            self.apply_new_chat_settings(snapshot, bookkeeping, folder_in_environment);
         (client, output_style)
     }
 
@@ -95,16 +97,25 @@ impl Agent {
         )
     }
 
+    /// A Folder only in the Execution Environment (`folder_in_environment`) belongs to no project
+    /// on this machine: the Chat reads the user's settings alone and gains none of their local
+    /// Additional Directories.
     pub(super) fn apply_new_chat_settings(
         &self,
         snapshot: &mut ChatSnapshot,
         bookkeeping: &mut ChatBookkeeping,
+        folder_in_environment: bool,
     ) -> OutputStyle {
+        bookkeeping.environment_folder = folder_in_environment;
+        let project = snapshot
+            .folder
+            .as_deref()
+            .filter(|_| !folder_in_environment);
         let mut saved = self
             .inner
             .settings
             .as_ref()
-            .map(|settings| settings.read(snapshot.folder.as_deref()));
+            .map(|settings| settings.read(project));
         match &self.inner.search {
             super::SearchDefaults::Fixed(config) => snapshot.search_config = config.clone(),
             super::SearchDefaults::UserSettings => {
@@ -135,7 +146,11 @@ impl Agent {
         snapshot.auto_compact_window = saved.auto_compact_window;
         snapshot.reasoning_effort = defaults.reasoning_effort;
         snapshot.thinking_enabled = defaults.thinking_enabled;
-        for (directory, sources) in &saved.additional_directories {
+        for (directory, sources) in saved
+            .additional_directories
+            .iter()
+            .filter(|_| !folder_in_environment)
+        {
             if !snapshot.additional_directories.contains(directory) {
                 snapshot.additional_directories.push(directory.clone());
             }
@@ -174,7 +189,12 @@ impl Agent {
         saved: SettingsSnapshot,
     ) {
         // A Chat without a Folder belongs to no project, which persistent rules partition by.
-        let Some(folder) = snapshot.folder.clone() else {
+        let Some(folder) = bookkeeping
+            .local_settings_folder(snapshot)
+            .map(Path::to_path_buf)
+        else {
+            snapshot.policy.rules.retain(|rule| !rule.persistent);
+            bookkeeping.persistent_rule_projects.clear();
             return;
         };
         if snapshot.delegation.is_some() {
@@ -410,7 +430,7 @@ impl Agent {
             if Some(*chat_id) == skip || chat.snapshot.delegation.is_some() {
                 continue;
             }
-            if let Some(project) = chat.snapshot.folder.clone()
+            if let Some(project) = chat.local_folder().map(std::path::Path::to_path_buf)
                 && let Some(change) = changes.get(&project)
             {
                 apply_rule_changes(chat, &project, change);
@@ -433,6 +453,7 @@ impl Agent {
             return Ok(());
         };
         let _settings_gate = self.inner.settings_writes.lock().await;
+        // Only a Folder on this machine belongs to a project with rules of its own.
         let Some(folder) = self
             .inner
             .chats
@@ -440,9 +461,8 @@ impl Agent {
             .await
             .get(&chat_id)
             .ok_or(AgentError::NotFound)?
-            .snapshot
-            .folder
-            .clone()
+            .local_folder()
+            .map(Path::to_path_buf)
         else {
             return Ok(());
         };
@@ -557,7 +577,14 @@ impl Agent {
                 loop_id: None,
                 persistent: true,
             };
-            (super::require_folder(&chat.snapshot)?.to_path_buf(), rule)
+            (
+                chat.local_folder()
+                    .ok_or_else(|| {
+                        AgentError::Invalid("this Chat has no local settings partition".into())
+                    })?
+                    .to_path_buf(),
+                rule,
+            )
         };
         let changes = RuleChanges::from([(
             project.clone(),
@@ -605,7 +632,7 @@ pub(super) fn persistent_rule_changes(
         .iter()
         .filter(|rule| rule.persistent)
         .collect::<Vec<_>>();
-    let Some(folder) = &snapshot.folder else {
+    let Some(folder) = bookkeeping.local_settings_folder(snapshot) else {
         return if current.is_empty() {
             Ok(RuleChanges::new())
         } else {
@@ -620,7 +647,7 @@ pub(super) fn persistent_rule_changes(
             .persistent_rule_projects
             .get(id)
             .cloned()
-            .unwrap_or_else(|| folder.clone())
+            .unwrap_or_else(|| folder.to_path_buf())
     };
     let mut changes = RuleChanges::new();
     for rule in &previous {

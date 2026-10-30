@@ -20,7 +20,7 @@ pub(crate) struct ChatFiles {
     environment: Arc<dyn FileHost>,
     /// The Chat's own directories, which the Harness keeps on this machine whatever the
     /// environment.
-    harness: Option<Arc<LocalRoots>>,
+    harness: Option<Arc<dyn FileHost>>,
 }
 
 /// A file a tool acts on, with symbolic links resolved, and the host that reaches it.
@@ -110,7 +110,17 @@ impl ChatFiles {
     pub(crate) fn new(environment: Arc<dyn FileHost>, harness: Option<LocalRoots>) -> Self {
         Self {
             environment,
-            harness: harness.map(Arc::new),
+            harness: harness.map(|host| Arc::new(host) as Arc<dyn FileHost>),
+        }
+    }
+
+    pub(crate) fn with_hosts(
+        environment: Arc<dyn FileHost>,
+        harness: Option<Arc<dyn FileHost>>,
+    ) -> Self {
+        Self {
+            environment,
+            harness,
         }
     }
 
@@ -137,6 +147,15 @@ impl ChatFiles {
             .capabilities()
             .folder()
             .map(|folder| PathBuf::from(&folder.display_path))
+    }
+
+    /// Whether the environment keeps the Folder only on its side: it reports the Folder root
+    /// without a path on this machine.
+    pub(crate) fn folder_in_environment(&self) -> bool {
+        self.environment
+            .capabilities()
+            .folder()
+            .is_some_and(|folder| folder.local_path.is_none())
     }
 
     /// Where the Folder is on this machine, when the environment says it is here.

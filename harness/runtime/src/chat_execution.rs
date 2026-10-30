@@ -2,6 +2,12 @@
 //! Additional Directories, together with the capabilities the Port reported then, and shared by
 //! the Chat's tool listing and its shell host. A change of directories binds a new Port in place
 //! of the old one; Shells already started keep the Port they started on.
+//!
+//! The Port also says where the Folder is. A Folder root reported without a path on this machine
+//! is only in the environment: the Harness neither resolves nor checks it here, runs no local
+//! command for it and keeps no local scratchpad, plans or Skills for it. Any other Folder, also
+//! one a successfully bound environment reports no root for, is a directory on this machine.
+//! A failed binding never authorizes local access.
 
 use std::{
     path::PathBuf,
@@ -22,6 +28,7 @@ use crate::environment::{
 #[derive(Clone)]
 pub(crate) struct BoundPort {
     pub(crate) port: Arc<dyn ExecutionPort>,
+    authority: ExecutionAuthority,
     pub(crate) capabilities: ExecutionCapabilities,
     /// Which binding of the Chat this Port is; a later binding supersedes it.
     pub(crate) generation: u64,
@@ -92,8 +99,89 @@ impl ChatExecution {
         };
     }
 
-    pub(crate) fn authority(&self) -> &ExecutionAuthority {
-        &self.authority
+    pub(crate) fn same_capabilities(&self, candidate: &Self) -> bool {
+        let current = self.binding.read().unwrap();
+        let candidate = candidate.binding.read().unwrap();
+        match (&current.port, &candidate.port) {
+            (Ok(current), Ok(candidate)) => {
+                let current = &current.capabilities;
+                let candidate = &candidate.capabilities;
+                current.ticks == candidate.ticks
+                    && current.shells == candidate.shells
+                    && current.shell_output == candidate.shell_output
+                    && current.files.outside_roots() == candidate.files.outside_roots()
+                    && current
+                        .files
+                        .roots()
+                        .iter()
+                        .map(|root| (&root.name, root))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                        == candidate
+                            .files
+                            .roots()
+                            .iter()
+                            .map(|root| (&root.name, root))
+                            .collect::<std::collections::BTreeMap<_, _>>()
+            }
+            (Err(_), Err(_)) => {
+                current
+                    .scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.folder.is_none())
+                    && candidate
+                        .scope
+                        .as_ref()
+                        .is_none_or(|scope| scope.folder.is_none())
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn replace(&self, candidate: &Self) {
+        let generation = self.bindings.fetch_add(1, Ordering::Relaxed) + 1;
+        let candidate = candidate.binding.read().unwrap();
+        let port = candidate.port.clone().map(|mut bound| {
+            bound.generation = generation;
+            bound
+        });
+        *self.binding.write().unwrap() = Binding {
+            scope: candidate.scope.clone(),
+            port,
+            generation,
+        };
+    }
+
+    pub(crate) fn is_local_directory(&self, path: &std::path::Path) -> bool {
+        let binding = self.binding.read().unwrap();
+        let Ok(bound) = &binding.port else {
+            return false;
+        };
+        bound
+            .capabilities
+            .files
+            .roots()
+            .iter()
+            .find(|root| std::path::Path::new(&root.display_path) == path)
+            .map_or(!bound.folder_in_environment(), |root| {
+                root.local_path.is_some()
+            })
+    }
+
+    pub(crate) fn authority(&self) -> ExecutionAuthority {
+        self.binding
+            .read()
+            .unwrap()
+            .port
+            .as_ref()
+            .map_or_else(|_| self.authority.clone(), |bound| bound.authority.clone())
+    }
+
+    pub(crate) fn matches_directories(&self, snapshot: &ChatSnapshot) -> bool {
+        self.binding.read().unwrap().scope.as_ref() == Some(&scope(snapshot))
+    }
+
+    pub(crate) fn admitted_scope(&self, snapshot: &ChatSnapshot) {
+        self.binding.write().unwrap().scope = Some(scope(snapshot));
     }
 
     pub(crate) fn port(&self) -> Result<BoundPort, ExecutionError> {
@@ -122,6 +210,41 @@ impl ChatExecution {
         self.files()
             .folder()
             .and_then(|folder| folder.local_path.clone())
+    }
+
+    /// Whether the bound Port keeps the Chat's Folder only in the environment.
+    pub(crate) fn folder_in_environment(&self) -> bool {
+        let binding = self.binding.read().unwrap();
+        binding.port.as_ref().map_or_else(
+            |_| {
+                binding
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.folder.is_some())
+            },
+            |bound| bound.folder_in_environment(),
+        )
+    }
+
+    /// Whether the bound Port runs the Chat's Shells.
+    pub(crate) fn runs_shells(&self) -> bool {
+        self.binding
+            .read()
+            .unwrap()
+            .port
+            .as_ref()
+            .is_ok_and(|bound| bound.capabilities.shells)
+    }
+}
+
+impl BoundPort {
+    /// Whether this Port keeps the Folder only in the environment: it reports the Folder root
+    /// without a path on this machine.
+    pub(crate) fn folder_in_environment(&self) -> bool {
+        self.capabilities
+            .files
+            .folder()
+            .is_some_and(|folder| folder.local_path.is_none())
     }
 }
 
@@ -154,6 +277,7 @@ async fn bind_port(
     match port.inspect(ExecutionQuery::Capabilities).await? {
         ExecutionInspection::Capabilities(capabilities) => Ok(BoundPort {
             port,
+            authority: authority.clone(),
             capabilities,
             generation,
         }),

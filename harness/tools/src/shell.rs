@@ -88,6 +88,8 @@ pub(super) struct ShellInput {
     /// same directory, never in one that replaced it at its path.
     #[serde(skip)]
     pub(super) approved_directory: Option<DirectoryIdentity>,
+    #[serde(skip)]
+    pub(super) environment_cwd: bool,
 }
 
 /// A directory as its device and inode, which a rename keeps and a replacement does not.
@@ -1267,13 +1269,23 @@ impl Registry {
                 "Shell preparation belongs to another operation".into(),
             ));
         }
-        let directory = open_existing(cwd, true)?;
-        let opened = directory.metadata().map_err(|error| io_error(cwd, error))?;
-        if input.approved_directory.is_none()
-            || input.approved_directory != DirectoryIdentity::of(&opened)
-        {
-            return Err(ToolError::PathChanged(cwd.into()));
-        }
+        let directory = if input.environment_cwd {
+            if input.preparation.is_none() {
+                return Err(ToolError::Rejected(
+                    "environment Shell requires a prepared start".into(),
+                ));
+            }
+            None
+        } else {
+            let directory = open_existing(cwd, true)?;
+            let opened = directory.metadata().map_err(|error| io_error(cwd, error))?;
+            if input.approved_directory.is_none()
+                || input.approved_directory != DirectoryIdentity::of(&opened)
+            {
+                return Err(ToolError::PathChanged(cwd.into()));
+            }
+            Some(directory)
+        };
         task_output_dir
             .create()
             .map_err(|error| io_error(task_output_dir.path(), error))?;
@@ -1375,7 +1387,7 @@ impl Registry {
                     command: input.command.clone(),
                     description: input.description.clone(),
                     cwd: cwd.into(),
-                    directory,
+                    directory: directory.expect("local unprepared Shell has a directory"),
                     output: output.expect("unprepared Shell uses the caller's output file"),
                     output_path,
                     cancel: command_cancel.clone(),
@@ -1905,6 +1917,7 @@ mod tests {
                 cwd: None,
                 readable_directories: Vec::new(),
                 editable_directory: None,
+                environment_cwd: false,
                 approved_directory: DirectoryIdentity::of(&std::fs::metadata(&self.path).unwrap()),
             }
         }

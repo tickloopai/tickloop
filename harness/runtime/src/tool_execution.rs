@@ -278,7 +278,8 @@ pub(super) struct ToolRegistry {
 impl ToolRegistry {
     /// The tools a request of `chat` offers: those `policy` admits; Read, Glob and Grep when one
     /// of its Port's roots is readable, Write and Edit when one is writable; Bash and TaskStop
-    /// only when the Chat has a Folder.
+    /// when the Chat has a Folder on this machine, or one only in the environment whose Port runs
+    /// Shells.
     pub(super) fn for_chat(
         chat: &Chat,
         host_provider: Option<Arc<dyn crate::host_tools::HostToolProvider>>,
@@ -290,6 +291,8 @@ impl ToolRegistry {
     ) -> Self {
         let is_delegated = chat.snapshot.delegation.is_some();
         let has_folder = chat.snapshot.folder.is_some();
+        let runs_commands =
+            chat.local_folder().is_some() || (has_folder && chat.execution.runs_shells());
         let files = chat.execution.files();
         let can_read = files.roots().iter().any(|root| root.access.can_read());
         let can_write = files.roots().iter().any(|root| root.access.can_write());
@@ -303,7 +306,7 @@ impl ToolRegistry {
                 | tickloop_harness_tools::GREP_TOOL_NAME => can_read,
                 tickloop_harness_tools::WRITE_TOOL_NAME
                 | tickloop_harness_tools::EDIT_TOOL_NAME => can_write,
-                _ => has_folder,
+                _ => runs_commands,
             })
             .map(|definition| RegisteredTool {
                 definition,
@@ -1308,12 +1311,12 @@ impl Agent {
         let mut denial: Option<DenialRecord> = None;
         let mut images = Vec::new();
         let mut sources = None;
-        let (configured_workspace, workspace) = {
+        let (configured_workspace, workspace, file_capabilities) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).unwrap();
             let configured_workspace = configured_workspace_for_chat(chat);
             let workspace = configured_workspace.clone();
-            (configured_workspace, workspace)
+            (configured_workspace, workspace, chat.execution.files())
         };
         let permission_owner = PermissionOwner::new(receipt.chat_id.into(), receipt.loop_id.into())
             .map_err(|error| error.to_string())?;
@@ -1561,8 +1564,11 @@ impl Agent {
             let session_operation = SessionPermissionOperation::from_normalized(
                 normalized_name.to_owned(),
                 permission_input.clone(),
-                super::session_permissions::capture_workspace_scope(&configured_workspace)
-                    .map_err(|error| error.to_string())?,
+                super::session_permissions::capture_workspace_scope(
+                    &configured_workspace,
+                    &file_capabilities,
+                )
+                .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
             let operation = OperationRecord {
@@ -2141,9 +2147,12 @@ impl Agent {
                     if let Err(error) = self.check_web_fetch_provenance(receipt, &prepared).await {
                         return Ok(ToolCallOutcome::not_admitted(error));
                     }
-                    let session_operation =
-                        SessionPermissionOperation::from_prepared(&prepared, &configured_workspace)
-                            .map_err(|error| error.to_string())?;
+                    let session_operation = SessionPermissionOperation::from_prepared(
+                        &prepared,
+                        &configured_workspace,
+                        &file_capabilities,
+                    )
+                    .map_err(|error| error.to_string())?;
                     let operation = OperationRecord {
                         parent_call_id: crate::nested_calls::parent_call_id(),
                         parent_call_index: crate::nested_calls::parent_call_index(),
@@ -2198,7 +2207,7 @@ impl Agent {
                         let sessions = self.inner.session_permissions.lock().await;
                         let session_evaluation =
                             sessions.evaluate(permission_owner, &session_operation);
-                        let plan_file = chat.snapshot.folder.as_deref().and_then(|folder| {
+                        let plan_file = chat.local_folder().and_then(|folder| {
                             plan::current_plan_file(
                                 &chat.bookkeeping,
                                 self.plans_directory(folder).path(),
@@ -2537,11 +2546,9 @@ impl Agent {
                         )
                         .map_err(ToolCallError::from)?;
                         let chat = chats.get(&receipt.chat_id).unwrap();
-                        if let Err(error) =
-                            chat.snapshot.folder.as_deref().map_or(Ok(()), |folder| {
-                                self.require_working_directory_trust(folder)
-                            })
-                        {
+                        if let Err(error) = chat.local_folder().map_or(Ok(()), |folder| {
+                            self.require_working_directory_trust(folder)
+                        }) {
                             let reason = error.to_string();
                             let record = super::denials::DenialCandidate::new(
                                 &operation,
@@ -2561,6 +2568,7 @@ impl Agent {
                         let current_session_operation = SessionPermissionOperation::from_prepared(
                             &prepared,
                             &configured_workspace_for_chat(chat),
+                            &chat.execution.files(),
                         )
                         .map_err(|error| {
                             let reason = error.to_string();

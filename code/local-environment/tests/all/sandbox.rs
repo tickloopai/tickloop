@@ -158,7 +158,7 @@ impl SandboxFixture {
             ChatDirectory {
                 chat: family.clone(),
                 task_output: family.join("tasks"),
-                family_temp: family,
+                family_temp: Some(family),
             },
             environment
                 .shell_tasks()

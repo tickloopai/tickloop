@@ -41,7 +41,7 @@ pub(crate) fn private_family_temp_directory(root_chat_id: Uuid) -> PrivateDirect
         .join(root_chat_id.to_string())
 }
 
-fn private_temp_root() -> PrivateDirectory {
+pub(crate) fn private_temp_root() -> PrivateDirectory {
     let base = std::env::var_os(TEMP_DIRECTORY_ENV)
         .filter(|value| !value.is_empty())
         .map_or_else(|| PathBuf::from(DEFAULT_TEMP_DIRECTORY), PathBuf::from);

@@ -478,7 +478,11 @@ async fn host_admission_rechecks_task_binding_after_waiting_for_the_commit_lock(
     let session_operation = SessionPermissionOperation::from_normalized(
         operation.name.clone(),
         operation.input.clone(),
-        session_permissions::capture_workspace_scope(&configured_workspace_for_chat(chat)).unwrap(),
+        session_permissions::capture_workspace_scope(
+            &configured_workspace_for_chat(chat),
+            &chat.execution.files(),
+        )
+        .unwrap(),
     )
     .unwrap();
     let evaluation = core.inner.session_permissions.lock().await.evaluate(

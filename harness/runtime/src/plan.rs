@@ -748,7 +748,10 @@ impl Agent {
         if chat.active.is_some() && request.is_none() {
             return Err(AgentError::Busy);
         }
-        let plans_directory = self.plans_directory(super::require_folder(&chat.snapshot)?);
+        let plans_directory = self.plans_directory(
+            chat.local_folder()
+                .ok_or_else(|| AgentError::Invalid(super::FOLDERLESS_CHAT.into()))?,
+        );
         let next_version = highest_plan_version(&chat.snapshot, &chat.bookkeeping)
             .unwrap_or(0)
             .saturating_add(1);
@@ -862,8 +865,11 @@ impl Agent {
         if chat.active.is_some() && request.is_none() {
             return Err(AgentError::Busy);
         }
+        let plans_directory = self.plans_directory(
+            chat.local_folder()
+                .ok_or_else(|| AgentError::Invalid(super::FOLDERLESS_CHAT.into()))?,
+        );
         let mut snapshot = chat.snapshot.clone();
-        let plans_directory = self.plans_directory(super::require_folder(&snapshot)?);
         let plan = snapshot
             .plans
             .iter_mut()
@@ -939,7 +945,7 @@ impl Agent {
     pub async fn plan_file(&self, chat_id: ChatId) -> Result<Option<PathBuf>, AgentError> {
         let chats = self.inner.chats.lock().await;
         let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-        let Some(folder) = chat.snapshot.folder.as_deref() else {
+        let Some(folder) = chat.local_folder() else {
             return Ok(None);
         };
         Ok(current_plan_file(
@@ -965,13 +971,13 @@ impl Agent {
     }
 
     /// The Loop's plan file for a request of a root Chat with a Folder in Plan mode, choosing the
-    /// Chat's plan file prefix on first use. A delegated child or a Chat without a Folder has
-    /// none.
+    /// Chat's plan file prefix on first use. A delegated child or a Chat without a Folder on this
+    /// machine has none.
     pub(super) fn prepare_plan_file(&self, chat: &mut Chat, loop_id: LoopId) -> Option<PathBuf> {
         if chat.snapshot.delegation.is_some() {
             return None;
         }
-        let directory = self.plans_directory(&chat.snapshot.folder.clone()?);
+        let directory = self.plans_directory(chat.local_folder()?);
         // The model's Write would create a missing plans directory with ordinary permissions, so
         // the private one is created first; if that fails, ExitPlanMode reports the reason.
         let _ = directory.create();
@@ -987,7 +993,7 @@ impl Agent {
         let Some(chat) = chats.get(&receipt.chat_id) else {
             return prompts::plan_mode_refusal(None, false);
         };
-        let plan_file = chat.snapshot.folder.as_deref().and_then(|folder| {
+        let plan_file = chat.local_folder().and_then(|folder| {
             current_plan_file(
                 &chat.bookkeeping,
                 self.plans_directory(folder).path(),
@@ -1105,9 +1111,10 @@ impl Agent {
         let workspace = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
-            super::session_permissions::capture_workspace_scope(&configured_workspace_for_chat(
-                chat,
-            ))
+            super::session_permissions::capture_workspace_scope(
+                &configured_workspace_for_chat(chat),
+                &chat.execution.files(),
+            )
             .map_err(|error| error.to_string())?
         };
         let mut request_operation = operation.clone();
@@ -1182,13 +1189,8 @@ impl Agent {
                 .ok_or("plan is unavailable")?;
             let path = current_plan_file(
                 &chat.bookkeeping,
-                self.plans_directory(
-                    chat.snapshot
-                        .folder
-                        .as_deref()
-                        .ok_or("plan file is unavailable")?,
-                )
-                .path(),
+                self.plans_directory(chat.local_folder().ok_or("plan file is unavailable")?)
+                    .path(),
                 receipt.loop_id,
             )
             .ok_or("plan file is unavailable")?;
@@ -1197,6 +1199,7 @@ impl Agent {
                 path,
                 super::session_permissions::capture_workspace_scope(
                     &configured_workspace_for_chat(chat),
+                    &chat.execution.files(),
                 )
                 .map_err(|error| error.to_string())?,
                 chat.snapshot.clone(),
@@ -1293,9 +1296,7 @@ impl Agent {
             return Err(prompts::NOT_IN_PLAN_MODE.into());
         }
         let directory = self.plans_directory(
-            snapshot
-                .folder
-                .as_deref()
+            chat.local_folder()
                 .ok_or("this Chat has no Folder for a plan file")?,
         );
         directory

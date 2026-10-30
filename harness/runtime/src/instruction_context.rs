@@ -1,6 +1,8 @@
 //! The user context message, which leads each conversation request as Claude Code's does: the
 //! instruction files, the date in the user's time zone and, in a git repository, the git status.
 
+use std::path::Path;
+
 use tickloop_harness_policy::instructions::{InstructionFile, user_context_message};
 use tickloop_harness_protocol::{ChatId, Content, Message, Role};
 
@@ -75,7 +77,7 @@ impl Agent {
     }
 
     /// The Chat's instruction files as they read now, read on a blocking thread outside the
-    /// Chats lock.
+    /// Chats lock. A Folder only in the Execution Environment contributes none.
     pub(super) async fn instruction_files(
         &self,
         chat_id: ChatId,
@@ -83,7 +85,7 @@ impl Agent {
         let folder = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            chat.snapshot.folder.clone()
+            chat.local_folder().map(Path::to_path_buf)
         };
         self.instruction_files_in(folder).await
     }

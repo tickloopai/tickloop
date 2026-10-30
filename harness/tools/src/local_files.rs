@@ -228,17 +228,27 @@ pub fn list_directory(
     path: &Path,
     limit: usize,
 ) -> Result<(Vec<(String, FileType)>, bool), LocalFileError> {
+    list_directory_excluding(path, limit, &[])
+}
+
+pub(crate) fn list_directory_excluding(
+    path: &Path,
+    limit: usize,
+    excluded: &[PathBuf],
+) -> Result<(Vec<(String, FileType)>, bool), LocalFileError> {
     if !stat(path)?.is_dir() {
         return Err(LocalFileError::NotADirectory(path.into()));
     }
     let mut entries = std::fs::read_dir(path)
         .map_err(|error| LocalFileError::io(path, error))?
-        .map(|entry| {
-            let entry = entry?;
-            Ok((
-                entry.file_name().to_string_lossy().into_owned(),
-                entry.file_type()?,
-            ))
+        .filter_map(|entry| match entry {
+            Ok(entry) if excluded.iter().any(|path| entry.path().starts_with(path)) => None,
+            Ok(entry) => Some(
+                entry
+                    .file_type()
+                    .map(|kind| (entry.file_name().to_string_lossy().into_owned(), kind)),
+            ),
+            Err(error) => Some(Err(error)),
         })
         .collect::<io::Result<Vec<_>>>()
         .map_err(|error| LocalFileError::io(path, error))?;
@@ -452,7 +462,9 @@ fn walker(
     root: &Path,
     skipped_names: &'static [&'static str],
     respect_ignore_files: bool,
+    excluded: &[PathBuf],
 ) -> WalkBuilder {
+    let excluded = excluded.to_vec();
     let mut builder = WalkBuilder::new(root);
     builder
         .standard_filters(respect_ignore_files)
@@ -461,7 +473,8 @@ fn walker(
         .sort_by_file_name(OsStr::cmp)
         .filter_entry(move |entry| {
             let name = entry.file_name();
-            !skipped_names.iter().any(|skipped| name == *skipped)
+            !excluded.iter().any(|path| entry.path().starts_with(path))
+                && !skipped_names.iter().any(|skipped| name == *skipped)
                 && !is_sensitive_path(Path::new(name))
         });
     if respect_ignore_files {
@@ -478,7 +491,17 @@ pub fn glob(
     query: &GlobQuery,
     cancel: &CancellationToken,
 ) -> Result<GlobMatches, LocalFileError> {
-    let mut walk = walker(base, GLOB_SKIPPED_NAMES, false);
+    glob_excluding(root, base, query, cancel, &[])
+}
+
+pub(crate) fn glob_excluding(
+    root: &Path,
+    base: &Path,
+    query: &GlobQuery,
+    cancel: &CancellationToken,
+    excluded: &[PathBuf],
+) -> Result<GlobMatches, LocalFileError> {
+    let mut walk = walker(base, GLOB_SKIPPED_NAMES, false, excluded);
     walk.overrides(override_matcher(base, [&query.pattern])?);
     if !std::fs::metadata(base)
         .map_err(|error| LocalFileError::io(base, error))?
@@ -517,8 +540,18 @@ pub fn grep(
     query: &GrepQuery,
     cancel: &CancellationToken,
 ) -> Result<GrepMatches, LocalFileError> {
+    grep_excluding(root, base, query, cancel, &[])
+}
+
+pub(crate) fn grep_excluding(
+    root: &Path,
+    base: &Path,
+    query: &GrepQuery,
+    cancel: &CancellationToken,
+    excluded: &[PathBuf],
+) -> Result<GrepMatches, LocalFileError> {
     let mut search = GrepSearch::new(query)?;
-    let mut walk = walker(base, GREP_SKIPPED_NAMES, true);
+    let mut walk = walker(base, GREP_SKIPPED_NAMES, true, excluded);
     walk.overrides(override_matcher(base, &query.globs)?);
     if let Some(file_type) = &query.file_type {
         walk.types(file_types(file_type)?);

@@ -71,6 +71,8 @@ pub(crate) struct FileHistoryBackup {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FileHistorySnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup_directory: Option<PathBuf>,
     pub message_id: Uuid,
     pub tracked_file_backups: BTreeMap<String, FileHistoryBackup>,
     pub timestamp: String,
@@ -143,6 +145,7 @@ struct ComputedFile {
 impl FileHistory {
     pub(super) fn upgrade_checkpoint(&self) -> serde_json::Value {
         serde_json::json!({
+            "backup_directory": self.directory.path(),
             "snapshots": self.snapshots,
             "tracked_files": self.tracked_files,
             "pending_snapshots": self.pending_snapshots,
@@ -155,12 +158,15 @@ impl FileHistory {
     ) -> Result<Self, String> {
         #[derive(Deserialize)]
         struct Checkpoint {
+            #[serde(default)]
+            backup_directory: Option<PathBuf>,
             snapshots: Vec<FileHistorySnapshot>,
             tracked_files: BTreeSet<String>,
             pending_snapshots: Vec<PendingSnapshot>,
         }
         let checkpoint: Checkpoint =
             serde_json::from_value(value).map_err(|error| error.to_string())?;
+        let directory = restored_directory(directory, checkpoint.backup_directory.as_deref())?;
         Ok(Self {
             directory,
             snapshots: checkpoint.snapshots,
@@ -168,6 +174,12 @@ impl FileHistory {
             pending_snapshots: checkpoint.pending_snapshots,
         })
     }
+    pub(crate) fn protect_from(&self, tools: &tickloop_harness_tools::Tools) {
+        if let Some(parent) = self.directory().parent() {
+            tools.protect_directory(parent.to_path_buf());
+        }
+    }
+
     pub(crate) fn new(directory: PrivateDirectory) -> Self {
         Self::restore(directory, Vec::new())
     }
@@ -178,6 +190,14 @@ impl FileHistory {
         directory: PrivateDirectory,
         snapshots: Vec<FileHistorySnapshot>,
     ) -> Self {
+        let directory = restored_directory(
+            directory.clone(),
+            snapshots
+                .iter()
+                .rev()
+                .find_map(|snapshot| snapshot.backup_directory.as_deref()),
+        )
+        .unwrap_or(directory);
         let tracked_files = snapshots
             .iter()
             .flat_map(|snapshot| snapshot.tracked_file_backups.keys().cloned())
@@ -190,7 +210,6 @@ impl FileHistory {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn directory(&self) -> &Path {
         self.directory.path()
     }
@@ -323,6 +342,7 @@ impl FileHistory {
             })
             .unwrap_or_default();
         self.snapshots.push(FileHistorySnapshot {
+            backup_directory: Some(self.directory.path().to_path_buf()),
             message_id,
             tracked_file_backups,
             timestamp: now_timestamp(),
@@ -489,8 +509,16 @@ impl FileHistory {
     /// backups outside it.
     pub(crate) fn relocated(&self, directory: PrivateDirectory) -> Self {
         Self {
-            directory,
-            snapshots: self.snapshots.clone(),
+            directory: directory.clone(),
+            snapshots: self
+                .snapshots
+                .iter()
+                .cloned()
+                .map(|mut snapshot| {
+                    snapshot.backup_directory = Some(directory.path().to_path_buf());
+                    snapshot
+                })
+                .collect(),
             tracked_files: self.tracked_files.clone(),
             pending_snapshots: Vec::new(),
         }
@@ -518,6 +546,10 @@ impl FileHistory {
                     })
             })
             .cloned()
+            .map(|mut snapshot| {
+                snapshot.backup_directory = Some(directory.path().to_path_buf());
+                snapshot
+            })
             .collect()
     }
 
@@ -626,6 +658,34 @@ impl SnapshotPlan {
     }
 }
 
+fn restored_directory(
+    fallback: PrivateDirectory,
+    recorded: Option<&Path>,
+) -> Result<PrivateDirectory, String> {
+    let Some(recorded) = recorded.filter(|path| *path != fallback.path()) else {
+        return Ok(fallback);
+    };
+    let root = crate::transcript::private_temp_root();
+    let relative = recorded
+        .strip_prefix(root.path())
+        .map_err(|_| "file history namespace is outside private storage")?;
+    let components = relative.components().collect::<Vec<_>>();
+    if !(2..=3).contains(&components.len())
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || recorded.file_name() != fallback.path().file_name()
+        || recorded.parent().and_then(Path::file_name)
+            != Some(std::ffi::OsStr::new(FILE_HISTORY_DIRECTORY))
+        || components
+            .first()
+            .is_some_and(|component| component.as_os_str() == "sessions")
+    {
+        return Err("invalid file history namespace".into());
+    }
+    Ok(root.join(relative))
+}
+
 fn backup_file_name(key: &str, version: u32) -> String {
     let digest = format!("{:x}", Sha256::digest(key.as_bytes()));
     format!("{}@v{version}", &digest[..BACKUP_NAME_HASH_HEX_LENGTH])
@@ -692,17 +752,28 @@ async fn write_backup(
     content: Vec<u8>,
     backup_time: String,
 ) -> io::Result<FileHistoryBackup> {
-    let name = backup_file_name(key, version);
     let directory = directory.clone();
-    let staged_name = name.clone();
-    tokio::task::spawn_blocking(move || {
+    let key = key.to_owned();
+    let (name, version) = tokio::task::spawn_blocking(move || {
         let backup_directory = open_backup_directory(&directory, true)?;
-        publish_copy(
-            &backup_directory,
-            &c_string(staged_name.as_bytes())?,
-            &mut content.as_slice(),
-            PRIVATE_FILE_MODE,
-        )
+        let mut version = version;
+        loop {
+            let name = backup_file_name(&key, version);
+            match publish_copy(
+                &backup_directory,
+                &c_string(name.as_bytes())?,
+                &mut content.as_slice(),
+                PRIVATE_FILE_MODE,
+            ) {
+                Ok(()) => return Ok::<_, io::Error>((name, version)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    version = version
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("file history version exhausted"))?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     })
     .await
     .map_err(io::Error::other)??;
@@ -1027,11 +1098,12 @@ fn publish_copy(
         }
         // SAFETY: Both names are under the same valid directory descriptor and are NUL-terminated.
         if unsafe {
-            libc::renameat(
+            libc::linkat(
                 directory.as_raw_fd(),
                 staged.as_ptr(),
                 directory.as_raw_fd(),
                 name.as_ptr(),
+                0,
             )
         } != 0
         {
@@ -1039,7 +1111,7 @@ fn publish_copy(
         }
         Ok(())
     })();
-    if published.is_err() {
+    {
         // SAFETY: The directory descriptor is valid and the name is NUL-terminated.
         unsafe { libc::unlinkat(directory.as_raw_fd(), staged.as_ptr(), 0) };
     }

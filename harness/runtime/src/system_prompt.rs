@@ -23,6 +23,9 @@ const FOLDERLESS_CHAT_NOTE: &str =
     "Act as a conversational assistant and use the supplied tools when they help.";
 
 const FOLDERLESS_FILE_REQUEST_NOTE: &str = "If the user asks you to read or change files or run commands, say that you cannot access files in this chat.";
+/// A Chat whose Folder is only in its Execution Environment reaches files there, through the file
+/// tools, and nothing on the machine it runs on.
+const ENVIRONMENT_FOLDER_NOTE: &str = "The user's files are in the working directories listed under Environment; reach them only through the supplied tools.";
 
 const OUTPUT_STYLE_INTRO: &str = "Respond to the user according to your \"Output Style\" below, which describes how you should respond to user queries.";
 
@@ -116,7 +119,11 @@ If you can say it in one sentence, don't use three. Prefer short, direct sentenc
 /// What a Chat's request can do, which decides the sections its instructions include.
 #[derive(Clone, Copy)]
 pub(super) struct PromptScope<'a> {
+    /// Whether the Chat has a Folder on this machine, which makes it a coding agent.
     pub has_folder: bool,
+    /// Whether the Chat has a Folder only in its Execution Environment: a conversation that
+    /// reaches the files there.
+    pub has_environment_folder: bool,
     pub tools: crate::ToolPolicy,
     pub waits: crate::WaitHosting,
     pub prompt_policy: tickloop_harness_protocol::PromptPolicy,
@@ -135,6 +142,7 @@ impl PromptScope<'_> {
     #[cfg(test)]
     const LOCAL: Self = Self {
         has_folder: true,
+        has_environment_folder: false,
         tools: crate::ToolPolicy::local(),
         waits: crate::WaitHosting::Process,
         prompt_policy: tickloop_harness_protocol::PromptPolicy::Interactive,
@@ -182,6 +190,7 @@ pub(super) fn conversation_system_prompt(
 ) -> String {
     let PromptScope {
         has_folder,
+        has_environment_folder,
         tools,
         waits,
         prompt_policy,
@@ -200,7 +209,12 @@ pub(super) fn conversation_system_prompt(
         CHAT_INTRO.to_owned()
     };
     if !has_folder {
-        intro = format!("{intro} {FOLDERLESS_CHAT_NOTE} {FOLDERLESS_FILE_REQUEST_NOTE}");
+        let file_note = if has_environment_folder {
+            ENVIRONMENT_FOLDER_NOTE
+        } else {
+            FOLDERLESS_FILE_REQUEST_NOTE
+        };
+        intro = format!("{intro} {FOLDERLESS_CHAT_NOTE} {file_note}");
     }
     if style_section.is_some() {
         intro = format!("{intro} {OUTPUT_STYLE_INTRO}");
@@ -274,7 +288,8 @@ impl crate::Agent {
                     environment.section(directories, &chat.snapshot.model)
                 });
         let scope = PromptScope {
-            has_folder: chat.snapshot.folder.is_some(),
+            has_folder: chat.local_folder().is_some(),
+            has_environment_folder: chat.execution.folder_in_environment(),
             tools: self.inner.tool_policy,
             waits: self.inner.waits,
             prompt_policy: self.inner.host_options.prompt_policy,

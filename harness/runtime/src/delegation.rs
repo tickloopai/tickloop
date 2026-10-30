@@ -359,10 +359,13 @@ fn check_direct_call(
     let session_operation = SessionPermissionOperation::from_normalized(
         name.to_owned(),
         input.clone(),
-        super::session_permissions::capture_workspace_scope(&Workspace {
-            folder: ceiling.folder.clone(),
-            additional_directories: ceiling.additional_directories.clone(),
-        })
+        super::session_permissions::capture_workspace_scope(
+            &Workspace {
+                folder: ceiling.folder.clone(),
+                additional_directories: ceiling.additional_directories.clone(),
+            },
+            &chat.execution.files(),
+        )
         .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
@@ -590,9 +593,10 @@ pub(super) fn host_authority(
         let session_operation = SessionPermissionOperation::from_normalized(
             operation.name.clone(),
             permission_input.clone(),
-            super::session_permissions::capture_workspace_scope(&configured_workspace_for_chat(
-                parent,
-            ))
+            super::session_permissions::capture_workspace_scope(
+                &configured_workspace_for_chat(parent),
+                &parent.execution.files(),
+            )
             .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
@@ -618,9 +622,12 @@ pub(super) fn host_authority(
     }
     // A call that sends a local file needs whatever approval a `Read` of that file would.
     if let Some(read) = local_read {
-        let read_operation =
-            SessionPermissionOperation::from_prepared(read, &configured_workspace_for_chat(own))
-                .map_err(|error| error.to_string())?;
+        let read_operation = SessionPermissionOperation::from_prepared(
+            read,
+            &configured_workspace_for_chat(own),
+            &own.execution.files(),
+        )
+        .map_err(|error| error.to_string())?;
         let owner = PermissionOwner::new(receipt.chat_id.into(), receipt.loop_id.into())
             .map_err(|error| error.to_string())?;
         let read_session = sessions.evaluate(owner, &read_operation).decision;
@@ -763,8 +770,11 @@ fn direct_permission_authority(
             return (Decision::Deny, false, Some(parent.snapshot.policy.revision));
         };
         let parent_workspace = configured_workspace_for_chat(parent);
-        let Ok(operation) = SessionPermissionOperation::from_prepared(prepared, &parent_workspace)
-        else {
+        let Ok(operation) = SessionPermissionOperation::from_prepared(
+            prepared,
+            &parent_workspace,
+            &parent.execution.files(),
+        ) else {
             return (Decision::Deny, false, Some(parent.snapshot.policy.revision));
         };
         let parent_session = sessions.evaluate(owner, &operation).decision;
@@ -980,8 +990,7 @@ impl Agent {
         let plan_file = chats.get(&receipt.chat_id).and_then(|chat| {
             super::plan::current_plan_file(
                 &chat.bookkeeping,
-                self.plans_directory(chat.snapshot.folder.as_deref()?)
-                    .path(),
+                self.plans_directory(chat.local_folder()?).path(),
                 receipt.loop_id,
             )
         });
@@ -1011,9 +1020,12 @@ impl Agent {
         let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
         let owner = PermissionOwner::new(receipt.chat_id.into(), receipt.loop_id.into())
             .map_err(|error| error.to_string())?;
-        let operation =
-            SessionPermissionOperation::from_prepared(read, &configured_workspace_for_chat(chat))
-                .map_err(|error| error.to_string())?;
+        let operation = SessionPermissionOperation::from_prepared(
+            read,
+            &configured_workspace_for_chat(chat),
+            &chat.execution.files(),
+        )
+        .map_err(|error| error.to_string())?;
         let session = self
             .inner
             .session_permissions

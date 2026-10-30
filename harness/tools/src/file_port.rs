@@ -379,6 +379,12 @@ pub struct DirectoryListing {
 /// A read of the environment's files. `Glob` and `Grep` search below `path` and answer with paths
 /// below its root (below `/` outside every root).
 pub enum FileQuery {
+    /// A List, Glob or Grep that must omit these subtrees before traversal, limits and pagination.
+    /// A backend that cannot enforce exclusions must return Unsupported, never run unfiltered.
+    Excluding {
+        query: Box<FileQuery>,
+        paths: Vec<FilePath>,
+    },
     /// The path the environment acts on for this one once symbolic links are resolved, below the
     /// root that holds it or outside every root, and what is there. The names of a missing path
     /// below its deepest existing directory are kept; a symbolic link whose target is missing
@@ -407,8 +413,54 @@ pub enum FileQuery {
 }
 
 impl FileQuery {
+    pub fn excluding(self, paths: Vec<FilePath>) -> Self {
+        if paths.is_empty() {
+            self
+        } else {
+            Self::Excluding {
+                query: Box::new(self),
+                paths,
+            }
+        }
+    }
+
+    pub fn is_search(&self) -> bool {
+        match self {
+            Self::Glob { .. } | Self::Grep { .. } => true,
+            Self::Excluding { query, .. } => query.is_search(),
+            _ => false,
+        }
+    }
+
+    pub fn is_enumeration(&self) -> bool {
+        match self {
+            Self::List { .. } => true,
+            Self::Excluding { query, .. } => query.is_enumeration(),
+            _ => self.is_search(),
+        }
+    }
+
+    /// The backend must enforce every returned exclusion before accessing the query's subtree.
+    pub fn into_query_and_exclusions(self) -> (Self, Vec<FilePath>) {
+        let mut query = self;
+        let mut excluded = Vec::new();
+        loop {
+            match query {
+                Self::Excluding {
+                    query: inner,
+                    paths,
+                } => {
+                    excluded.extend(paths);
+                    query = *inner;
+                }
+                query => return (query, excluded),
+            }
+        }
+    }
+
     pub fn path(&self) -> &FilePath {
         match self {
+            Self::Excluding { query, .. } => query.path(),
             Self::Resolve(path)
             | Self::Stat(path)
             | Self::Read { path, .. }

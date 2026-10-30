@@ -110,10 +110,16 @@ impl Agent {
         let execution =
             crate::chat_execution::ChatExecution::bind(self.inner.environment.as_ref(), &snapshot)
                 .await;
+        let skills = self.discover_skills(
+            snapshot
+                .folder
+                .as_deref()
+                .filter(|_| !execution.folder_in_environment()),
+        );
         crate::NewChat {
             tools: self.folderless_chat_tools(&snapshot),
             execution,
-            skills: self.discover_skills(snapshot.folder.as_deref()),
+            skills,
             output_style: settings
                 .map(|settings| settings.output_style)
                 .unwrap_or_default(),

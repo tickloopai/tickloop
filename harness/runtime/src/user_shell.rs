@@ -104,6 +104,12 @@ impl Agent {
             }
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
             let folder = super::require_folder(&chat.snapshot)?.to_path_buf();
+            // A Folder only in the environment never runs a command on this machine.
+            if chat.execution.folder_in_environment() && !chat.execution.runs_shells() {
+                return Err(AgentError::Invalid(
+                    "Unsupported: this Chat's execution environment runs no commands".into(),
+                ));
+            }
             // A `!` command belongs to the Loop once it has worked, or always in a delegated
             // Chat, so its background completion goes on with that work; before the first turn
             // it only records its completion.
@@ -311,6 +317,8 @@ impl Agent {
             chat.user_shell_queue.clone()
         };
         let mut updates = tools.subscribe_user_shells();
+        // Holding the tools would keep their commands alive after the Chat replaces them.
+        let tools = std::sync::Arc::downgrade(&tools);
         let agent = self.clone();
         self.inner.tasks.spawn(async move {
             loop {
@@ -327,6 +335,9 @@ impl Agent {
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let Some(tools) = tools.upgrade() else {
+                                break;
+                            };
                             for command in tools.user_commands().await {
                                 agent.record_watched_user_shell(chat_id, command).await;
                             }
@@ -451,6 +462,14 @@ impl Agent {
             PermissionApprovalSource, PermissionExecution, PermissionRequest, Receipt,
         };
         let snapshot = self.snapshot(chat_id).await?;
+        let file_capabilities = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .map(|chat| chat.execution.files())
+            .ok_or(AgentError::NotFound)?;
         let workspace = tickloop_harness_tools::Workspace {
             folder: snapshot.folder.clone(),
             additional_directories: snapshot.additional_directories.clone(),
@@ -487,8 +506,12 @@ impl Agent {
                 .map_err(AgentError::Invalid)?;
             let owner = PermissionOwner::new(chat_id.into(), loop_id.into())
                 .map_err(|error| AgentError::Invalid(error.to_string()))?;
-            let operation = SessionPermissionOperation::from_prepared(&prepared, &workspace)
-                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            let operation = SessionPermissionOperation::from_prepared(
+                &prepared,
+                &workspace,
+                &file_capabilities,
+            )
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
             let (authority, mut evaluation) = {
                 let chats = self.inner.chats.lock().await;
                 let sessions = self.inner.session_permissions.lock().await;

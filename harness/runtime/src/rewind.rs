@@ -17,7 +17,7 @@ use super::{Agent, AgentError, Chat, ChatBookkeeping};
 use crate::file_history::{
     FileHistoryError, FileHistorySnapshot, FileRestoreReport, create_first_backup,
 };
-use crate::transcript::private_project_temp_directory;
+use crate::transcript::{private_project_temp_directory, private_temp_root};
 use tickloop_harness_base::private_fs::PrivateDirectory;
 use tickloop_harness_protocol::local_messages::LocalMessage;
 use tickloop_harness_protocol::projection;
@@ -270,6 +270,7 @@ impl Agent {
         &self,
         chat_id: ChatId,
         folder: &Path,
+        in_environment: bool,
     ) -> PrivateDirectory {
         match self
             .inner
@@ -278,11 +279,9 @@ impl Agent {
             .and_then(|recorder| recorder.file_history_root())
         {
             Some(directory) => PrivateDirectory::trusted(directory),
-            // When not persisting, nothing is written in the working directory: backups go under
-            // the project directory in the system temp directory (ticket 54), with ownership,
-            // permission bits and symlinks checked at each level on creation.
-            None => private_project_temp_directory(folder)
+            None if !in_environment => private_project_temp_directory(folder)
                 .join(crate::file_history::FILE_HISTORY_DIRECTORY),
+            None => private_temp_root().join(crate::file_history::FILE_HISTORY_DIRECTORY),
         }
         .join(chat_id.uuid().to_string())
     }

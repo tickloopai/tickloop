@@ -76,7 +76,7 @@ impl Fixture {
             ChatDirectory {
                 chat: output.clone(),
                 task_output: output.join("tasks"),
-                family_temp: output,
+                family_temp: Some(output),
             },
             shells.for_chat(Uuid::new_v4()),
             Arc::new(LocalRoots::for_workspace(&workspace)),

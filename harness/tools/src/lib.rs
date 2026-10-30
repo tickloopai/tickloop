@@ -1,3 +1,4 @@
+mod protected_files;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -9,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::chat_files::{ChatFiles, FileTarget};
 use crate::file_change::{ARTIFACT_DIRECTORY, FileChangeArtifactError, persist_file_change_review};
-use crate::file_port::{FileHost, FileVersion};
+use crate::file_port::{FileAccess, FileHost, FileVersion};
 use crate::local_files::LocalFileError;
 use crate::local_roots::LocalRoots;
 use tickloop_harness_base::git_worktree::sibling_linked_worktrees;
@@ -146,7 +147,7 @@ pub struct LocalFileReader {
     workspace: Workspace,
     files: ChatFiles,
     readable_directories: Vec<PathBuf>,
-    family_temp: PathBuf,
+    family_temp: Option<PathBuf>,
     admission: Arc<dyn LocalReadAdmission>,
 }
 
@@ -161,7 +162,7 @@ impl LocalFileReader {
             READ_TOOL_NAME,
             &json!({"file_path": file_path}),
             &self.readable_directories,
-            Some(&self.family_temp),
+            self.family_temp.as_deref(),
             &FileReadState::default(),
         )
         .await?;
@@ -286,6 +287,11 @@ impl Operation {
             self,
             Operation::Read(_) | Operation::Write(_) | Operation::Search(_)
         )
+    }
+
+    /// Whether the call acts in the Chat's directories, unlike a fetch or search on the web.
+    fn is_local(&self) -> bool {
+        !matches!(self, Operation::WebFetch(_) | Operation::WebSearch(_))
     }
 }
 
@@ -632,12 +638,25 @@ pub struct ChatDirectory {
     /// Background task output directory; following Claude Code, `<chatId>/tasks` under the system
     /// temp directory.
     pub task_output: PrivateDirectory,
-    /// Canonical private family temp space, shared by the family's root and its children.
-    pub family_temp: PrivateDirectory,
+    /// Canonical private family temp space, shared by the family's root and its children; `None`
+    /// for a Chat whose Folder is only in its Execution Environment, which has no scratchpad and
+    /// whose file tools only read the Chat's own directories on this machine.
+    pub family_temp: Option<PrivateDirectory>,
+}
+
+impl ChatDirectory {
+    /// The Chat's own directories its file tools read without asking.
+    fn harness_paths(&self) -> Vec<PathBuf> {
+        std::iter::once(&self.chat)
+            .chain(&self.family_temp)
+            .map(|directory| directory.path().to_path_buf())
+            .collect()
+    }
 }
 
 #[derive(Clone)]
 pub struct Tools {
+    protected_paths: protected_files::ProtectedPaths,
     /// `None` for a Chat without a Folder, whose tools write no local file.
     directory: Option<ChatDirectory>,
     commands: shell::Registry,
@@ -658,6 +677,14 @@ pub struct Tools {
 }
 
 impl Tools {
+    /// Excludes host-owned storage from model file tools and file attachments.
+    pub fn protect_directory(&self, path: PathBuf) {
+        let mut paths = self.protected_paths.write().unwrap();
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+
     /// When used standalone, attachments and task output both go under `output_dir` and the files
     /// of each call's workspace are those on this machine; with no host to run commands, Shell
     /// commands are rejected.
@@ -666,7 +693,7 @@ impl Tools {
         Self::with_commands(
             Some(ChatDirectory {
                 task_output: output_dir.join(TASK_OUTPUT_SUBDIRECTORY),
-                family_temp: output_dir.clone(),
+                family_temp: Some(output_dir.clone()),
                 chat: output_dir,
             }),
             shell::Registry::without_host(),
@@ -696,6 +723,12 @@ impl Tools {
         Self::with_commands(None, shell::Registry::without_folder(), None, reach)
     }
 
+    /// `WebFetch` fetches only from the addresses `reach` admits.
+    pub fn with_reach(mut self, reach: Reach) -> Self {
+        self.reach = reach;
+        self
+    }
+
     fn with_commands(
         directory: Option<ChatDirectory>,
         commands: shell::Registry,
@@ -703,6 +736,7 @@ impl Tools {
         reach: Reach,
     ) -> Self {
         Self {
+            protected_paths: Default::default(),
             directory,
             commands,
             files,
@@ -795,25 +829,30 @@ impl Tools {
             return self.bind_search(prepared).await;
         };
         let family_temp = directory.family_temp.clone();
-        family_temp
-            .create()
-            .map_err(|error| io_error(family_temp.path(), error))?;
-        let scratchpad = family_temp.join(SCRATCHPAD_SUBDIRECTORY);
-        scratchpad
-            .create()
-            .map_err(|error| io_error(scratchpad.path(), error))?;
-        let readable_directories = vec![
-            directory.chat.path().to_path_buf(),
-            family_temp.path().to_path_buf(),
-        ];
-        let mut prepared = if FILE_TOOL_NAMES.contains(&name) {
+        if let Some(family_temp) = &family_temp {
+            family_temp
+                .create()
+                .map_err(|error| io_error(family_temp.path(), error))?;
+            let scratchpad = family_temp.join(SCRATCHPAD_SUBDIRECTORY);
+            scratchpad
+                .create()
+                .map_err(|error| io_error(scratchpad.path(), error))?;
+        }
+        let readable_directories = directory.harness_paths();
+        let chat_files = self.chat_files(workspace, &directory);
+        // A web call of a Chat whose Folder is only in the environment resolves nothing here.
+        let is_web_call = [WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME].contains(&name);
+        let mut prepared = if FILE_TOOL_NAMES.contains(&name)
+            || ((is_web_call || [BASH_TOOL_NAME, TASK_STOP_TOOL_NAME].contains(&name))
+                && chat_files.folder_in_environment())
+        {
             prepare_call(
-                Some(&self.chat_files(workspace, &directory)),
+                Some(&chat_files),
                 workspace,
                 name,
                 input,
                 &readable_directories,
-                Some(family_temp.path()),
+                family_temp.as_ref().map(PrivateDirectory::path),
                 &self.file_reads,
             )
             .await?
@@ -831,7 +870,7 @@ impl Tools {
                     &name,
                     &input,
                     &readable_directories,
-                    Some(family_temp.path()),
+                    family_temp.as_ref().map(PrivateDirectory::path),
                     &file_reads,
                 ))
             })
@@ -923,11 +962,11 @@ impl Tools {
         Some(LocalFileReader {
             workspace: workspace.clone(),
             files: self.chat_files(workspace, directory),
-            readable_directories: vec![
-                directory.chat.path().to_path_buf(),
-                directory.family_temp.path().to_path_buf(),
-            ],
-            family_temp: directory.family_temp.path().to_path_buf(),
+            readable_directories: directory.harness_paths(),
+            family_temp: directory
+                .family_temp
+                .as_ref()
+                .map(|family_temp| family_temp.path().to_path_buf()),
             admission,
         })
     }
@@ -938,7 +977,14 @@ impl Tools {
             .files
             .clone()
             .unwrap_or_else(|| Arc::new(LocalRoots::for_workspace(workspace)) as Arc<dyn FileHost>);
-        chat_files_on(environment, directory)
+        chat_files_on(environment, directory, self.protected_paths.clone())
+    }
+
+    /// The protected environment files used by both model operations and prompt attachments.
+    pub fn workspace_file_host(&self) -> Option<Arc<dyn FileHost>> {
+        self.files
+            .clone()
+            .map(|files| protected_files::ProtectedFiles::wrap(files, self.protected_paths.clone()))
     }
 
     /// Where this Chat's files are for what reaches them outside a tool call, such as file
@@ -946,7 +992,11 @@ impl Tools {
     pub fn file_locator(&self) -> Option<FileLocator> {
         let directory = self.directory.as_ref()?;
         let environment = self.files.clone()?;
-        Some(FileLocator::for_chat(chat_files_on(environment, directory)))
+        Some(FileLocator::for_chat(chat_files_on(
+            environment,
+            directory,
+            self.protected_paths.clone(),
+        )))
     }
 
     pub async fn set_search(&self, config: Option<SearchConfig>) -> Result<(), ToolError> {
@@ -1004,7 +1054,7 @@ impl Tools {
         shell::command_output(command, offset, limit)
     }
     pub fn family_temp_directory(&self) -> Option<&Path> {
-        Some(self.directory.as_ref()?.family_temp.path())
+        Some(self.directory.as_ref()?.family_temp.as_ref()?.path())
     }
 
     /// Where this Chat keeps file change reviews and stored tool results; `None` without a Folder.
@@ -1035,9 +1085,11 @@ impl Tools {
         chat_id: uuid::Uuid,
         cancel: CancellationToken,
     ) -> Result<ToolResult, ToolError> {
-        let current = shell::resolve_cwd(&prepared.original_path, !prepared.is_read_only)?;
-        if current != prepared.resolved_path {
-            return Err(ToolError::PathChanged(prepared.original_path));
+        if !matches!(&prepared.operation, Operation::Shell(input) if input.environment_cwd) {
+            let current = shell::resolve_cwd(&prepared.original_path, !prepared.is_read_only)?;
+            if current != prepared.resolved_path {
+                return Err(ToolError::PathChanged(prepared.original_path));
+            }
         }
         prepared.revalidate_automatic_shell_paths()?;
         let Operation::Shell(input) = prepared.operation else {
@@ -1154,7 +1206,9 @@ impl Tools {
                 if cancel.is_cancelled() {
                     return Err(ToolError::Cancelled);
                 }
-                if shell::resolve_cwd(&prepared.original_path, false)? != prepared.resolved_path {
+                if !input.environment_cwd
+                    && shell::resolve_cwd(&prepared.original_path, false)? != prepared.resolved_path
+                {
                     return Err(ToolError::PathChanged(prepared.original_path.clone()));
                 }
                 self.commands
@@ -1300,13 +1354,26 @@ pub fn is_concurrency_safe(workspace: &Workspace, name: &str, input: &Value) -> 
     }
 }
 
-fn chat_files_on(environment: Arc<dyn FileHost>, directory: &ChatDirectory) -> ChatFiles {
-    ChatFiles::new(
-        environment,
-        Some(LocalRoots::harness_directories(&[
-            directory.chat.path(),
-            directory.family_temp.path(),
-        ])),
+/// The file tools write in the Chat's own directories only when it has a scratchpad: without one,
+/// they write nothing on this machine.
+fn chat_files_on(
+    environment: Arc<dyn FileHost>,
+    directory: &ChatDirectory,
+    protected: protected_files::ProtectedPaths,
+) -> ChatFiles {
+    let access = if directory.family_temp.is_some() {
+        FileAccess::ReadWrite
+    } else {
+        FileAccess::Read
+    };
+    let paths = directory.harness_paths();
+    let paths = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    ChatFiles::with_hosts(
+        protected_files::ProtectedFiles::wrap(environment, protected.clone()),
+        Some(protected_files::ProtectedFiles::wrap(
+            Arc::new(LocalRoots::harness_directories(&paths, access)),
+            protected,
+        )),
     )
 }
 
@@ -1430,13 +1497,21 @@ async fn prepare_call(
         Operation::Shell(input) => {
             input.readable_directories = readable_directories.to_vec();
             input.editable_directory = family_temp.map(Path::to_path_buf);
-            let cwd = shell::resolve_cwd(&original_path, true).ok();
+            if files.is_some_and(ChatFiles::folder_in_environment) {
+                input.environment_cwd = true;
+            }
+            let cwd = if input.environment_cwd {
+                None
+            } else {
+                shell::resolve_cwd(&original_path, true).ok()
+            };
             if let Some(cwd) = &cwd
                 && input.is_allowed_with_family_temp(cwd, workspace)
             {
                 automatic_shell_workspace = Some(workspace.clone());
             }
-            input.is_read_only(cwd.as_deref().unwrap_or(&original_path), workspace)
+            !input.environment_cwd
+                && input.is_read_only(cwd.as_deref().unwrap_or(&original_path), workspace)
         }
         Operation::TaskStop(_) => false,
         _ => true,
@@ -1453,13 +1528,24 @@ async fn prepare_call(
             file_reads,
         )
         .await?
+    } else if files.is_some_and(ChatFiles::folder_in_environment) {
+        // A fetch or search runs nowhere in the Folder, and a Folder only in the environment is
+        // never looked up on this machine.
+        let location = Location {
+            resolved_path: original_path.clone(),
+            original_scope: original_path.clone(),
+            in_workspace: false,
+            in_sibling_worktree: false,
+            file: None,
+        };
+        (operation, location)
     } else {
         let resolved_path = shell::resolve_cwd(&original_path, !is_read_only)?;
         if let Operation::Shell(input) = &mut operation {
             input.approved_directory = shell::DirectoryIdentity::at(&resolved_path);
         }
         let original_scope = shell::cwd_scope(&original_path, &resolved_path)?;
-        let is_local = !matches!(operation, Operation::WebFetch(_) | Operation::WebSearch(_));
+        let is_local = operation.is_local();
         let in_workspace =
             is_local && workspace.contains(&original_scope) && workspace.contains(&resolved_path);
         let in_sibling_worktree = is_local

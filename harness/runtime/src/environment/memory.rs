@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_protocol::{InstanceRef, TickDescriptor, TickState};
 use tickloop_harness_protocol::{ChatId, ToolResult};
-use tickloop_harness_tools::file_search::{SearchedFile, glob_files, grep_files};
+use tickloop_harness_tools::file_search::{
+    SearchedFile, glob_files_excluding, grep_files_excluding,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -26,6 +28,8 @@ pub struct MemoryEnvironment {
 #[derive(Default)]
 struct MemoryState {
     isolation: ExecutionIsolation,
+    /// Reports no Shells, as an environment that runs no commands does.
+    without_shells: bool,
     shell_approval_required: bool,
     shell_approval_skipped_when_isolated: bool,
     epoch: Uuid,
@@ -50,6 +54,7 @@ struct MemoryState {
 }
 
 struct MemoryRoot {
+    local_path: Option<std::path::PathBuf>,
     display_path: String,
     access: FileAccess,
     tree: MemoryTree,
@@ -116,7 +121,12 @@ impl MemoryTree {
         })
     }
 
-    fn list(&self, path: &str, limit: usize) -> Result<DirectoryListing, ExecutionError> {
+    fn list(
+        &self,
+        path: &str,
+        limit: usize,
+        excluded: &[String],
+    ) -> Result<DirectoryListing, ExecutionError> {
         if self.files.contains_key(path) {
             return Err(ExecutionError::new(
                 error_code::NOT_A_DIRECTORY,
@@ -130,6 +140,13 @@ impl MemoryTree {
         let mut entries = BTreeMap::new();
         for (below, _) in self.below(path) {
             let rest = &below[skipped..];
+            let name = rest.split('/').next().expect("a child entry");
+            if excluded
+                .iter()
+                .any(|excluded| std::path::Path::new(path).join(name).starts_with(excluded))
+            {
+                continue;
+            }
             match rest.split_once('/') {
                 Some((name, _)) => entries.insert(name.to_owned(), FileKind::Directory),
                 None => entries.insert(rest.to_owned(), FileKind::File),
@@ -401,6 +418,11 @@ impl MemoryEnvironment {
         self.state.lock().unwrap().shell_approval_required = required;
     }
 
+    /// Whether the environment reports that it runs Shells; it does by default.
+    pub fn set_shells(&self, runs_shells: bool) {
+        self.state.lock().unwrap().without_shells = !runs_shells;
+    }
+
     pub fn set_isolation(&self, isolation: ExecutionIsolation) {
         self.state.lock().unwrap().isolation = isolation;
     }
@@ -598,11 +620,23 @@ impl MemoryEnvironment {
         state.file_roots.insert(
             name,
             MemoryRoot {
+                local_path: None,
                 display_path: display_path.into(),
                 access,
                 tree: MemoryTree::default(),
             },
         );
+    }
+
+    /// Reports the root's placement on the Harness machine, without changing its memory files.
+    pub fn set_root_local_path(&self, name: &str, path: Option<std::path::PathBuf>) {
+        self.state
+            .lock()
+            .unwrap()
+            .file_roots
+            .get_mut(&RootName::new(name).expect("valid root name"))
+            .expect("defined root")
+            .local_path = path;
     }
 
     /// What every Port allows on absolute paths below no root; nothing by default.
@@ -745,7 +779,7 @@ impl MemoryPort {
                     display_path: root.display_path.clone(),
                     access: root.access,
                     is_folder,
-                    local_path: None,
+                    local_path: root.local_path.clone(),
                 })
             })
             .collect();
@@ -764,11 +798,33 @@ impl MemoryPort {
             self.authority.check(self.scope.chat)?;
         }
         let state = self.state.lock().unwrap();
+        let (query, exclusions) = query.into_query_and_exclusions();
+        if !exclusions.is_empty() && !query.is_enumeration() {
+            return Err(ExecutionError::new(
+                error_code::INVALID_INPUT,
+                "exclusions require a directory query",
+            ));
+        }
         let path = query.path().clone();
+        let excluded = exclusions
+            .iter()
+            .filter(|excluded| excluded.root() == path.root())
+            .map(|path| tree_path(path).to_owned())
+            .collect::<Vec<_>>();
+        if excluded
+            .iter()
+            .any(|excluded| std::path::Path::new(tree_path(&path)).starts_with(excluded))
+        {
+            return Err(ExecutionError::new(
+                error_code::ACCESS_DENIED,
+                "query targets an excluded subtree",
+            ));
+        }
         check_access(&self.file_capabilities(&state), &path, FileAccess::Read)?;
         let tree = tree(&state, &path);
         let below = tree_path(&path);
         let inspection = match query {
+            FileQuery::Excluding { .. } => unreachable!("exclusions were separated"),
             FileQuery::Resolve(path) => FileInspection::Resolved(ResolvedPath {
                 kind: match tree.stat(below) {
                     Ok(FileStat::File(_)) => Some(FileKind::File),
@@ -790,13 +846,21 @@ impl MemoryPort {
                     data: file.content[begin..end].to_vec(),
                 })
             }
-            FileQuery::List { limit, .. } => FileInspection::List(tree.list(below, limit)?),
-            FileQuery::Glob { query, .. } => {
-                FileInspection::Glob(glob_files(tree.searched(), below, &query)?)
+            FileQuery::List { limit, .. } => {
+                FileInspection::List(tree.list(below, limit, &excluded)?)
             }
-            FileQuery::Grep { query, .. } => {
-                FileInspection::Grep(grep_files(tree.searched(), below, &query)?)
-            }
+            FileQuery::Glob { query, .. } => FileInspection::Glob(glob_files_excluding(
+                tree.searched(),
+                below,
+                &query,
+                &excluded,
+            )?),
+            FileQuery::Grep { query, .. } => FileInspection::Grep(grep_files_excluding(
+                tree.searched(),
+                below,
+                &query,
+                &excluded,
+            )?),
         };
         Ok(ExecutionInspection::File(inspection))
     }
@@ -1017,10 +1081,11 @@ impl ExecutionPort for MemoryPort {
         let describes = matches!(&query, ExecutionQuery::Describe(_));
         match query {
             ExecutionQuery::Capabilities => {
-                let files = self.file_capabilities(&self.state.lock().unwrap());
+                let state = self.state.lock().unwrap();
+                let files = self.file_capabilities(&state);
                 Ok(ExecutionInspection::Capabilities(ExecutionCapabilities {
                     ticks: true,
-                    shells: true,
+                    shells: !state.without_shells,
                     shell_output: ShellOutputDelivery::Environment,
                     files,
                 }))
@@ -1158,6 +1223,13 @@ impl ExecutionPort for MemoryPort {
                 )
             }
             ExecutionIntent::SpawnShell(shell) => {
+                let files = self.file_capabilities(&state);
+                if !files.roots().is_empty() && files.resolve(&shell.cwd)?.root().is_none() {
+                    return Err(ExecutionError::new(
+                        error_code::OUTSIDE_ROOT,
+                        "Shell cwd is outside the bound roots",
+                    ));
+                }
                 if !state.shell_programs.contains_key(&shell.command) {
                     return Err(ExecutionError::new(
                         "ProgramNotFound",

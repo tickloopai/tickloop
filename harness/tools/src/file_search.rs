@@ -291,6 +291,16 @@ pub fn glob_files<'a>(
     base: &str,
     query: &GlobQuery,
 ) -> Result<GlobMatches, FileSearchError> {
+    glob_files_excluding(files, base, query, &[])
+}
+
+/// Like [`glob_files`], pruning root-relative excluded subtrees before search and pagination.
+pub fn glob_files_excluding<'a>(
+    files: impl IntoIterator<Item = SearchedFile<'a>>,
+    base: &str,
+    query: &GlobQuery,
+    excluded: &[String],
+) -> Result<GlobMatches, FileSearchError> {
     let overrides = override_matcher(&virtual_path(base), [&query.pattern])?;
     let tree = FileTree::new(files);
     if let SearchBase::File(_) = tree.base(base)? {
@@ -299,6 +309,7 @@ pub fn glob_files<'a>(
     let mut walk = Walk {
         tree: &tree,
         base,
+        excluded,
         overrides,
         types: None,
         ignore_files: None,
@@ -335,16 +346,37 @@ pub fn grep_files<'a>(
     base: &str,
     query: &GrepQuery,
 ) -> Result<GrepMatches, FileSearchError> {
+    grep_files_excluding(files, base, query, &[])
+}
+
+/// Like [`grep_files`], pruning root-relative excluded subtrees before search and pagination.
+pub fn grep_files_excluding<'a>(
+    files: impl IntoIterator<Item = SearchedFile<'a>>,
+    base: &str,
+    query: &GrepQuery,
+    excluded: &[String],
+) -> Result<GrepMatches, FileSearchError> {
     let mut search = GrepSearch::new(query)?;
     let overrides = override_matcher(&virtual_path(base), &query.globs)?;
     let types = query.file_type.as_deref().map(file_types).transpose()?;
     let tree = FileTree::new(files);
     let (searched, shows_paths) = match tree.base(base)? {
-        SearchBase::File(index) => (vec![(&tree.files[index], true)], false),
+        SearchBase::File(index) => (
+            if excluded
+                .iter()
+                .any(|path| Path::new(base).starts_with(path))
+            {
+                Vec::new()
+            } else {
+                vec![(&tree.files[index], true)]
+            },
+            false,
+        ),
         SearchBase::Directory => (
             Walk {
                 tree: &tree,
                 base,
+                excluded,
                 overrides,
                 types,
                 ignore_files: Some(IgnoreFiles::default()),
@@ -784,6 +816,7 @@ impl<'a> FileTree<'a> {
 struct Walk<'t, 'a> {
     tree: &'t FileTree<'a>,
     base: &'t str,
+    excluded: &'t [String],
     overrides: Override,
     types: Option<Types>,
     /// `None` searches like `--no-ignore`.
@@ -803,6 +836,12 @@ impl<'t, 'a> Walk<'t, 'a> {
         tree.files
             .iter()
             .filter(|file| file.path.starts_with(&below))
+            .filter(|file| {
+                !self
+                    .excluded
+                    .iter()
+                    .any(|path| Path::new(file.path).starts_with(path))
+            })
             .filter(|file| {
                 !parent(file.path).is_some_and(|directory| self.is_directory_skipped(directory))
                     && !self.is_entry_skipped(file.path, false)

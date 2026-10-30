@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashSet},
-    path::PathBuf,
     sync::Arc,
 };
 
@@ -47,18 +46,12 @@ impl Agent {
         let source_loop_id = source.snapshot.chat_loop.id;
         validate_snapshot(&source.snapshot)?;
         ensure_branchable(source)?;
-        let folder = canonical_directory(super::require_folder(&source.snapshot)?)?;
-        self.require_working_directory_trust(&folder)?;
+        let folder = super::require_folder(&source.snapshot)?.to_path_buf();
         let mut source_file_history = source
             .file_history
             .clone()
             .ok_or_else(|| AgentError::Invalid(super::FOLDERLESS_CHAT.into()))?;
-        let additional_directories = source
-            .snapshot
-            .additional_directories
-            .iter()
-            .map(|directory| canonical_directory(directory))
-            .collect::<Result<Vec<_>, _>>()?;
+        let additional_directories = source.snapshot.additional_directories.clone();
         let seed = public_seed_with_sources(source)?;
         let model_seed = seed
             .iter()
@@ -175,6 +168,7 @@ impl Agent {
             user_shells: Vec::new(),
             last_model_run: None,
         };
+        let execution = self.admit_existing_directories(&mut snapshot).await?;
         let mut bookkeeping = ChatBookkeeping {
             additional_directory_sources: source.bookkeeping.additional_directory_sources.clone(),
             continued_message_ids: source.bookkeeping.continued_message_ids.clone(),
@@ -190,7 +184,12 @@ impl Agent {
             plan_slug: source.bookkeeping.plan_slug.clone(),
             ..ChatBookkeeping::default()
         };
-        let output_style = self.apply_new_chat_settings(&mut snapshot, &mut bookkeeping);
+        let output_style = self.apply_new_chat_settings(
+            &mut snapshot,
+            &mut bookkeeping,
+            execution.folder_in_environment(),
+        );
+        bookkeeping.environment_folder = execution.folder_in_environment();
         carry_rewind_points(&mut snapshot, &source.snapshot, &seed);
         carry_citation_results(&mut snapshot, &mut bookkeeping, source, &seed)?;
         carry_compaction_summaries(&mut snapshot, &source.snapshot, &seed);
@@ -199,14 +198,15 @@ impl Agent {
         carry_plans_and_progress(&mut snapshot, &mut bookkeeping, source);
         // Following Claude Code's `copyPlanForFork`: the Branch uses a new slug and copies the plan
         // file, after which each side edits its own.
-        let plans_directory = self.plans_directory(&folder);
+        let plans_directory =
+            (!execution.folder_in_environment()).then(|| self.plans_directory(&folder));
         super::plan::copy_plans_to_new_slug(
             &mut snapshot,
             &mut bookkeeping,
             plans_directory
-                .create()
-                .is_ok()
-                .then(|| plans_directory.path()),
+                .as_ref()
+                .filter(|directory| directory.create().is_ok())
+                .map(|directory| directory.path()),
         );
         validate_child(&snapshot, &model_seed)?;
         let child_prompts = snapshot
@@ -215,7 +215,8 @@ impl Agent {
             .copied()
             .collect::<HashSet<_>>();
         source_file_history.retain_messages(&child_prompts);
-        let child_file_history_directory = self.file_history_directory(child_chat_id, &folder);
+        let child_file_history_directory =
+            self.file_history_directory(child_chat_id, &folder, execution.folder_in_environment());
         let file_history = source_file_history.relocated(child_file_history_directory.clone());
 
         let mut permission_context = self.inner.session_permissions.lock().await;
@@ -239,8 +240,12 @@ impl Agent {
                 recorder.record_citation_sources(bookkeeping.citation_sources.clone());
             }
         }
-        let (tools, execution) = self.create_chat_tools(&snapshot).await;
-        let skills = self.discover_skills(Some(&folder));
+        self.follow_admitted_directories(&execution, &mut snapshot)
+            .await?;
+        let tools = self.chat_tools_on(&snapshot, &execution);
+        file_history.protect_from(&tools);
+        let skills =
+            self.discover_skills((!execution.folder_in_environment()).then_some(folder.as_path()));
         // Following Claude Code's `/branch`: re-records, under the child Chat's id, the source's
         // replacement decisions still in the copied conversation.
         let source_replacements = chats
@@ -863,19 +868,6 @@ fn source_fingerprint(
     ))
     .map_err(|error| AgentError::Invalid(format!("branch source cannot be encoded: {error}")))?;
     Ok(format!("{:x}", Sha256::digest(encoded)))
-}
-
-fn canonical_directory(path: &std::path::Path) -> Result<PathBuf, AgentError> {
-    let canonical = path.canonicalize().map_err(|_| {
-        AgentError::Invalid(format!("directory is unavailable: {}", path.display()))
-    })?;
-    if canonical != path || !canonical.is_dir() {
-        return Err(AgentError::Invalid(format!(
-            "directory changed after it was configured: {}",
-            path.display()
-        )));
-    }
-    Ok(canonical)
 }
 
 fn unused_chat_id(chats: &std::collections::HashMap<ChatId, Chat>) -> ChatId {

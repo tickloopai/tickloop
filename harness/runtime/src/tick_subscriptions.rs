@@ -1389,6 +1389,7 @@ impl Agent {
                 permission_input.clone(),
                 super::session_permissions::capture_workspace_scope(
                     &configured_workspace_for_chat(chat),
+                    &chat.execution.files(),
                 )
                 .map_err(|error| AgentError::Invalid(error.to_string()))?,
             )
@@ -1657,6 +1658,7 @@ impl Agent {
                 permission_input.clone(),
                 super::session_permissions::capture_workspace_scope(
                     &configured_workspace_for_chat(chat),
+                    &chat.execution.files(),
                 )
                 .map_err(|error| AgentError::Invalid(error.to_string()))?,
             )

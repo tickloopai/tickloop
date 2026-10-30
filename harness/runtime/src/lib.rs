@@ -428,6 +428,8 @@ struct Inner {
 /// Branch copies rebuild it from the conversation chain.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ChatBookkeeping {
+    #[serde(skip)]
+    environment_folder: bool,
     #[serde(default)]
     additional_directory_sources: tickloop_harness_protocol::AdditionalDirectorySources,
     /// What the Chat's own work vouches for, as its Transcript keeps it.
@@ -893,7 +895,22 @@ fn mode_before_plan_after(
     }
 }
 
+impl ChatBookkeeping {
+    fn local_settings_folder<'a>(&self, snapshot: &'a ChatSnapshot) -> Option<&'a Path> {
+        snapshot
+            .folder
+            .as_deref()
+            .filter(|_| !self.environment_folder)
+    }
+}
+
 impl Chat {
+    /// The Chat's Folder when it is a directory on this machine; `None` without a Folder or for one
+    /// only in the Execution Environment, which reads and writes nothing here.
+    fn local_folder(&self) -> Option<&Path> {
+        self.bookkeeping.local_settings_folder(&self.snapshot)
+    }
+
     /// Changes the execution mode, remembering the mode Plan is entered from.
     fn change_execution_mode(&mut self, mode: ExecutionMode) {
         let policy = &mut self.snapshot.policy;
@@ -1198,7 +1215,7 @@ impl Agent {
             .lock()
             .await
             .get(&chat_id)
-            .map(|chat| chat.snapshot.folder.clone())
+            .map(|chat| chat.local_folder().map(Path::to_path_buf))
         else {
             return;
         };
@@ -1519,7 +1536,7 @@ impl Agent {
         cancel: CancellationToken,
         emit_permission: bool,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
-        let (snapshot, bookkeeping, chat_client, boundary_id, root_goal) = {
+        let (snapshot, bookkeeping, chat_client, boundary_id, root_goal, local_folder) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
             let boundary_id =
@@ -1550,6 +1567,7 @@ impl Agent {
                 chat.client.clone(),
                 boundary_id,
                 root_goal,
+                chat.local_folder().map(Path::to_path_buf),
             )
         };
         // One load serves both the original prompts and the history before the boundary.
@@ -1598,7 +1616,9 @@ impl Agent {
                 ));
             }
         };
-        let Some(folder) = snapshot.folder.clone() else {
+        // The review reads the Folder's context on this machine, which a Folder only in the
+        // Execution Environment does not have.
+        let Some(folder) = local_folder else {
             let reason =
                 "This Chat has no Folder to review this action in; review it manually.".to_owned();
             if emit_permission {
@@ -2330,7 +2350,8 @@ impl Agent {
             .await
     }
 
-    /// A new Chat without a Folder, in an Agent without an Execution Environment.
+    /// A new Chat without a Folder; in an Agent with an Execution Environment it can gain one
+    /// later through [`Agent::set_working_directories`].
     pub async fn create_chat_without_folder(&self) -> Result<ChatId, AgentError> {
         self.create_chat_with_id(tickloop_ids::generate().into(), None)
             .await
@@ -2357,29 +2378,96 @@ impl Agent {
             .await
     }
 
-    /// The canonical Folder of a new Chat. Chats have a Folder exactly when the Agent has an
-    /// Execution Environment.
-    fn admit_folder(&self, folder: Option<PathBuf>) -> Result<Option<PathBuf>, AgentError> {
-        let folder = match (folder, &self.inner.environment) {
-            (None, None) => return Ok(None),
-            (Some(folder), Some(_)) => folder,
-            (Some(_), None) => {
-                return Err(AgentError::Invalid(NO_ENVIRONMENT.into()));
+    async fn admit_directories(
+        &self,
+        snapshot: &mut ChatSnapshot,
+    ) -> Result<chat_execution::ChatExecution, AgentError> {
+        if snapshot.folder.is_some() && self.inner.environment.is_none() {
+            return Err(AgentError::Invalid(NO_ENVIRONMENT.into()));
+        }
+        let execution =
+            chat_execution::ChatExecution::bind(self.inner.environment.as_ref(), snapshot).await;
+        if snapshot.folder.is_some() {
+            execution
+                .port()
+                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        }
+        for path in snapshot
+            .folder
+            .iter_mut()
+            .chain(&mut snapshot.additional_directories)
+        {
+            if execution.is_local_directory(path) {
+                *path = tickloop_harness_tools::permissions::canonical_directory(path.clone())
+                    .map_err(|reason| AgentError::Invalid(reason.into()))?;
             }
-            (None, Some(_)) => {
-                return Err(AgentError::Invalid("a new Chat needs a Folder".into()));
-            }
-        };
-        let folder = folder
-            .canonicalize()
-            .map_err(|_| AgentError::Invalid("working directory does not exist".into()))?;
-        if !folder.is_dir() {
+        }
+        if let Some(folder) = snapshot
+            .folder
+            .as_deref()
+            .filter(|_| !execution.folder_in_environment())
+        {
+            self.require_working_directory_trust(folder)?;
+        }
+        execution.admitted_scope(snapshot);
+        Ok(execution)
+    }
+
+    async fn bind_recorded_directories(
+        &self,
+        snapshot: &ChatSnapshot,
+    ) -> Result<chat_execution::ChatExecution, AgentError> {
+        if snapshot.folder.is_some() && self.inner.environment.is_none() {
+            return Err(AgentError::Invalid(NO_ENVIRONMENT.into()));
+        }
+        let execution =
+            chat_execution::ChatExecution::bind(self.inner.environment.as_ref(), snapshot).await;
+        if snapshot.folder.is_some() {
+            execution
+                .port()
+                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        }
+        if let Some(folder) = snapshot
+            .folder
+            .as_deref()
+            .filter(|_| !execution.folder_in_environment())
+        {
+            self.require_working_directory_trust(folder)?;
+        }
+        Ok(execution)
+    }
+
+    async fn admit_existing_directories(
+        &self,
+        snapshot: &mut ChatSnapshot,
+    ) -> Result<chat_execution::ChatExecution, AgentError> {
+        let folder = snapshot.folder.clone();
+        let additional = snapshot.additional_directories.clone();
+        let execution = self.admit_directories(snapshot).await?;
+        if snapshot.folder != folder || snapshot.additional_directories != additional {
             return Err(AgentError::Invalid(
-                "working directory must be a directory".into(),
+                "working or authorized directory changed".into(),
             ));
         }
-        self.require_working_directory_trust(&folder)?;
-        Ok(Some(folder))
+        Ok(execution)
+    }
+
+    async fn follow_admitted_directories(
+        &self,
+        execution: &chat_execution::ChatExecution,
+        snapshot: &mut ChatSnapshot,
+    ) -> Result<(), AgentError> {
+        if execution.matches_directories(snapshot) {
+            return Ok(());
+        }
+        let candidate = self.admit_directories(snapshot).await?;
+        if candidate.folder_in_environment() != execution.folder_in_environment() {
+            return Err(AgentError::Invalid(
+                "Folder placement changed while loading settings".into(),
+            ));
+        }
+        execution.replace(&candidate);
+        Ok(())
     }
 
     async fn create_chat_with_delegation(
@@ -2390,21 +2478,20 @@ impl Agent {
         launch_rules: Vec<PermissionRule>,
     ) -> Result<ChatId, AgentError> {
         let _upgrade = self.inner.upgrade_gate.read().await;
-        let folder = self.admit_folder(folder)?;
-        if let Some(recorder) = &self.inner.recorder {
-            recorder.register_chat(id, folder.as_deref()).await?;
-        }
+        let inherited_directories = inherited
+            .as_ref()
+            .map(|inherited| inherited.metadata.ceiling.additional_directories.clone())
+            .unwrap_or_default();
         let mut snapshot = empty_snapshot(id, folder, ModelConfig::unselected());
-        let mut bookkeeping = ChatBookkeeping {
-            dependency_baseline: Some(
-                snapshot
-                    .folder
-                    .as_deref()
-                    .map(approval_context::dependency_fingerprints)
-                    .unwrap_or_default(),
-            ),
-            ..Default::default()
-        };
+        snapshot.additional_directories = inherited_directories;
+        let execution = self.admit_directories(&mut snapshot).await?;
+        let folder_in_environment = execution.folder_in_environment();
+        if let Some(recorder) = &self.inner.recorder {
+            recorder
+                .register_chat(id, snapshot.folder.as_deref())
+                .await?;
+        }
+        let mut bookkeeping = ChatBookkeeping::default();
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style, user_context, environment, announced_date) =
             if let Some(InheritedChat {
@@ -2438,8 +2525,11 @@ impl Agent {
                     announced_date,
                 )
             } else {
-                let (client, output_style) =
-                    self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
+                let (client, output_style) = self.apply_chat_defaults(
+                    &mut snapshot,
+                    &mut bookkeeping,
+                    folder_in_environment,
+                );
                 snapshot.policy.launch_rules = launch_rules;
                 (client, output_style, OnceLock::new(), OnceLock::new(), None)
             };
@@ -2452,12 +2542,30 @@ impl Agent {
             .await
             .entry(id)
             .or_default();
-        let (tools, execution) = self.create_chat_tools(&snapshot).await;
-        let skills = self.discover_skills(snapshot.folder.as_deref());
-        let file_history = snapshot
+        self.follow_admitted_directories(&execution, &mut snapshot)
+            .await?;
+        let tools = self.chat_tools_on(&snapshot, &execution);
+        let local_folder = snapshot
             .folder
             .as_deref()
-            .map(|folder| FileHistory::new(self.file_history_directory(id, folder)));
+            .filter(|_| !execution.folder_in_environment());
+        bookkeeping.dependency_baseline = Some(
+            local_folder
+                .map(approval_context::dependency_fingerprints)
+                .unwrap_or_default(),
+        );
+        bookkeeping.environment_folder = execution.folder_in_environment();
+        let skills = self.discover_skills(local_folder);
+        let file_history = snapshot.folder.as_deref().map(|folder| {
+            FileHistory::new(self.file_history_directory(
+                id,
+                folder,
+                execution.folder_in_environment(),
+            ))
+        });
+        if let Some(history) = &file_history {
+            history.protect_from(&tools);
+        }
         let mut chats = self.inner.chats.lock().await;
         if let Some(metadata) = &mut snapshot.delegation {
             let sessions = self.inner.session_permissions.lock().await;
@@ -2644,7 +2752,7 @@ impl Agent {
     }
 
     /// Checks that the user may invoke `name` in a new Chat with `folder`, before any Chat exists.
-    pub fn check_user_skill(
+    pub async fn check_user_skill(
         &self,
         folder: &Path,
         name: &str,
@@ -2656,15 +2764,26 @@ impl Agent {
                 "user Skill invocation is not available in this Chat".into(),
             ));
         }
-        self.discover_skills(Some(folder))
-            .expand(
-                name,
-                arguments,
-                tickloop_harness_policy::skills::SkillCaller::User,
-            )
-            .and_then(tickloop_harness_protocol::InvokedSkill::try_from)
-            .map(|_| ())
-            .map_err(|error| AgentError::Invalid(error.to_string()))
+        let mut snapshot = empty_snapshot(
+            tickloop_ids::generate().into(),
+            Some(folder.to_path_buf()),
+            ModelConfig::unselected(),
+        );
+        let execution = self.admit_directories(&mut snapshot).await?;
+        self.discover_skills(
+            snapshot
+                .folder
+                .as_deref()
+                .filter(|_| !execution.folder_in_environment()),
+        )
+        .expand(
+            name,
+            arguments,
+            tickloop_harness_policy::skills::SkillCaller::User,
+        )
+        .and_then(tickloop_harness_protocol::InvokedSkill::try_from)
+        .map(|_| ())
+        .map_err(|error| AgentError::Invalid(error.to_string()))
     }
 
     pub async fn has_skill(&self, chat_id: ChatId, name: &str) -> Result<bool, AgentError> {
@@ -2788,9 +2907,10 @@ impl Agent {
                 folder: snapshot.folder.clone(),
                 additional_directories: snapshot.additional_directories.clone(),
             };
-            let files: Arc<dyn tickloop_harness_tools::file_port::FileHost> = Arc::new(
-                environment::file_host::EnvironmentFileHost::new(chat.execution.clone()),
-            );
+            let files = chat
+                .tools
+                .workspace_file_host()
+                .ok_or_else(|| AgentError::Invalid(FOLDERLESS_CHAT.into()))?;
             (workspace, chat.tools.clone(), chat.ids, files)
         };
         // Each attachment is admitted as the Chat's own `Read` of it, prepared where the Chat's
@@ -3017,10 +3137,12 @@ impl Agent {
         let requested_receipt = receipt.clone();
         if trigger_source.is_none() {
             self.apply_pending_model(chat)?;
+            let execution = chat.execution.clone();
             recovery::before_resume(
                 &mut chat.snapshot,
                 loop_id,
                 self.inner.config_root.as_deref(),
+                &execution,
             )?;
         }
         if !chat.snapshot.accepts_images()
@@ -3278,7 +3400,7 @@ impl Agent {
             .lock()
             .await
             .get(&receipt.chat_id)
-            .is_some_and(|chat| chat.snapshot.folder.is_some())
+            .is_some_and(|chat| chat.local_folder().is_some())
             .then(|| {
                 crate::host_tools::current_workspace_host(
                     self.inner.host_tools.read().unwrap().as_deref(),
@@ -3630,9 +3752,10 @@ impl Agent {
         let current_session_operation = SessionPermissionOperation::from_normalized(
             operation.name.clone(),
             permission_input.clone(),
-            session_permissions::capture_workspace_scope(&configured_workspace_for_chat(
-                &chats[&receipt.chat_id],
-            ))
+            session_permissions::capture_workspace_scope(
+                &configured_workspace_for_chat(&chats[&receipt.chat_id]),
+                &chats[&receipt.chat_id].execution.files(),
+            )
             .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
@@ -4586,10 +4709,12 @@ impl Agent {
                     return Ok(RunAdmission::ValidateTrigger(Box::new(pending)));
                 }
             }
+            let execution = candidate.execution.clone();
             recovery::before_resume(
                 &mut candidate.snapshot,
                 pending.receipt.loop_id,
                 self.inner.config_root.as_deref(),
+                &execution,
             )?;
             candidate.snapshot.pending_inputs.remove(index);
             let mut merged_inputs = Vec::new();
@@ -5003,47 +5128,132 @@ impl Agent {
         folder: PathBuf,
         additional: Vec<PathBuf>,
     ) -> Result<(), AgentError> {
+        let _settings_gate = self.inner.settings_writes.lock().await;
+        self.set_working_directories_locked(chat_id, Some(folder), additional, None, false)
+            .await
+    }
+
+    /// Changes a root Chat's Folder and Additional Directories. In an Agent with an Execution
+    /// Environment a Chat can also gain a Folder or lose it (`folder: None`, with no Additional
+    /// Directories); the change is recorded as the Folder of the Chat's later Transcript entries.
+    /// A Folder only in the environment is taken as given and judged by the environment, one on
+    /// this machine must exist and be trusted.
+    ///
+    /// The Chat's next model request offers the tools and names the directories of the new
+    /// binding, in its `# Environment` section: a host whose directories change between turns
+    /// calls this before submitting the turn, and keeps them out of its system prompt addition.
+    /// Gaining, losing or moving the Folder between this machine and the environment replaces the
+    /// Chat's tools, so it waits until the Chat is idle with no command running.
+    pub async fn set_working_directories(
+        &self,
+        chat_id: ChatId,
+        folder: Option<PathBuf>,
+        additional: Vec<PathBuf>,
+    ) -> Result<(), AgentError> {
+        let _settings_gate = self.inner.settings_writes.lock().await;
+        self.set_working_directories_locked(chat_id, folder, additional, None, true)
+            .await
+    }
+
+    async fn set_working_directories_locked(
+        &self,
+        chat_id: ChatId,
+        folder: Option<PathBuf>,
+        additional: Vec<PathBuf>,
+        expected_revision: Option<u64>,
+        persist_local_change: bool,
+    ) -> Result<(), AgentError> {
         self.require_root_chat(chat_id, "change working directories")
             .await?;
-        require_folder(
-            &self
-                .inner
-                .chats
-                .lock()
-                .await
-                .get(&chat_id)
-                .ok_or(AgentError::NotFound)?
-                .snapshot,
-        )?;
-        let canonical = |path: PathBuf| -> Result<PathBuf, AgentError> {
-            let path = path
-                .canonicalize()
-                .map_err(|_| AgentError::Invalid("directory is unavailable".into()))?;
-            if !path.is_dir() {
-                return Err(AgentError::Invalid("path is not a directory".into()));
-            }
-            Ok(path)
-        };
-        let folder = canonical(folder)?;
-        let mut additional = additional
-            .into_iter()
-            .map(canonical)
-            .collect::<Result<Vec<_>, _>>()?;
+        if self.inner.environment.is_none() {
+            require_folder(
+                &self
+                    .inner
+                    .chats
+                    .lock()
+                    .await
+                    .get(&chat_id)
+                    .ok_or(AgentError::NotFound)?
+                    .snapshot,
+            )?;
+        }
+        if folder.is_none() && !additional.is_empty() {
+            return Err(AgentError::Invalid(
+                "Additional Directories need a Folder".into(),
+            ));
+        }
+        let mut candidate = empty_snapshot(chat_id, folder, ModelConfig::unselected());
+        candidate.additional_directories = additional;
+        candidate.additional_directories.sort();
+        candidate.additional_directories.dedup();
+        let execution = self.admit_directories(&mut candidate).await?;
+        let in_environment = execution.folder_in_environment();
+        let folder = candidate.folder;
+        let mut additional = candidate.additional_directories;
         additional.sort();
         additional.dedup();
-        self.require_working_directory_trust(&folder)?;
-        let _settings_gate = self.inner.settings_writes.lock().await;
-        let saved = self.load_user_settings(Some(folder.clone())).await?;
+        let local_folder = folder.clone().filter(|_| !in_environment);
+        let saved = match &local_folder {
+            Some(folder) => self.load_user_settings(Some(folder.clone())).await?,
+            None => None,
+        };
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let folder_changed = chat.snapshot.folder.as_ref() != Some(&folder);
-        let directory_changed =
-            folder_changed || chat.snapshot.additional_directories != additional;
-        if folder_changed {
+        if expected_revision.is_some_and(|revision| revision != chat.snapshot.policy.revision) {
+            return Err(AgentError::Busy);
+        }
+        let folder_changed = chat.snapshot.folder != folder;
+        let mut current_additional = chat.snapshot.additional_directories.clone();
+        current_additional.sort();
+        current_additional.dedup();
+        let directory_changed = folder_changed || current_additional != additional;
+        if expected_revision.is_some() && !directory_changed {
+            return Err(AgentError::Invalid(
+                "directory is already configured".into(),
+            ));
+        }
+        if !directory_changed && chat.execution.same_capabilities(&execution) {
+            return Ok(());
+        }
+        let place_changed = chat.snapshot.folder.is_some() != folder.is_some()
+            || (folder.is_some() && chat.execution.folder_in_environment() != in_environment);
+        if place_changed
+            && (chat.active.is_some()
+                || !chat.user_loops.is_empty()
+                || chat.snapshot.user_shells.iter().any(|shell| {
+                    matches!(
+                        shell.state,
+                        tickloop_harness_protocol::UserShellState::Queued
+                            | tickloop_harness_protocol::UserShellState::WaitingPermission
+                            | tickloop_harness_protocol::UserShellState::Background
+                            | tickloop_harness_protocol::UserShellState::Running
+                            | tickloop_harness_protocol::UserShellState::Cancelling
+                    )
+                })
+                || chat.snapshot.commands.iter().any(|command| {
+                    matches!(
+                        command.state,
+                        tickloop_harness_protocol::CommandState::Running
+                            | tickloop_harness_protocol::CommandState::Background
+                            | tickloop_harness_protocol::CommandState::Cancelling
+                    )
+                }))
+        {
+            return Err(AgentError::Busy);
+        }
+        if folder_changed || place_changed {
+            chat.bookkeeping.environment_folder = in_environment;
+            chat.snapshot.policy.plan_without_auto =
+                self.plan_without_auto(local_folder.as_deref());
             // Persistent rules belong to the working directory's partition: changing directories
-            // swaps in the new directory's persistent rules, while session rules are kept.
-            chat.skills = self.discover_skills(Some(&folder));
-            chat.snapshot.folder = Some(folder);
+            // swaps in the new directory's persistent rules, while session rules are kept. A
+            // Folder not on this machine belongs to no partition.
+            chat.skills = self.discover_skills(local_folder.as_deref());
+            if local_folder.is_none() {
+                chat.snapshot.policy.rules.retain(|rule| !rule.persistent);
+                chat.bookkeeping.persistent_rule_projects.clear();
+            }
+            chat.snapshot.folder = folder;
             if let Some(saved) = saved {
                 self.replace_persistent_rules(&mut chat.snapshot, &mut chat.bookkeeping, saved);
             }
@@ -5060,11 +5270,39 @@ impl Agent {
                 });
         }
         chat.snapshot.additional_directories = additional;
-        if directory_changed {
-            chat.snapshot.policy.revision += 1;
-            chat.execution
-                .follow(self.inner.environment.as_ref(), &chat.snapshot)
-                .await;
+        chat.execution.replace(&execution);
+        chat.bookkeeping.environment_folder = in_environment;
+        chat.snapshot.policy.revision += 1;
+        if place_changed {
+            chat.tools = self.chat_tools_on(&chat.snapshot, &chat.execution);
+            chat.watching_commands = false;
+            chat.watching_user_shells = false;
+            chat.environment = OnceLock::new();
+        }
+        if chat.file_history.is_none() {
+            chat.file_history = chat.snapshot.folder.as_deref().map(|folder| {
+                FileHistory::new(self.file_history_directory(chat_id, folder, in_environment))
+            });
+        }
+        if let Some(history) = &chat.file_history {
+            history.protect_from(&chat.tools);
+        }
+        if place_changed {
+            chat.user_context = OnceLock::new();
+            chat.environment = OnceLock::new();
+        }
+        if directory_changed || place_changed {
+            chat.bookkeeping.dependency_baseline = Some(
+                local_folder
+                    .as_deref()
+                    .map(approval_context::dependency_fingerprints)
+                    .unwrap_or_default(),
+            );
+            if (persist_local_change || in_environment || place_changed)
+                && let Some(recorder) = &self.inner.recorder
+            {
+                recorder.directories_changed(&chat.snapshot, &chat.bookkeeping);
+            }
         }
         self.save(&chat.snapshot);
         Ok(())

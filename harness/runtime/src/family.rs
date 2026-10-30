@@ -637,7 +637,8 @@ impl Agent {
         chat_id: ChatId,
         admission: &AttachmentAdmission,
     ) -> Result<(), AgentError> {
-        let snapshot = &chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot;
+        let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+        let snapshot = &chat.snapshot;
         let workspace = tickloop_harness_tools::Workspace {
             folder: snapshot.folder.clone(),
             additional_directories: snapshot.additional_directories.clone(),
@@ -673,8 +674,12 @@ impl Agent {
                 None,
             )
             .map_err(AgentError::Invalid)?;
-            let operation = SessionPermissionOperation::from_prepared(prepared, &workspace)
-                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            let operation = SessionPermissionOperation::from_prepared(
+                prepared,
+                &workspace,
+                &chat.execution.files(),
+            )
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
             let decision = sessions.evaluate(owner, &operation).decision;
             if snapshot
                 .policy

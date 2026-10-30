@@ -28,18 +28,31 @@ impl PermissionOwner {
     }
 }
 
+/// Capture each directory according to the placement reported by its bound root.
 pub(crate) fn capture_workspace_scope(
     workspace: &Workspace,
+    files: &crate::environment::FileCapabilities,
 ) -> Result<WorkspaceScope, SessionPermissionError> {
-    let folder = workspace
-        .folder
-        .as_deref()
-        .map(canonical_directory)
-        .transpose()?;
+    let directory = |path: &Path| {
+        let local = files
+            .roots()
+            .iter()
+            .find(|root| Path::new(&root.display_path) == path)
+            .map_or_else(
+                || files.folder().is_none_or(|root| root.local_path.is_some()),
+                |root| root.local_path.is_some(),
+            );
+        if local {
+            canonical_directory(path)
+        } else {
+            Ok(path.to_path_buf())
+        }
+    };
+    let folder = workspace.folder.as_deref().map(directory).transpose()?;
     let mut additional_directories = workspace
         .additional_directories
         .iter()
-        .map(|directory| canonical_directory(directory))
+        .map(|path| directory(path))
         .collect::<Result<BTreeSet<_>, _>>()?;
     if let Some(folder) = &folder {
         additional_directories.remove(folder);
@@ -79,11 +92,12 @@ impl SessionPermissionOperation {
     pub(crate) fn from_prepared(
         operation: &PreparedTool,
         configured_workspace: &Workspace,
+        files: &crate::environment::FileCapabilities,
     ) -> Result<Self, SessionPermissionError> {
         Self::from_normalized(
             operation.name.clone(),
             operation.input.clone(),
-            capture_workspace_scope(configured_workspace)?,
+            capture_workspace_scope(configured_workspace, files)?,
         )
     }
 
