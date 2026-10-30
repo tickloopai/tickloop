@@ -462,7 +462,7 @@ impl Agent {
                 .filter(|pending| {
                     inputs.contains(&pending.receipt.run_id) && is_user_prompt(pending)
                 })
-                .map(|pending| pending.input.as_str())
+                .map(crate::user_prompt_text)
                 .collect::<Vec<_>>()
                 .join("\n\n");
             (inputs.clone(), prompt)

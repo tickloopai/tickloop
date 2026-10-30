@@ -701,6 +701,18 @@ fn taken_elsewhere(chat: &Chat, pending: &PendingInput) -> Option<TriggerTake> {
         .then_some(TriggerTake::Waits)
 }
 
+/// The user's text in input order, excluding the material attached to the prompt.
+fn user_prompt_text(pending: &PendingInput) -> String {
+    std::iter::once(pending.input.as_str())
+        .chain(pending.contexts.iter().filter_map(|context| match context {
+            InputContext::PromptText { text } => Some(text.as_str()),
+            _ => None,
+        }))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The input queued to the Run `active`'s Loop that joins its conversation before the next model
 /// request, in queue order. Trigger input waits for the turn to end, user input queued behind a
 /// `!` command or slash command waits for it, and so do prompts a `UserPromptSubmit` hook held
@@ -3691,7 +3703,7 @@ impl Agent {
             let prompts = merging
                 .iter()
                 .filter(|pending| hooks::is_user_prompt(pending))
-                .map(|pending| (pending.receipt.run_id, pending.input.clone()))
+                .map(|pending| (pending.receipt.run_id, user_prompt_text(pending)))
                 .collect::<Vec<_>>();
             let merging = merging
                 .iter()

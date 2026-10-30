@@ -16,8 +16,8 @@ use tickloop_harness_protocol::hooks::{
     HookRunRecord, HookSource, HookTrust,
 };
 use tickloop_harness_protocol::{
-    AgentHostOptions, ChatId, Content, EventKind, ExecutionMode, GoalAction, GoalStatus, Message,
-    Receipt, Role, RunId,
+    AgentHostOptions, ChatId, Content, EventKind, ExecutionMode, GoalAction, GoalStatus,
+    InputContext, Message, Receipt, ResourceContext, Role, RunId,
 };
 use tickloop_harness_runtime::environment::memory::{MemoryCommandRun, MemoryEnvironment};
 use tickloop_harness_runtime::transcript::{JsonlTranscriptStore, TranscriptStore};
@@ -2864,5 +2864,209 @@ async fn prompt_hooks_preserve_a_finished_board_until_admission_then_allow_new_t
     assert!(board.revision > old_board.revision);
     assert_eq!(board.tasks.len(), 1);
     assert_eq!(board.tasks[0].title, "new task");
+    bench.agent.shutdown().await;
+}
+
+const BLOCKED_MIXED_TEXT: &str = "forbidden mixed prompt text";
+
+fn prompt_attachment() -> InputContext {
+    InputContext::Resource(ResourceContext {
+        uri: "test://reference".into(),
+        mime_type: Some("text/plain".into()),
+        name: Some("Reference".into()),
+        content: Some(BLOCKED_MIXED_TEXT.into()),
+    })
+}
+
+#[tokio::test]
+async fn prompt_hook_checks_all_user_text_before_and_after_attachments() {
+    for (main_text, expected) in [
+        (
+            "",
+            format!("{BLOCKED_MIXED_TEXT}\ntext after second attachment"),
+        ),
+        (
+            "text before attachment",
+            format!("text before attachment\n{BLOCKED_MIXED_TEXT}\ntext after second attachment"),
+        ),
+    ] {
+        let bench = Bench::start(
+            vec![text("must not answer")],
+            vec![user_hook(HookEvent::UserPromptSubmit, None, "mixed.sh")],
+        )
+        .await;
+        bench.define("mixed.sh", |input| {
+            if input["prompt"]
+                .as_str()
+                .unwrap()
+                .contains(BLOCKED_MIXED_TEXT)
+            {
+                exits(2, "", "prompt rejected")
+            } else {
+                exits(0, "", "")
+            }
+        });
+        let mut events = bench.agent.subscribe();
+        let receipt = bench
+            .agent
+            .submit_with_input_contexts(
+                bench.chat,
+                main_text.into(),
+                vec![
+                    prompt_attachment(),
+                    InputContext::PromptText {
+                        text: BLOCKED_MIXED_TEXT.into(),
+                    },
+                    prompt_attachment(),
+                    InputContext::PromptText {
+                        text: "text after second attachment".into(),
+                    },
+                ],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let observed = observe(&mut events, &receipt).await;
+        assert_eq!(bench.inputs_of("mixed.sh")[0]["prompt"], expected);
+        assert!(observed.failed.is_none() && !observed.interrupted);
+        assert!(
+            observed
+                .hook_runs
+                .iter()
+                .any(|run| run.outcome == HookRunOutcome::Blocking)
+        );
+        assert!(
+            bench.requests().is_empty(),
+            "blocked mixed input must never reach the model"
+        );
+        let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+        assert!(snapshot.messages.is_empty());
+        assert!(snapshot.message_contexts.is_empty());
+        bench.agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn prompt_hook_checks_queued_text_after_attachments_before_merging() {
+    let bench = Bench::start(
+        vec![
+            call("build", "Bash", json!({"command": "cargo build"})),
+            text("done"),
+        ],
+        vec![user_hook(HookEvent::UserPromptSubmit, None, "mixed.sh")],
+    )
+    .await;
+    bench
+        .environment
+        .define_shell("cargo build", Duration::ZERO, b"built".to_vec(), 0);
+    bench.define("mixed.sh", |input| {
+        if input["prompt"]
+            .as_str()
+            .unwrap()
+            .contains(BLOCKED_MIXED_TEXT)
+        {
+            exits(2, "", "prompt rejected")
+        } else {
+            exits(0, "", "")
+        }
+    });
+    let mut events = bench.agent.subscribe();
+    bench.gate.holds_next.store(true, Ordering::SeqCst);
+    let active = bench
+        .agent
+        .submit(bench.chat, "Build it.".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), bench.gate.entered.notified())
+        .await
+        .unwrap();
+    bench
+        .agent
+        .submit_with_input_contexts(
+            bench.chat,
+            "queued text before attachment".into(),
+            vec![
+                prompt_attachment(),
+                InputContext::PromptText {
+                    text: BLOCKED_MIXED_TEXT.into(),
+                },
+            ],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let safe = bench
+        .agent
+        .submit(bench.chat, "safe queued prompt".into())
+        .await
+        .unwrap();
+    bench.gate.release.notify_one();
+    let observed = observe(&mut events, &active).await;
+    let prompts = bench
+        .inputs_of("mixed.sh")
+        .into_iter()
+        .map(|input| input["prompt"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prompts,
+        [
+            json!("Build it."),
+            json!(format!(
+                "queued text before attachment\n{BLOCKED_MIXED_TEXT}"
+            )),
+            json!("safe queued prompt")
+        ]
+    );
+    assert!(observed.failed.is_none() && !observed.interrupted);
+    assert_eq!(observed.merged, [(safe.run_id, active.run_id)]);
+    let requests = bench.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(!format!("{requests:?}").contains(BLOCKED_MIXED_TEXT));
+    assert!(
+        conversation_texts(&requests[1].messages)
+            .iter()
+            .any(|text| text == "safe queued prompt")
+    );
+    let snapshot = bench.agent.snapshot(bench.chat).await.unwrap();
+    assert!(snapshot.queued_inputs().is_empty());
+    assert!(!format!("{:?}", snapshot.message_contexts).contains(BLOCKED_MIXED_TEXT));
+    bench.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn prompt_hook_sees_empty_text_for_attachment_only_input() {
+    let bench = Bench::start(
+        vec![text("read the attached material")],
+        vec![user_hook(HookEvent::UserPromptSubmit, None, "mixed.sh")],
+    )
+    .await;
+    bench.define("mixed.sh", |input| {
+        if input["prompt"]
+            .as_str()
+            .unwrap()
+            .contains(BLOCKED_MIXED_TEXT)
+        {
+            exits(2, "", "resource content must not be treated as a prompt")
+        } else {
+            exits(0, "", "")
+        }
+    });
+    let mut events = bench.agent.subscribe();
+    let receipt = bench
+        .agent
+        .submit_with_input_contexts(
+            bench.chat,
+            String::new(),
+            vec![prompt_attachment()],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let observed = observe(&mut events, &receipt).await;
+    assert!(observed.failed.is_none() && !observed.interrupted);
+    assert_eq!(bench.inputs_of("mixed.sh")[0]["prompt"], "");
+    let requests = bench.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(format!("{:?}", requests[0].messages).contains(BLOCKED_MIXED_TEXT));
     bench.agent.shutdown().await;
 }
