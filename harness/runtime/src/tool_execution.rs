@@ -2347,18 +2347,22 @@ impl Agent {
                                 ..operation.clone()
                             };
                             dispatched = true;
-                            self.dispatch_registered_tool(
-                                receipt,
-                                &dispatch_operation,
-                                registration
-                                    .as_ref()
-                                    .expect("registered local or Host tool"),
-                                prepared_local.as_ref(),
-                                DispatchContext {
-                                    watch_authority,
-                                    assistant_message_id,
-                                },
-                                cancel.clone(),
+                            // Task assignment dispatches SendMessage inside another tool call.
+                            // Keep the route future off both admission frames.
+                            Box::pin(
+                                self.dispatch_registered_tool(
+                                    receipt,
+                                    &dispatch_operation,
+                                    registration
+                                        .as_ref()
+                                        .expect("registered local or Host tool"),
+                                    prepared_local.as_ref(),
+                                    DispatchContext {
+                                        watch_authority,
+                                        assistant_message_id,
+                                    },
+                                    cancel.clone(),
+                                ),
                             )
                             .await
                         }
