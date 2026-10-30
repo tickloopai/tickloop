@@ -444,6 +444,7 @@
   {
     "kind": "hooks",
     "launch": {
+      "profile": "local",
       "folder": "/work/project",
       "config_root": "/home/user/.tickloop",
       "model": {
