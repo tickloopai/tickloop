@@ -107,6 +107,7 @@ mod system_prompt;
 mod tool_batch;
 mod tool_execution;
 pub mod tool_exposure;
+mod tool_input;
 mod tool_results;
 pub mod upgrade;
 mod web_fetch;

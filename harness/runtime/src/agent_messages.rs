@@ -826,8 +826,9 @@ impl Agent {
             true => Ok(()),
             false => self.make_durable(&[sender.chat_id, target_id]).await,
         };
-        let next = self
-            .next_run(target_id)
+        // Task assignment reaches this through a nested SendMessage call; keep Run admission
+        // off that stack.
+        let next = Box::pin(self.next_run(target_id))
             .await
             .map_err(|error| error.to_string())?;
         if let Some(next) = next {

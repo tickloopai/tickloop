@@ -13,7 +13,7 @@ use std::{
     path::Path,
 };
 
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -23,7 +23,9 @@ use crate::{
 };
 
 use super::{
-    FileReadState, Operation, READ_TOOL_NAME, ToolDefinition, ToolError, io_error, open_existing,
+    FileReadState, Operation, READ_TOOL_NAME, ToolDefinition, ToolError,
+    input::{parse_input, semantic_boolean},
+    io_error, open_existing,
     read::recorded_text,
 };
 use tickloop_harness_base::private_fs::{
@@ -174,10 +176,19 @@ pub(super) fn prepare_input(
         #[serde(default, deserialize_with = "semantic_boolean")]
         replace_all: bool,
     }
+    let (replacement, hint) = if name == EDIT_TOOL_NAME {
+        ("new_string", "pass \"\" to delete old_string")
+    } else {
+        ("content", "pass \"\" to write an empty file")
+    };
+    if input.is_object() && input.get(replacement).is_none_or(Value::is_null) {
+        return Err(ToolError::InvalidInput(format!(
+            "{replacement} is required; {hint}"
+        )));
+    }
     let mut normalized_input = input.clone();
     let (file_path, tool, change) = if name == EDIT_TOOL_NAME {
-        let parsed: EditInput = serde_json::from_value(input.clone())
-            .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+        let parsed: EditInput = parse_input(input)?;
         if parsed.old_string == parsed.new_string {
             return Err(ToolError::Rejected(IDENTICAL_STRINGS.into()));
         }
@@ -199,8 +210,7 @@ pub(super) fn prepare_input(
             }),
         )
     } else {
-        let parsed: WriteInput = serde_json::from_value(input.clone())
-            .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+        let parsed: WriteInput = parse_input(input)?;
         if parsed.content.len() > MAX_WRITE_BYTES {
             return Err(ToolError::InvalidInput(
                 "write content exceeds 8 MiB".into(),
@@ -223,29 +233,6 @@ pub(super) fn prepare_input(
         })),
         normalized_input,
     ))
-}
-
-/// Claude Code `semanticBoolean`: models occasionally quote booleans, so `"true"` and `"false"`
-/// count too.
-pub(super) fn semantic_boolean<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<bool, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum SemanticBoolean {
-        Boolean(bool),
-        Text(String),
-    }
-    match SemanticBoolean::deserialize(deserializer)? {
-        SemanticBoolean::Boolean(value) => Ok(value),
-        SemanticBoolean::Text(text) => match text.as_str() {
-            "true" => Ok(true),
-            "false" => Ok(false),
-            _ => Err(D::Error::custom(format!(
-                "expected a boolean, found {text:?}"
-            ))),
-        },
-    }
 }
 
 /// Binds the requested change to the file as it is now: validates it the way Claude Code's
