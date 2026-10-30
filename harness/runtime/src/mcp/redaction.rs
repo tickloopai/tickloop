@@ -88,12 +88,21 @@ impl Redactor {
                     .to_owned(),
             );
         }
+        #[cfg(feature = "test-support")]
+        super::test_pauses::wait(
+            super::test_pauses::PausePoint::RedactorBuild,
+            &entry.config.name,
+        );
         // OAuth tokens are long; avoid determinizing their encoded variants on rotation.
         let matcher = aho_corasick::AhoCorasick::builder()
             .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
             .build(variants)
             .expect("valid secret patterns");
         Some(Self { secrets, matcher })
+    }
+    /// Whether the redactor redacts `secret`.
+    pub(super) fn covers(&self, secret: &str) -> bool {
+        self.secrets.contains(secret)
     }
     pub(super) fn redact(&self, content: String) -> String {
         let normalizer = icu_normalizer::ComposingNormalizerBorrowed::new_nfc();

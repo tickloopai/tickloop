@@ -368,8 +368,16 @@ fn invalid_composition(has_environment: bool, options: &HarnessOptions) -> Optio
     if durable && !has_environment && tools.plan {
         return Some("durable Chats without a Folder have no plan mode");
     }
-    if durable && options.host.prompt_policy != PromptPolicy::DenyOnPrompt {
-        return Some("durable waits need a host that denies what would prompt");
+    if durable
+        && !matches!(
+            options.host.prompt_policy,
+            PromptPolicy::DenyOnPrompt | PromptPolicy::DurableApproval
+        )
+    {
+        return Some("durable waits need a host that denies what would prompt or approves durably");
+    }
+    if !durable && options.host.prompt_policy == PromptPolicy::DurableApproval {
+        return Some("Durable Approval needs durable waits");
     }
     None
 }
@@ -430,7 +438,7 @@ pub struct PersonWait {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersonWaitKind {
     Question,
-    /// Waits in this process only.
+    /// Waits durably under Durable Approval, and in this process only otherwise.
     Permission,
     /// Waits in this process only.
     UserShell,

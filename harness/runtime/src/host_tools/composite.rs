@@ -194,6 +194,9 @@ impl HostToolProvider for CompositeHostTools {
     fn has_tool_search(&self) -> bool {
         self.sources.iter().any(|source| source.has_tool_search())
     }
+    fn mcp_guidance(&self) -> Option<crate::tool_exposure::McpGuidance> {
+        self.sources.iter().find_map(|source| source.mcp_guidance())
+    }
     fn exposure_revisions(&self) -> std::collections::BTreeMap<String, u64> {
         self.sources
             .iter()

@@ -12,6 +12,8 @@ async fn a_token_expiring_within_thirty_seconds_is_renewed_and_saved() {
     let fixture = Fixture::new();
     fixture.server.issue_tokens_lasting(20);
     fixture.log_in().await;
+    let login = fixture.credentials.current().unwrap().login;
+    assert!(login.is_some(), "a login names itself");
     let first = fixture.credentials.current().unwrap().token.unwrap();
 
     let token = fixture
@@ -32,8 +34,20 @@ async fn a_token_expiring_within_thirty_seconds_is_renewed_and_saved() {
         renewal.form.get("resource"),
         Some(&fixture.server.resource())
     );
-    let saved = fixture.credentials.current().unwrap().token.unwrap();
-    assert_eq!(saved.access_token, token.secret());
+    let saved = fixture.credentials.current().unwrap();
+    assert_eq!(saved.token.unwrap().access_token, token.secret());
+    assert_eq!(saved.login, login, "a renewed token keeps its login");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_login_is_named_anew() {
+    let fixture = Fixture::new();
+    fixture.log_in().await;
+    let first = fixture.credentials.current().unwrap().login;
+    fixture.log_in().await;
+    let second = fixture.credentials.current().unwrap().login;
+    assert!(first.is_some() && second.is_some());
+    assert_ne!(first, second);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -274,4 +288,33 @@ async fn tokens_never_appear_in_debug_output_or_errors() {
         assert!(!text.contains(token.secret()), "{text}");
         assert!(!text.contains(&refresh_token), "{text}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn renewing_a_login_saved_without_a_name_names_it_once() {
+    let fixture = Fixture::new();
+    fixture.server.issue_tokens_lasting(20);
+    fixture.log_in().await;
+    let mut saved = fixture.credentials.current().unwrap();
+    saved.login = None;
+    fixture.credentials.replace(Some(saved));
+
+    fixture
+        .connector
+        .access_token(&fixture.cancellation)
+        .await
+        .unwrap();
+    let named = fixture.credentials.current().unwrap().login;
+    assert!(named.is_some(), "the renewal names the login");
+    fixture
+        .connector
+        .access_token(&fixture.cancellation)
+        .await
+        .unwrap();
+    assert_eq!(fixture.server.requests_to(TOKEN_PATH).len(), 3);
+    assert_eq!(
+        fixture.credentials.current().unwrap().login,
+        named,
+        "later renewals keep the name"
+    );
 }

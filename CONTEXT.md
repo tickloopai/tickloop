@@ -319,6 +319,9 @@ The process in which Jev, on technical failure or capacity problems, temporarily
 **Manual Approval Escalation**:
 Handing an operation to the user to decide after Automatic Approval is blocked; escalation does not create a standing Allow rule.
 
+**Durable Approval**:
+A durable host's human confirmation of a model tool call: the Run waits in the Transcript until the person allows or denies the call, whichever host instance holds the Chat then takes the answer, and an allowed call runs at most once. A third-party tool without a Permission Rule goes to the person rather than Automatic Approval; prompts other than a tool call's approval are denied.
+
 **Auto Denial Tracking**:
 The count of consecutive and cumulative valid automatic denials in the current Chat; reaching the threshold triggers Manual Approval Escalation. It is not counted per command or tool, and does not imply automatic retry.
 

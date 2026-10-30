@@ -170,6 +170,7 @@ fn wait_states(lines: &[Line]) -> Vec<String> {
             Line::Wait(entry) => Some(match &entry.state {
                 WaitState::Open => "open".to_string(),
                 WaitState::Resolved { .. } => "resolved".into(),
+                WaitState::Allowed { .. } => "allowed".into(),
                 WaitState::Appended => "appended".into(),
                 WaitState::Abandoned { reason } => format!("abandoned {reason:?}"),
             }),

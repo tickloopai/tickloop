@@ -41,6 +41,14 @@ pub enum Logout {
     NotLoggedIn,
 }
 
+/// A token with the saved login it belongs to, read together, so the login a token is taken up
+/// under is always the one it came from.
+#[derive(Clone, Debug)]
+pub struct SavedToken {
+    pub token: AccessToken,
+    pub credential: ConnectorCredential,
+}
+
 impl From<Cancelled> for TokenError {
     fn from(_: Cancelled) -> Self {
         Self::Cancelled
@@ -54,13 +62,30 @@ impl Connector {
         &self,
         cancellation: &CancellationToken,
     ) -> Result<AccessToken, TokenError> {
-        let token = self.saved_token(cancellation).await?;
+        self.saved_access_token(cancellation)
+            .await
+            .map(|saved| saved.token)
+    }
+
+    /// [`Self::access_token`], with the saved login it belongs to.
+    pub async fn saved_access_token(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<SavedToken, TokenError> {
+        let credential = cancellable(cancellation, self.credentials.load()).await??;
+        let token = self
+            .token_of(credential.clone())
+            .ok_or(TokenError::NeedsLogin)?;
+        let saved = |credential: Option<ConnectorCredential>| SavedToken {
+            token: AccessToken(token.access_token.clone()),
+            credential: credential.expect("a token implies a credential"),
+        };
         if !expires_soon(&token) {
-            return Ok(AccessToken(token.access_token));
+            return Ok(saved(credential));
         }
         if token.refresh_token().is_none() {
             return if now_seconds() < token.expires_at {
-                Ok(AccessToken(token.access_token))
+                Ok(saved(credential))
             } else {
                 Err(TokenError::NeedsLogin)
             };
@@ -75,6 +100,17 @@ impl Connector {
         rejected: &AccessToken,
         cancellation: &CancellationToken,
     ) -> Result<AccessToken, TokenError> {
+        self.renew_saved_rejected(rejected, cancellation)
+            .await
+            .map(|saved| saved.token)
+    }
+
+    /// [`Self::renew_rejected`], with the saved login the token belongs to.
+    pub async fn renew_saved_rejected(
+        &self,
+        rejected: &AccessToken,
+        cancellation: &CancellationToken,
+    ) -> Result<SavedToken, TokenError> {
         self.renew(rejected.secret(), cancellation).await
     }
 
@@ -107,14 +143,6 @@ impl Connector {
         Ok(outcome)
     }
 
-    async fn saved_token(
-        &self,
-        cancellation: &CancellationToken,
-    ) -> Result<OAuthToken, TokenError> {
-        let credential = cancellable(cancellation, self.credentials.load()).await??;
-        self.token_of(credential).ok_or(TokenError::NeedsLogin)
-    }
-
     /// The token of `credential` when it was granted for this server's address.
     fn token_of(&self, credential: Option<ConnectorCredential>) -> Option<OAuthToken> {
         credential
@@ -126,7 +154,7 @@ impl Connector {
         &self,
         seen_access_token: &str,
         cancellation: &CancellationToken,
-    ) -> Result<AccessToken, TokenError> {
+    ) -> Result<SavedToken, TokenError> {
         let _lock = cancellable(cancellation, self.credentials.lock()).await??;
         let credential = cancellable(cancellation, self.credentials.load()).await??;
         let resource = credential
@@ -136,7 +164,10 @@ impl Connector {
             .token_of(credential.clone())
             .ok_or(TokenError::NeedsLogin)?;
         if token.access_token != seen_access_token && !expires_soon(&token) {
-            return Ok(AccessToken(token.access_token));
+            return Ok(SavedToken {
+                token: AccessToken(token.access_token),
+                credential: credential.expect("a token implies a credential"),
+            });
         }
         let Some(refresh_token) = token.refresh_token().map(str::to_owned) else {
             self.forget_token(credential).await?;
@@ -158,15 +189,26 @@ impl Connector {
                 let access_token = renewed.access_token.clone();
                 let mut credential = credential.expect("a token implies a credential");
                 credential.token = Some(renewed);
+                // A login saved before logins were named is named once, by its first renewal
+                // under the lock, and keeps the name from then on.
+                credential
+                    .login
+                    .get_or_insert_with(|| tickloop_ids::generate().to_string());
                 self.credentials.save(&credential).await?;
-                Ok(AccessToken(access_token))
+                Ok(SavedToken {
+                    token: AccessToken(access_token),
+                    credential,
+                })
             }
             Err(RefreshError::Refused(code)) if code == INVALID_GRANT => {
                 let reread = self.credentials.load().await?;
                 if let Some(current) = self.token_of(reread.clone())
                     && current.refresh_token() != Some(refresh_token.as_str())
                 {
-                    return Ok(AccessToken(current.access_token));
+                    return Ok(SavedToken {
+                        token: AccessToken(current.access_token),
+                        credential: reread.expect("a token implies a credential"),
+                    });
                 }
                 self.forget_token(reread).await?;
                 Err(TokenError::NeedsLogin)

@@ -86,6 +86,7 @@ pub struct ExposureDirectory {
     tools: Vec<ExposureTool>,
     search_support: SearchSupport,
     unavailable_servers: Vec<UnavailableServer>,
+    mcp_place: String,
 }
 
 impl ExposureDirectory {
@@ -94,11 +95,18 @@ impl ExposureDirectory {
             tools,
             search_support,
             unavailable_servers: Vec::new(),
+            mcp_place: DEFAULT_MCP_PLACE.into(),
         }
     }
 
     pub fn with_unavailable_servers(mut self, servers: Vec<UnavailableServer>) -> Self {
         self.unavailable_servers = servers;
+        self
+    }
+
+    /// Tells the model where the host's users change a server's exposure.
+    pub fn with_mcp_guidance(mut self, guidance: &McpGuidance) -> Self {
+        self.mcp_place = guidance.place.clone();
         self
     }
 
@@ -115,7 +123,7 @@ impl ExposureDirectory {
 
     pub fn discovery_definitions(&self) -> Vec<ToolDefinition> {
         match self.search_support {
-            SearchSupport::Fold => fold_definitions(),
+            SearchSupport::Fold => fold_definitions_in(&self.mcp_place),
             SearchSupport::Native => Vec::new(),
         }
     }
@@ -569,11 +577,56 @@ pub fn fold_history_as_text(messages: &mut [Message], available: &[ToolDefinitio
 }
 
 pub fn fold_definitions() -> Vec<ToolDefinition> {
+    fold_definitions_in(DEFAULT_MCP_PLACE)
+}
+
+/// The tool search tools, telling the model that the user changes a server's exposure in
+/// `mcp_place`.
+fn fold_definitions_in(mcp_place: &str) -> Vec<ToolDefinition> {
     vec![
-        ToolDefinition { name: SEARCH_TOOLS.into(), description: "Find tools that are not listed directly: deferred tools and MCP tools. `query` holds space-separated words: tools matching any word are returned, best match first, and words in tool names count most. Forms: an exact tool name returns that tool; `mcp__<server>` lists all tools of that server; `select:A,B` picks up to 10 tools by exact name; `+word` requires that word, while the other words only rank. `limit` caps ranked matches (default 8, at most 10). Returns names, servers, short summaries and required parameter names. Use DescribeTools for full parameters, then ExecuteTools to call them. A server's exposure decides whether its tools are listed directly, found here or hidden (never callable); only the user changes it, in /mcp, and a change applies from your next request.".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}) },
+        ToolDefinition { name: SEARCH_TOOLS.into(), description: format!("Find tools that are not listed directly: deferred tools and MCP tools. `query` holds space-separated words: tools matching any word are returned, best match first, and words in tool names count most. Forms: an exact tool name returns that tool; `mcp__<server>` lists all tools of that server; `select:A,B` picks up to 10 tools by exact name; `+word` requires that word, while the other words only rank. `limit` caps ranked matches (default 8, at most 10). Returns names, servers, short summaries and required parameter names. Use DescribeTools for full parameters, then ExecuteTools to call them. A server's exposure decides whether its tools are listed directly, found here or hidden (never callable); only the user changes it, in {mcp_place}, and a change applies from your next request."), input_schema: json!({"type":"object","properties":{"query":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}) },
         ToolDefinition { name: DESCRIBE_TOOLS.into(), description: "Describe 1–5 deferred or MCP tools by exact name. Returns complete descriptions, original input schemas, reference-only server annotations of MCP tools and names not found. Use ExecuteTools to call tools.".into(), input_schema: json!({"type":"object","properties":{"names":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}},"required":["names"],"additionalProperties":false}) },
         ToolDefinition { name: EXECUTE_TOOLS.into(), description: "Execute 1–10 independent tool calls concurrently. Each call uses its own tool permissions and may wait for user confirmation. Results are returned in submission order with completed, error, denied, not_executed or unknown status. Calls cannot reference other results in the batch. Do not retry unknown outcomes automatically.".into(), input_schema: json!({"type":"object","properties":{"calls":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name","arguments"],"additionalProperties":false}}},"required":["calls"],"additionalProperties":false}) },
     ]
+}
+
+/// What the model is told to ask of the user when a server needs a login, given the server's
+/// name; the host decides it, since only the host knows where its users log in.
+pub type LoginGuidance = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// The terminal's login guidance: /mcp or `tickloop mcp login`.
+pub fn default_login_guidance(name: &str) -> String {
+    format!(
+        "ask the user to log in from /mcp or with `tickloop mcp login {name}`. Only the user can log in."
+    )
+}
+
+const DEFAULT_MCP_PLACE: &str = "/mcp";
+const DEFAULT_MCP_MANAGEMENT: &str = "MCP servers are added with `tickloop mcp add`, and /mcp logs them in or out, reconnects them, turns them off or on and changes their exposure (`e`)";
+
+/// What the model is told of where the host's users manage their MCP servers; the host decides
+/// it, since only the host knows its own settings. The default is the terminal's.
+#[derive(Clone)]
+pub struct McpGuidance {
+    /// What to ask of the user when a server needs a login.
+    pub login: LoginGuidance,
+    /// Where the user manages servers, such as `/mcp` or `Settings → Connectors`: where to ask
+    /// the user to manage a server that failed or is unsupported, to check one that needs
+    /// configuration, to change a server's exposure, and to log in.
+    pub place: String,
+    /// The system prompt's sentence on who adds, logs in and manages MCP servers, and where,
+    /// without a final period.
+    pub management: String,
+}
+
+impl Default for McpGuidance {
+    fn default() -> Self {
+        Self {
+            login: Arc::new(default_login_guidance),
+            place: DEFAULT_MCP_PLACE.into(),
+            management: DEFAULT_MCP_MANAGEMENT.into(),
+        }
+    }
 }
 
 /// What the model needs to know about a server's state, one short line for the MCP note: how the
@@ -586,7 +639,9 @@ pub fn server_status(
     exposure: ToolExposure,
     description: &str,
     has_instructions: bool,
+    guidance: &McpGuidance,
 ) -> Option<String> {
+    let place = &guidance.place;
     use tickloop_harness_protocol::mcp::McpServerState;
     Some(match state {
         McpServerState::Connected => {
@@ -601,17 +656,15 @@ pub fn server_status(
             }
         }
         McpServerState::Connecting => "connecting; its tools are not available yet, and an empty search result is not proof it has none.".to_owned(),
-        McpServerState::NeedsLogin => format!(
-            "needs login; ask the user to log in from /mcp or with `tickloop mcp login {name}`. Only the user can log in."
-        ),
+        McpServerState::NeedsLogin => format!("needs login; {}", (guidance.login)(name)),
         McpServerState::NeedsConfiguration => match source.strip_prefix("plugin:") {
             Some(plugin) => format!(
                 "needs configuration; ask the user to fill it in with the Configure action of plugin {plugin} in /plugins, or in /ticks when that plugin has a Tick program."
             ),
-            None => "needs configuration; ask the user to complete its entry in their MCP settings and check it in /mcp.".to_owned(),
+            None => format!("needs configuration; ask the user to complete its entry in their MCP settings and check it in {place}."),
         },
-        McpServerState::Failed => "failed; report it and ask the user to manage it in /mcp. A remote server retries a few times on its own; a local one stays stopped until the user reconnects it.".to_owned(),
-        McpServerState::Unsupported => "unsupported; report it and ask the user to manage it in /mcp.".to_owned(),
+        McpServerState::Failed => format!("failed; report it and ask the user to manage it in {place}. A remote server retries a few times on its own; a local one stays stopped until the user reconnects it."),
+        McpServerState::Unsupported => format!("unsupported; report it and ask the user to manage it in {place}."),
         McpServerState::Disabled => return None,
     })
 }
@@ -634,7 +687,74 @@ mod server_status_tests {
             exposure,
             "Team notes. More detail.",
             instructions,
+            &McpGuidance::default(),
         )
+    }
+
+    #[test]
+    fn a_host_tells_the_model_where_its_users_log_in() {
+        let login = server_status(
+            "notes",
+            "global",
+            &McpServerState::NeedsLogin,
+            ToolExposure::Direct,
+            "",
+            false,
+            &connectors(),
+        );
+        assert_eq!(
+            login.as_deref(),
+            Some("needs login; ask the user to reconnect notes in Settings → Connectors.")
+        );
+        for (state, said) in [
+            (
+                McpServerState::Failed,
+                "failed; report it and ask the user to manage it in Settings → Connectors.",
+            ),
+            (
+                McpServerState::Unsupported,
+                "unsupported; report it and ask the user to manage it in Settings → Connectors.",
+            ),
+            (
+                McpServerState::NeedsConfiguration,
+                "needs configuration; ask the user to complete its entry in their MCP settings and check it in Settings → Connectors.",
+            ),
+        ] {
+            let status = server_status(
+                "notes",
+                "global",
+                &state,
+                ToolExposure::Direct,
+                "",
+                true,
+                &connectors(),
+            )
+            .unwrap();
+            assert!(status.starts_with(said), "{status}");
+            assert!(!status.contains("/mcp"), "{status}");
+        }
+        let search = ExposureDirectory::new(Vec::new(), SearchSupport::Fold)
+            .with_mcp_guidance(&connectors())
+            .discovery_definitions()
+            .remove(0)
+            .description;
+        assert!(
+            search.contains("only the user changes it, in Settings → Connectors, and"),
+            "{search}"
+        );
+        assert!(!search.contains("/mcp"), "{search}");
+    }
+
+    fn connectors() -> McpGuidance {
+        McpGuidance {
+            login: Arc::new(|name: &str| {
+                format!("ask the user to reconnect {name} in Settings → Connectors.")
+            }),
+            place: "Settings → Connectors".into(),
+            management:
+                "Connectors are added, logged in and managed by the user in Settings → Connectors"
+                    .into(),
+        }
     }
 
     /// A connected server needs a line only when nothing else tells the model it exists.

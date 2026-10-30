@@ -81,7 +81,7 @@ impl crate::Agent {
                 {
                     return Err("MCP server startup denied by current permission policy".into());
                 }
-                if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt {
+                if self.other_prompt_policy() == PromptPolicy::DenyOnPrompt {
                     return Err("MCP server startup requires one-time human approval".into());
                 }
                 let revision = policy.revision;
@@ -128,6 +128,7 @@ impl crate::Agent {
                     receipt.chat_id,
                     request,
                     session_operation.clone(),
+                    None,
                     cancel.clone(),
                 )
                 .await;

@@ -3,7 +3,6 @@ use sha2::{Digest, Sha256};
 use tickloop_harness_protocol::mcp::ToolExposure;
 
 pub(super) struct Tool {
-    pub generation: u64,
     pub original: String,
     pub definition: Arc<ToolDefinition>,
     pub original_schema: Arc<Value>,
@@ -154,7 +153,6 @@ impl Entry {
             tools.insert(
                 definition.name.clone(),
                 Arc::new(Tool {
-                    generation,
                     original: tool.original,
                     definition: Arc::new(definition),
                     original_schema: Arc::new(original_schema),

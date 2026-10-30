@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::plan_auto::{agent_with_plan_setting, agent_with_plan_setting_and_subagents};
 
-async fn provider(server: &McpService, name: &str) -> (Arc<McpToolProvider>, String) {
+pub(crate) async fn provider(server: &McpService, name: &str) -> (Arc<McpToolProvider>, String) {
     provider_with_secrets(server, name, Vec::new()).await
 }
 

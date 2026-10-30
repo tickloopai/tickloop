@@ -273,8 +273,8 @@ impl RetainedFold {
                 Line::NestedCall(entry) => entry.operation.parent_call_id.as_ref().is_some_and(|parent| self.chain.keeps_nested_parent(entry.operation.run_id.into(), parent)),
                 Line::RecordedEdit(entry) => self.chain.keeps_tool_result(&entry.call_id),
                 Line::Wait(entry) => {
-                    matches!(entry.state, WaitState::Open | WaitState::Resolved { .. })
-                        || (matches!(entry.kind, tickloop_harness_transcript::WaitKind::Question { .. })
+                    matches!(entry.state, WaitState::Open | WaitState::Resolved { .. } | WaitState::Allowed { .. })
+                        || (matches!(entry.kind, tickloop_harness_transcript::WaitKind::Question { .. } | tickloop_harness_transcript::WaitKind::Permission { .. })
                             && self.chain.responses.contains(&entry.response_id))
                 }
                 _ => false,

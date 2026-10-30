@@ -53,6 +53,9 @@ pub struct PreparedHostCall {
     artifact_account: Option<ArtifactAccountContext>,
     policy_identity: Option<HostPolicyIdentity>,
     mcp_server: Option<String>,
+    /// A token-free identity of what the call reaches, which an approval given for it is bound
+    /// to: for an MCP call, the server's configuration and account and the tool as listed.
+    target: Option<String>,
     approval_facts: tickloop_harness_protocol::PreparedApprovalFacts,
     local_read: Option<(tickloop_harness_tools::PreparedTool, bool)>,
 }
@@ -91,6 +94,7 @@ impl PreparedHostCall {
             artifact_account: None,
             policy_identity: None,
             mcp_server: None,
+            target: None,
             local_read: None,
         }
     }
@@ -102,6 +106,15 @@ impl PreparedHostCall {
 
     pub(crate) fn mcp_server(&self) -> Option<&str> {
         self.mcp_server.as_deref()
+    }
+
+    pub(crate) fn with_target(mut self, target: String) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    pub(crate) fn target(&self) -> Option<&str> {
+        self.target.as_deref()
     }
 
     pub fn with_payload<T: Any + Send + Sync>(mut self, payload: T) -> Self {
@@ -440,6 +453,12 @@ pub trait HostToolProvider: Send + Sync {
 
     fn has_tool_search(&self) -> bool {
         false
+    }
+
+    /// What the model is told of where the user manages this provider's MCP servers; `None`
+    /// keeps the terminal's.
+    fn mcp_guidance(&self) -> Option<crate::tool_exposure::McpGuidance> {
+        None
     }
 
     /// How many times the user changed each MCP server's exposure, by server name. A Run lets

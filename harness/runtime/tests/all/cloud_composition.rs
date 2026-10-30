@@ -293,6 +293,17 @@ async fn eventually<T>(mut probe: impl AsyncFnMut() -> Option<T>) -> T {
 /// `deleting_a_scheduled_task_is_reviewed_under_the_cloud_composition`.
 #[tokio::test]
 async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_cloud_composition() {
+    every_catalog_tool_is_admitted_without_review_or_a_prompt(PromptPolicy::DenyOnPrompt).await;
+}
+
+/// Durable Approval asks a person only what would prompt: the built-in tools the host's rules
+/// allow never ask.
+#[tokio::test]
+async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_durable_approval() {
+    every_catalog_tool_is_admitted_without_review_or_a_prompt(PromptPolicy::DurableApproval).await;
+}
+
+async fn every_catalog_tool_is_admitted_without_review_or_a_prompt(prompt_policy: PromptPolicy) {
     let service = ArtifactService::start().await;
     service.control.skills_enabled.store(true, Ordering::SeqCst);
     let credentials = tempfile::tempdir().unwrap();
@@ -312,6 +323,10 @@ async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_clo
             // The cloud trusts the Agent's tasks, so the task CronCreate makes is CronUpdate's
             // to change; one waiting for confirmation would not change.
             trust_model_scheduled_tasks: true,
+            host: AgentHostOptions {
+                prompt_policy,
+                ..AgentHostOptions::product_defaults()
+            },
             ..cloud_options(durable_chat_host_rules())
         },
     );

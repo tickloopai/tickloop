@@ -113,6 +113,17 @@ pub enum DisplayBlock {
         questions: Vec<Question>,
         reply: Option<DisplayToolResult>,
     },
+    /// The approval a person was asked for under Durable Approval, after the tool call it is for.
+    /// The answer waits for it while its status waits for `request_id`; the call's own result
+    /// tells how it ended.
+    Permission {
+        request_id: Uuid,
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp_server: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_reason: Option<String>,
+    },
     /// A prompt that joined the answer at a tool boundary.
     FollowUp {
         prompt_id: Uuid,
@@ -538,6 +549,9 @@ impl DisplayProjector {
                     WaitKind::Question { request, .. } => Some(DisplayWait::Person {
                         request: request.id,
                     }),
+                    WaitKind::Permission { request, .. } => Some(DisplayWait::Person {
+                        request: request.id,
+                    }),
                     WaitKind::Subagent { child_chat, .. } => {
                         Some(DisplayWait::Member { chat: *child_chat })
                     }
@@ -615,6 +629,27 @@ impl DisplayProjector {
             }
         }
         for wait in self.waits.iter().filter(|wait| wait.response_id == id) {
+            if let WaitKind::Permission { request, .. } = &wait.kind
+                && let Some(call_id) = wait.resume.call_id()
+                && !node.blocks.iter().any(|block| {
+                    matches!(block,
+                    DisplayBlock::Permission { request_id, .. } if *request_id == request.id)
+                })
+                && let Some(call_index) = node.blocks.iter().position(|block| {
+                    matches!(block,
+                    DisplayBlock::ToolCall { call_id: called, .. } if called == call_id)
+                })
+            {
+                node.blocks.insert(
+                    call_index + 1,
+                    DisplayBlock::Permission {
+                        request_id: request.id,
+                        call_id: call_id.into(),
+                        mcp_server: request.mcp_server.clone(),
+                        approval_reason: request.approval_reason.clone(),
+                    },
+                );
+            }
             let WaitKind::Question { request, .. } = &wait.kind else {
                 continue;
             };

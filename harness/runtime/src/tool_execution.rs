@@ -418,7 +418,11 @@ impl ToolRegistry {
         let mut folded = std::collections::BTreeSet::new();
         let mut deferred = Vec::new();
         let mut user_exposure = crate::cache_prefix::UserExposure::default();
+        let mut mcp_guidance = crate::tool_exposure::McpGuidance::default();
         if let Some(provider) = host_provider.filter(|_| policy.artifacts) {
+            if let Some(guidance) = provider.mcp_guidance() {
+                mcp_guidance = guidance;
+            }
             if provider.has_tool_search()
                 || provider
                     .mcp_resource_servers()
@@ -469,7 +473,8 @@ impl ToolRegistry {
         if offers_search {
             let directory = Arc::new(
                 crate::tool_exposure::ExposureDirectory::new(discovery_tools, search_support(chat))
-                    .with_unavailable_servers(unavailable_servers),
+                    .with_unavailable_servers(unavailable_servers)
+                    .with_mcp_guidance(&mcp_guidance),
             );
             deferred = directory.deferred_tools();
             deferred.sort_by(|first, second| first.name.cmp(&second.name));
@@ -1631,6 +1636,18 @@ impl Agent {
                             | crate::host_tools::HostToolPermission::Confirmation
                     )
                 );
+            let prompt_policy = self.tool_prompt_policy();
+            let is_granted = decision == Decision::Check
+                && self
+                    .is_permission_granted(
+                        receipt,
+                        &operation,
+                        prepared_host_call
+                            .as_ref()
+                            .and_then(|call| call.mcp_server()),
+                        prepared_host_call.as_ref().and_then(|call| call.target()),
+                    )
+                    .await;
             let decision = match decision {
                 Decision::Deny => Decision::Deny,
                 _ if name == EXIT_PLAN_MODE_TOOL_NAME => Decision::Allow,
@@ -1648,11 +1665,23 @@ impl Agent {
                 {
                     Decision::Allow
                 }
+                // Durable Approval hands a third-party call no rule decides to a person, never to
+                // Auto review, and a call a person allowed while its Run waited is not reviewed
+                // again.
+                Decision::Check
+                    if is_granted
+                        || prompt_policy == PromptPolicy::DurableApproval
+                            && host_permission
+                                == Some(crate::host_tools::HostToolPermission::ThirdParty) =>
+                {
+                    Decision::Ask
+                }
                 other => other,
             };
-            let prompts_unavailable = decision == Decision::Ask
-                && self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt;
-            let mut decision = self.apply_prompt_policy_keeping_required_approval(
+            let prompts_unavailable =
+                decision == Decision::Ask && prompt_policy == PromptPolicy::DenyOnPrompt;
+            let mut decision = Self::apply_prompt_policy_keeping_required_approval(
+                prompt_policy,
                 decision,
                 explicit_ask
                     || matches!(
@@ -1746,6 +1775,10 @@ impl Agent {
                                 mcp_server: prepared_host_call
                                     .as_ref()
                                     .and_then(|call| call.mcp_server())
+                                    .map(str::to_owned),
+                                target: prepared_host_call
+                                    .as_ref()
+                                    .and_then(|call| call.target())
                                     .map(str::to_owned),
                             },
                             cancel.clone(),
@@ -2256,9 +2289,16 @@ impl Agent {
                             )
                         }
                     });
-                    if decision == Decision::Ask
-                        && self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt
+                    let prompt_policy = self.tool_prompt_policy();
+                    // A call a person allowed while its Run waited is not reviewed again.
+                    if decision == Decision::Check
+                        && self
+                            .is_permission_granted(receipt, &operation, None, None)
+                            .await
                     {
+                        decision = Decision::Ask;
+                    }
+                    if decision == Decision::Ask && prompt_policy == PromptPolicy::DenyOnPrompt {
                         deterministic_denial_reason =
                             Some(auto_mode::prompts_unavailable_message(&prepared.name));
                     }
@@ -2266,9 +2306,12 @@ impl Agent {
                         explicit_ask || prepared.requires_environment_approval();
                     let bypassed_by_unrestricted_host = !approval_required
                         && matches!(decision, Decision::Ask | Decision::Check)
-                        && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted;
-                    decision = self
-                        .apply_prompt_policy_keeping_required_approval(decision, approval_required);
+                        && prompt_policy == PromptPolicy::Unrestricted;
+                    decision = Self::apply_prompt_policy_keeping_required_approval(
+                        prompt_policy,
+                        decision,
+                        approval_required,
+                    );
                     if decision == Decision::Check {
                         let mut review_attempts = 0;
                         loop {
@@ -2388,6 +2431,7 @@ impl Agent {
                                         source: approval_source,
                                         reason: approval_reason,
                                         mcp_server: None,
+                                        target: None,
                                     },
                                     cancel.clone(),
                                 )
@@ -2428,7 +2472,7 @@ impl Agent {
                                 _ => DenialCategory::NoHuman,
                             }
                         } else if approval_source == PermissionApprovalSource::ExplicitAsk
-                            || self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt
+                            || prompt_policy == PromptPolicy::DenyOnPrompt
                         {
                             DenialCategory::NoHuman
                         } else {
@@ -2757,7 +2801,7 @@ impl Agent {
                 }
             }
             AutoReview::ContextLimit => {
-                if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt {
+                if self.tool_prompt_policy() == PromptPolicy::DenyOnPrompt {
                     self.emit_permission_check(
                         receipt,
                         Decision::Deny,
@@ -2816,9 +2860,7 @@ impl Agent {
                         .push(tickloop_harness_protocol::ApprovalDiagnostic::DenialLimit);
                 }
                 match limit_warning {
-                    Some(_)
-                        if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt =>
-                    {
+                    Some(_) if self.tool_prompt_policy() == PromptPolicy::DenyOnPrompt => {
                         let mut reason = auto_mode::HEADLESS_DENIAL_LIMIT_ERROR.to_owned();
                         if let Some(warning) = self
                             .log_auto_review(

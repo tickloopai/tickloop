@@ -18,20 +18,14 @@ pub(super) fn directory(
     server: &str,
     tools: Vec<rmcp::model::Tool>,
 ) -> (BTreeMap<String, Tool>, Vec<String>) {
-    let mut names = BTreeMap::<String, usize>::new();
-    for tool in &tools {
-        *names.entry(normalize(server, &tool.name)).or_default() += 1;
-    }
+    let mut names = tool_names(server, tools.iter().map(|tool| tool.name.as_ref()));
     let mut directory = BTreeMap::new();
     let mut warnings = Vec::new();
     for tool in tools {
         let original = tool.name.to_string();
-        let normalized = normalize(server, &original);
-        let name = if normalized.len() > 64 || names[&normalized] > 1 {
-            hashed_name(server, &original)
-        } else {
-            normalized
-        };
+        let name = names
+            .remove(&original)
+            .unwrap_or_else(|| hashed_name(server, &original));
         let schema = Value::Object((*tool.input_schema).clone());
         let flattened = flatten(schema.clone()).filter(|schema| schema["type"] == "object");
         let is_flattened = flattened.is_some();
@@ -69,6 +63,33 @@ pub(super) fn directory(
     }
     (directory, warnings)
 }
+/// The names the model is given for the tools `tools` of the server `server`, by original name,
+/// as its catalog gives them: `mcp__<server>__<tool>` with the tool's name normalized, or a
+/// hashed name when that is longer than 64 bytes or two of the tools would share it. A host that
+/// writes rules for a server's tools before it connects names them this way.
+pub fn tool_names<'a>(
+    server: &str,
+    tools: impl IntoIterator<Item = &'a str>,
+) -> BTreeMap<String, String> {
+    let tools = tools.into_iter().collect::<Vec<_>>();
+    let mut uses = BTreeMap::<String, usize>::new();
+    for tool in &tools {
+        *uses.entry(normalize(server, tool)).or_default() += 1;
+    }
+    tools
+        .into_iter()
+        .map(|tool| {
+            let normalized = normalize(server, tool);
+            let name = if normalized.len() > 64 || uses[&normalized] > 1 {
+                hashed_name(server, tool)
+            } else {
+                normalized
+            };
+            (tool.to_owned(), name)
+        })
+        .collect()
+}
+
 fn normalize(server: &str, tool: &str) -> String {
     format!(
         "mcp__{server}__{}",

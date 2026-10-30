@@ -45,6 +45,7 @@ pub(super) struct Opened {
 
 /// After the server rejected the connection's token: renews it on the same connection when the
 /// login allows, waits for a new login when it does not, and otherwise opens the connection again.
+/// A host's login was already asked for a new token by the request itself.
 pub(super) async fn authentication_rejected(
     entry: &Entry,
     connection: &Connection,
@@ -56,23 +57,36 @@ pub(super) async fn authentication_rejected(
     let token = entry.token.read().unwrap().clone();
     let renewed = match (&entry.connector, token) {
         (Some(connector), Some(token)) if !http.insufficient_scope() => {
-            connector.renew_rejected(&token, cancel).await.ok()
+            connector.renew_saved_rejected(&token, cancel).await.ok()
         }
         _ => None,
     };
-    // Remember invalidation too: a deleted token is not a new login on the next request.
-    if let Some(credentials) = &entry.credentials
-        && let Ok(credential) = credentials.load().await
-    {
-        entry.remember_credential(credential);
+    // A token of another login is not taken up here: that login waits for an entry of its own.
+    if renewed.is_some_and(|saved| entry.take_up_token(saved, Some(connection))) {
+        return;
     }
-    if let Some(token) = renewed {
-        http.set_token(token.secret());
-        entry.remember_token(token);
-    } else if entry.connector.is_some() && !cancel.is_cancelled() {
-        *entry.state.write().unwrap() = McpServerState::NeedsLogin;
+    remember_invalidation(entry).await;
+    if entry.logs_in() && !cancel.is_cancelled() {
+        entry.needs_login_on(connection);
     } else {
         connection.lost.cancel();
+    }
+}
+
+/// Remembers the entry's saved login as it stands after its token could not be used, such as
+/// with the token deleted, so that the next reconcile does not take it for a new login. Another
+/// login is left for an entry of its own.
+pub(super) async fn remember_invalidation(entry: &Entry) {
+    if let Some(credentials) = &entry.credentials
+        && let Ok(Some(credential)) = credentials.load().await
+        && entry.takes_up(&credential)
+    {
+        #[cfg(feature = "test-support")]
+        super::test_pauses::wait(
+            super::test_pauses::PausePoint::Invalidation,
+            &entry.config.name,
+        );
+        entry.take_up_credential(credential);
     }
 }
 
@@ -96,6 +110,7 @@ pub(super) enum Served {
 pub(super) fn tool_list_key(
     config: &McpServerConfig,
     credential: Option<&ConnectorCredential>,
+    bearer: Option<&Bearer>,
 ) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut identity = config.clone();
@@ -108,7 +123,14 @@ pub(super) fn tool_list_key(
         McpTransport::Stdio { env, .. } => env.values_mut().for_each(String::clear),
         _ => {}
     }
-    let account = credential.map(|saved| (&saved.server_url, &saved.registration.client_id));
+    let account = credential
+        .map(|saved| {
+            (
+                saved.server_url.as_str(),
+                saved.registration.client_id.as_str(),
+            )
+        })
+        .or_else(|| bearer.map(|bearer| ("host", bearer.account.as_str())));
     Sha256::digest(serde_json::to_vec(&(identity, account)).expect("configuration serializes"))
         .into()
 }
@@ -198,25 +220,31 @@ pub(super) async fn connect(
             .acquire()
             .await
             .map_err(|_| "MCP connection cancelled")?;
+        if let Some(bearer) = &entry.bearer {
+            match bearer.source.bearer().await {
+                Ok(Some(token)) if !token.is_empty() && !bearer.was_rejected(&token) => {}
+                Ok(_) => return Err(OpenFailure::LoginRequired(None)),
+                Err(_) => return Err(OpenFailure::CredentialUnavailable),
+            }
+        }
         if entry.has_saved_token()
             && let Some(connector) = &entry.connector
         {
             authenticating.store(true, Ordering::SeqCst);
-            let token = connector.access_token(&entry.cancel).await;
-            if let Some(credentials) = &entry.credentials {
-                entry.remember_credential(
-                    credentials
-                        .load()
-                        .await
-                        .map_err(|_| OpenFailure::CredentialUnavailable)?,
-                );
-            }
-            entry.remember_token(token.map_err(|error| match error {
-                TokenError::NeedsLogin | TokenError::RenewalFailed => {
-                    OpenFailure::LoginRequired(None)
+            let saved = match connector.saved_access_token(&entry.cancel).await {
+                Ok(saved) => saved,
+                Err(error) => {
+                    remember_invalidation(entry).await;
+                    return Err(match error {
+                        TokenError::NeedsLogin | TokenError::RenewalFailed => {
+                            OpenFailure::LoginRequired(None)
+                        }
+                        _ => OpenFailure::CredentialUnavailable,
+                    });
                 }
-                _ => OpenFailure::CredentialUnavailable,
-            })?);
+            };
+            // A new connection may carry another login: what its calls reach changes with it.
+            entry.adopt_token(saved);
         }
         authenticating.store(false, Ordering::SeqCst);
         let token = entry.token.read().unwrap().clone();
@@ -235,25 +263,17 @@ pub(super) async fn connect(
             return Err(rejected);
         };
         authenticating.store(true, Ordering::SeqCst);
-        let renewed = connector.renew_rejected(&token, &entry.cancel).await;
-        if let Some(credentials) = &entry.credentials {
-            entry.remember_credential(
-                credentials
-                    .load()
-                    .await
-                    .map_err(|_| OpenFailure::CredentialUnavailable)?,
-            );
-        }
-        let renewed = renewed.map_err(|_| rejected)?;
-        entry.remember_token(renewed.clone());
+        let renewed = match connector.renew_saved_rejected(&token, &entry.cancel).await {
+            Ok(renewed) => renewed,
+            Err(_) => {
+                remember_invalidation(entry).await;
+                return Err(rejected);
+            }
+        };
+        let secret = renewed.token.secret().to_owned();
+        entry.adopt_token(renewed);
         authenticating.store(false, Ordering::SeqCst);
-        open(
-            entry,
-            Some(renewed.secret().to_owned()),
-            environment,
-            stderr_directory,
-        )
-        .await
+        open(entry, Some(secret), environment, stderr_directory).await
     };
     let result = tokio::select! {
         _ = entry.cancel.cancelled() => return Attempt::Cancelled,
@@ -261,7 +281,7 @@ pub(super) async fn connect(
     };
     match result {
         Ok(Ok(opened)) => Attempt::Opened(Box::new(opened)),
-        Ok(Err(failure)) if failure.needs_login() && entry.connector.is_some() => {
+        Ok(Err(failure)) if failure.needs_login() && entry.logs_in() => {
             Attempt::NeedsLogin(failure.into_reason())
         }
         Ok(Err(failure)) => Attempt::Failed(failure.into_reason()),
@@ -285,11 +305,15 @@ pub(super) async fn serve(
         warnings,
     } = *opened;
     let connection = Arc::new(connection);
-    *entry.connection.write().unwrap() = Some(connection.clone());
-    entry.adopt_tools(tools, warnings);
-    *entry.failure.write().unwrap() = None;
-    entry.reconnecting.store(false, Ordering::SeqCst);
-    *entry.state.write().unwrap() = McpServerState::Connected;
+    {
+        // Under the login switch, so a stale failure of the old connection cannot follow it.
+        let _switch = entry.login_switch.lock().unwrap();
+        *entry.connection.write().unwrap() = Some(connection.clone());
+        entry.adopt_tools(tools, warnings);
+        *entry.failure.write().unwrap() = None;
+        entry.reconnecting.store(false, Ordering::SeqCst);
+        *entry.state.write().unwrap() = McpServerState::Connected;
+    }
     state_changed.notify_waiters();
     let stop = service.cancellation_token();
     let mut waiting = Box::pin(service.waiting());
@@ -465,12 +489,25 @@ async fn open(
     let (service, http) = match &config.transport {
         McpTransport::Http { url, headers } => {
             let endpoint = reqwest::Url::parse(url).map_err(|_| "invalid MCP URL")?;
-            let http = McpHttpClient::for_server(
+            let mut http = McpHttpClient::for_server(
                 endpoint,
                 headers,
                 token.clone(),
                 Duration::from_millis(config.timeout_ms),
+                entry.reach,
             )?;
+            if let Some(bearer) = &entry.bearer {
+                let remember_entry = Arc::downgrade(entry);
+                http = http.with_host_bearer(crate::mcp_http::ConnectionBearer {
+                    source: bearer.source.clone(),
+                    sending: Arc::new(move |token| {
+                        if let Some(entry) = remember_entry.upgrade() {
+                            entry.remember_host_token(token);
+                        }
+                    }),
+                    rejected: bearer.rejected.clone(),
+                });
+            }
             let redact_entry = Arc::downgrade(entry);
             let http =
                 http.with_probe(probe.clone())

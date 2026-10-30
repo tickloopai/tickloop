@@ -42,6 +42,7 @@ async fn discover_classification_accepts_modern_results_and_retries_supported_ve
             let connections = McpConnections::new(
                 HostCapabilities {
                     local_processes: true,
+                    ..Default::default()
                 },
                 BTreeMap::new(),
                 std::env::vars().collect(),
@@ -121,6 +122,7 @@ async fn discover_classification_falls_back_for_legacy_responses_over_http_sse_a
             let connections = McpConnections::new(
                 HostCapabilities {
                     local_processes: true,
+                    ..Default::default()
                 },
                 BTreeMap::new(),
                 std::env::vars().collect(),
@@ -293,6 +295,7 @@ async fn probe_network_errors_and_timeouts_do_not_fall_back_over_http_but_stdio_
             let connections = McpConnections::new(
                 HostCapabilities {
                     local_processes: true,
+                    ..Default::default()
                 },
                 BTreeMap::new(),
                 std::env::vars().collect(),
@@ -339,6 +342,7 @@ async fn legacy_verdict_survives_reconnect_and_failed_initialize_but_changes_wit
         let connections = McpConnections::new(
             HostCapabilities {
                 local_processes: true,
+                ..Default::default()
             },
             BTreeMap::new(),
             std::env::vars().collect(),
@@ -398,6 +402,7 @@ async fn legacy_initialize_versions_keep_negotiated_headers_and_stdio_routing() 
             let connections = McpConnections::new(
                 HostCapabilities {
                     local_processes: true,
+                    ..Default::default()
                 },
                 BTreeMap::new(),
                 std::env::vars().collect(),
@@ -786,6 +791,7 @@ async fn stdio_connection_refreshes_notified_tools_and_shuts_down() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         std::env::vars().collect(),
@@ -1265,7 +1271,7 @@ async fn credentials_are_removed_from_catalogs_and_encoded_result_text() {
         json!({"content":[{"type":"text","text":"private/token+value private%2Ftoken%2Bvalue"}]}),
     );
     let credentials = Arc::new(InMemoryCredentials::default());
-    credentials.replace(Some(tickloop_harness_runtime::mcp::ConnectorCredential {
+    credentials.replace(Some(tickloop_harness_runtime::mcp::ConnectorCredential { login: None,
         server_url:server.url(),
         registration:tickloop_harness_connector::ClientRegistration {authorization_server:server.url(),client_id:"fixture".into(),redirect_uri:"http://localhost/callback".into()},
         resource:None,
@@ -1486,6 +1492,7 @@ for line in sys.stdin:
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         std::env::vars().collect(),
@@ -1557,6 +1564,7 @@ async fn bearer_scheme_spelling_and_stdio_arguments_do_not_expose_tokens() {
         let connections = McpConnections::new(
             HostCapabilities {
                 local_processes: true,
+                ..Default::default()
             },
             BTreeMap::new(),
             std::env::vars().collect(),
@@ -1601,7 +1609,7 @@ async fn credential_renewal_does_not_block_background_connection_startup() {
         std::future::pending::<()>().await;
     });
     let credentials = Arc::new(InMemoryCredentials::default());
-    credentials.replace(Some(tickloop_harness_runtime::mcp::ConnectorCredential {
+    credentials.replace(Some(tickloop_harness_runtime::mcp::ConnectorCredential { login: None,
         server_url:server.url(),
         registration:tickloop_harness_connector::ClientRegistration {authorization_server:endpoint.clone(),client_id:"fixture".into(),redirect_uri:"http://localhost/callback".into()},
         resource:None,
@@ -2062,7 +2070,7 @@ async fn renewal_timing_out_at_the_connection_deadline_requires_login() {
     }
     let server = McpService::start().await;
     let credentials = Arc::new(StalledCredentials::default());
-    credentials.inner.replace(Some(ConnectorCredential {
+    credentials.inner.replace(Some(ConnectorCredential { login: None,
         server_url:server.url(), registration:tickloop_harness_connector::ClientRegistration {authorization_server:server.url(),client_id:"client".into(),redirect_uri:"http://localhost/callback".into()}, resource:None,
         token:Some(serde_json::from_value(json!({"access_token":"expired-access","refresh_token":"expired-refresh","token_type":"Bearer","issuer":server.url(),"expires_at":0,"client_id":"client","token_endpoint":server.url()})).unwrap()),
     }));
@@ -2110,7 +2118,7 @@ async fn shutdown_releases_host_credentials_and_numeric_credentials_preserve_rpc
     server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}},{"name":"v1_probe","inputSchema":{"type":"object"}}]));
     let credentials = Arc::new(InMemoryCredentials::default());
     let released = Arc::downgrade(&credentials);
-    credentials.replace(Some(tickloop_harness_connector::ConnectorCredential {
+    credentials.replace(Some(tickloop_harness_connector::ConnectorCredential { login: None,
         server_url:server.url(), resource:None,
         registration:tickloop_harness_connector::ClientRegistration{authorization_server:server.url(),client_id:"client".into(),redirect_uri:"http://localhost/callback".into()},
         token:Some(serde_json::from_value(json!({"access_token":"1","token_type":"Bearer","issuer":server.url(),"expires_at":u64::MAX,"client_id":"client","token_endpoint":server.url()})).unwrap()),
@@ -2320,6 +2328,7 @@ async fn service_instructions_and_summary_redact_secrets_through_the_host_provid
             let connections = McpConnections::new(
                 HostCapabilities {
                     local_processes: true,
+                    ..Default::default()
                 },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -2361,6 +2370,7 @@ async fn service_instructions_redact_secrets_before_the_length_limit() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -2401,6 +2411,7 @@ async fn tool_descriptions_redact_secrets_before_the_length_limit() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -2478,6 +2489,7 @@ async fn discovery_resources_and_failures_redact_server_text() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -2643,6 +2655,7 @@ async fn reading_states_leaves_a_failed_server_failed_with_its_reason() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -2800,6 +2813,7 @@ async fn stdio_secrets_stay_redacted_before_sdk_logging_without_weakening_valida
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         Default::default(),
         std::env::vars().collect(),
@@ -3128,7 +3142,7 @@ async fn mcp_catalog_performance_scenario() {
         preparation.iter().max().unwrap()
     );
     let secret = "replacement/token+value".repeat(75);
-    let credential = tickloop_harness_runtime::mcp::ConnectorCredential {
+    let credential = tickloop_harness_runtime::mcp::ConnectorCredential { login: None,
         server_url: server.url(),
         registration: tickloop_harness_connector::ClientRegistration {
             authorization_server: server.url(), client_id: "fixture".into(), redirect_uri: "http://localhost/callback".into(),
@@ -3182,7 +3196,7 @@ async fn catalog_notifications_and_credentials_rebuild_only_the_changed_server()
     unchanged.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
     let credentials = Arc::new(InMemoryCredentials::default());
     let saved = |secret: &str| {
-        tickloop_harness_runtime::mcp::ConnectorCredential {
+        tickloop_harness_runtime::mcp::ConnectorCredential { login: None,
         server_url: server.url(),
         registration: tickloop_harness_connector::ClientRegistration { authorization_server: server.url(), client_id: "fixture".into(), redirect_uri: "http://localhost/callback".into() },
         resource: None,
@@ -3435,4 +3449,127 @@ async fn model_requests_and_tick_artifact_mcp_calls_reuse_third_party_catalogs()
     assert_eq!(native.0.load(Ordering::SeqCst), 31);
     assert_eq!(agent.mcp_performance_counts(), before);
     agent.shutdown().await;
+}
+
+/// How a login saved before logins were named meets the server at first connect.
+#[derive(Clone, Copy, Debug)]
+enum LegacyLogin {
+    /// Its token has expired.
+    Expired,
+    /// The server rejects its token.
+    Rejected,
+    /// Its token, like every one the authorization server issues, lasts 20 seconds, inside the
+    /// renewal window.
+    ShortLived,
+}
+
+/// A login saved before logins were named connects at its first attempt: the renewal names it,
+/// and the connection takes the named login up, without another attempt or a loop.
+#[tokio::test]
+async fn a_legacy_saved_login_connects_at_its_first_attempt() {
+    use tick_oauth_test_server::{AuthorizationServer, METADATA_PATH, TOKEN_PATH};
+    use tickloop_harness_connector::{Connector, OAuthSettings};
+    use tickloop_harness_runtime::mcp::ConnectionEvent;
+    for legacy in [
+        LegacyLogin::Expired,
+        LegacyLogin::Rejected,
+        LegacyLogin::ShortLived,
+    ] {
+        let server = McpService::start().await;
+        let authorization = AuthorizationServer::start();
+        let credentials = Arc::new(InMemoryCredentials::default());
+        let cancel = CancellationToken::new();
+        let metadata = format!("{}{METADATA_PATH}", authorization.issuer());
+        if matches!(legacy, LegacyLogin::ShortLived) {
+            authorization.issue_tokens_lasting(20);
+        }
+        let connector = Connector::new(
+            &server.url(),
+            OAuthSettings {
+                authorization_server_metadata_url: Some(metadata.clone()),
+                ..Default::default()
+            },
+            credentials.clone(),
+        )
+        .unwrap();
+        let login = connector.start_login(None, &cancel).await.unwrap();
+        login
+            .paste()
+            .submit(&authorization.approve(login.authorization_url()))
+            .unwrap();
+        login.finish(&cancel).await.unwrap();
+        let mut saved = credentials.current().unwrap();
+        saved.login = None;
+        if matches!(legacy, LegacyLogin::Expired) {
+            saved.token.as_mut().unwrap().expires_at = 0;
+        }
+        credentials.replace(Some(saved));
+        // Short-lived tokens are renewed at each connection, so no single one is required.
+        if !matches!(legacy, LegacyLogin::ShortLived) {
+            server.require_bearer("access-2");
+        }
+        server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+        let configs = vec![McpServerConfig {
+            exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
+            tool_exposure: Vec::new(),
+            description: String::new(),
+            sensitive_values: Vec::new(),
+            disabled: false,
+            name: "remote".into(),
+            source: "global".into(),
+            transport: McpTransport::Http {
+                url: server.url(),
+                headers: Default::default(),
+            },
+            timeout_ms: 1000,
+            oauth: tickloop_harness_protocol::mcp::McpOAuthConfig {
+                authorization_server_metadata_url: Some(metadata),
+                ..Default::default()
+            },
+        }];
+        let connections = McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::from([(
+                "remote".into(),
+                credentials.clone() as Arc<dyn tickloop_harness_connector::ConnectorCredentials>,
+            )]),
+            Default::default(),
+        );
+        connections.reconcile(configs).await;
+        wait_for_state(&connections, "remote", McpServerState::Connected).await;
+        // Long enough for another round of connection attempts to show.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let attempts = connections
+            .connection_events("remote")
+            .iter()
+            .filter(|(event, _)| *event == ConnectionEvent::Attempt)
+            .count();
+        assert_eq!(attempts, 1, "{legacy:?}: connected at the first attempt");
+        assert_eq!(
+            connections.snapshot()[0].state,
+            McpServerState::Connected,
+            "{legacy:?}"
+        );
+        assert!(
+            credentials.current().unwrap().login.is_some(),
+            "{legacy:?}: the renewal names the login"
+        );
+        let renewals = authorization.requests_to(TOKEN_PATH).len() - 1;
+        let most = if matches!(legacy, LegacyLogin::ShortLived) {
+            2
+        } else {
+            1
+        };
+        assert!(
+            renewals <= most,
+            "{legacy:?}: {renewals} renewals, not a loop of them"
+        );
+        assert!(matches!(
+            connections
+                .call("mcp__remote__probe", json!({}), cancel.clone())
+                .await,
+            HostCallResult::Completed(_)
+        ));
+        connections.shutdown().await;
+    }
 }

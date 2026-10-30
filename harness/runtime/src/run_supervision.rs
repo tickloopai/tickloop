@@ -27,6 +27,8 @@ pub(super) fn clear_run_state(chat: &mut Chat, run: RunId) {
     chat.parked.remove(&run);
     chat.releases.remove(&run);
     chat.ready_runs.retain(|id| *id != run);
+    chat.permission_grants
+        .retain(|(granted_run, _), _| *granted_run != run);
 }
 
 impl Agent {

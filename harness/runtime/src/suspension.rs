@@ -8,8 +8,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use tickloop_harness_protocol::{
-    ChatSnapshot, Content, LoopState, OperationRecord, OperationState, QuestionRequest, Receipt,
-    RunId, ToolResult,
+    ChatSnapshot, Content, LoopState, OperationRecord, OperationState, PermissionRequest,
+    QuestionRequest, Receipt, RunId, ToolResult,
 };
 use tickloop_harness_tools::ASK_USER_QUESTION_TOOL_NAME;
 use tickloop_harness_transcript::{
@@ -20,14 +20,21 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    Agent, Chat, ParkedRun, RunStart, WaitHosting, interaction::PendingReply, lifecycle::Lifecycle,
-    run_supervision, tool_batch,
+    Agent, Chat, ParkedRun, PendingApproval, PermissionAnswer, RunStart, WaitHosting,
+    interaction::PendingReply, lifecycle::Lifecycle, run_supervision,
+    session_permissions::PermissionOwner, tool_batch,
 };
 
 /// Why a released Run's wait ended: it leaves this instance and nothing of it is written.
 pub(crate) const RUN_RELEASED: &str = "the waiting run was released to another host";
 const QUESTION_CANCELLED: &str = "question was cancelled";
 const QUESTION_EXPIRED: &str = "question expired";
+const PERMISSION_CANCELLED: &str = "permission request cancelled";
+const PERMISSION_EXPIRED: &str = "permission request expired";
+/// Why an allowed call does not run: its wait's end did not reach the store, so the host that
+/// loads the Chat next may run it.
+const ALLOWED_CALL_UNRECORDED: &str =
+    "the allowed call was not run because the end of its wait could not be recorded";
 const HANDED_OVER_RUN_CANCELLED: &str = "the run was cancelled before it went on";
 const HANDOVER_LOST: &str = "the run's handover is no longer recorded";
 
@@ -89,7 +96,145 @@ pub(crate) fn waited_calls(waits: WaitHosting, lines: &[Line]) -> HashSet<String
     }
 }
 
+/// The open durable wait on the permission `request_id`, if a Run waits on it under Durable
+/// Approval.
+pub(crate) fn open_permission_wait(chat: &Chat, request_id: Uuid) -> Option<&WaitEntry> {
+    chat.bookkeeping.lifecycle.wait(request_id).filter(|wait| {
+        matches!(wait.kind, WaitKind::Permission { .. }) && matches!(wait.state, WaitState::Open)
+    })
+}
+
+/// What the model reads of a call the user denied while its Run waited: the denial, with their
+/// comment when given. Without one the Run ends there, as after any bare denial.
+pub(crate) fn denied_permission_result(comment: Option<&str>) -> ModelVisibleResult {
+    let text = super::permission_denial_message(comment);
+    ModelVisibleResult {
+        tool: ToolResult {
+            content: text.clone(),
+            is_error: true,
+            output_ref: None,
+        },
+        content: text.into(),
+        ends_run: comment.is_none(),
+    }
+}
+
+/// A call a person allowed while its Run waited durably, which the Run prepares again where it
+/// waited.
+#[derive(Clone)]
+pub(crate) struct PermissionGrant {
+    request: PermissionRequest,
+    /// What the allowed call reached, as its wait recorded it.
+    target: Option<String>,
+}
+
+impl PermissionGrant {
+    /// Whether the grant allows the call `operation` makes, which reaches `target`: the same
+    /// tool, input and MCP server, reaching the same server configuration, account and tool.
+    fn allows(
+        &self,
+        operation: &OperationRecord,
+        mcp_server: Option<&str>,
+        target: Option<&str>,
+    ) -> bool {
+        self.request.name == operation.name
+            && self.request.input == operation.input
+            && self.request.mcp_server.as_deref() == mcp_server
+            && self.target.as_deref() == target
+    }
+}
+
 impl Agent {
+    /// The permission `request` suspends its Run under Durable Approval: the wait is recorded
+    /// with the answer's `Suspended`, in the change that makes the Loop wait for it, and the Run
+    /// gets its release.
+    pub(crate) fn suspend_for_permission(
+        &self,
+        chat: &mut Chat,
+        receipt: &Receipt,
+        request: &PermissionRequest,
+        target: Option<String>,
+    ) -> CancellationToken {
+        let call_id = request.execution.call_key();
+        let operation_id = chat
+            .snapshot
+            .operations
+            .iter()
+            .rev()
+            .find(|operation| operation.run_id == receipt.run_id && operation.call_id == call_id)
+            .map(|operation| operation.id);
+        let assistant_message = batch_message_of(&chat.snapshot, receipt.run_id, &call_id);
+        if let (Some(operation_id), Some(assistant_message)) = (operation_id, assistant_message) {
+            chat.bookkeeping.lifecycle.suspend(
+                receipt,
+                WaitKind::Permission {
+                    request: Box::new(request.clone()),
+                    operation_id,
+                    target,
+                },
+                ResumePoint::InBatch {
+                    assistant_message,
+                    call_id,
+                },
+            );
+        }
+        chat.releases.entry(receipt.run_id).or_default().clone()
+    }
+
+    /// Commits the end of an allowed call's wait before the call runs. Nothing runs unless it is
+    /// in the store: a host that cannot record it, or no longer holds the Chat, leaves the call
+    /// allowed for whichever host loads the Chat next, so the call runs at most once.
+    pub(crate) async fn commit_allowed_call(
+        &self,
+        chat_id: tickloop_harness_protocol::ChatId,
+    ) -> Result<(), String> {
+        self.commit_transcripts(&[chat_id])
+            .await
+            .map_err(|error| format!("{ALLOWED_CALL_UNRECORDED}: {error}"))
+    }
+
+    /// Whether a person allowed `operation`, reaching `target`, while its Run waited durably,
+    /// so the call prepared again where the Run waited goes ahead without asking or a review.
+    pub(crate) async fn is_permission_granted(
+        &self,
+        receipt: &Receipt,
+        operation: &OperationRecord,
+        mcp_server: Option<&str>,
+        target: Option<&str>,
+    ) -> bool {
+        self.inner
+            .chats
+            .lock()
+            .await
+            .get(&receipt.chat_id)
+            .and_then(|chat| {
+                chat.permission_grants
+                    .get(&(receipt.run_id, operation.call_id.clone()))
+            })
+            .is_some_and(|grant| grant.allows(operation, mcp_server, target))
+    }
+
+    /// Takes the grant a person gave `operation` while its Run waited durably, giving the
+    /// permission revision it is answered under; `None` when the person allowed no such call, or
+    /// the call prepared again reaches another target than the allowed one, which is then asked
+    /// about again.
+    pub(crate) async fn take_permission_grant(
+        &self,
+        receipt: &Receipt,
+        operation: &OperationRecord,
+        mcp_server: Option<&str>,
+        target: Option<&str>,
+    ) -> Option<u64> {
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&receipt.chat_id)?;
+        let grant = chat
+            .permission_grants
+            .remove(&(receipt.run_id, operation.call_id.clone()))?;
+        grant
+            .allows(operation, mcp_server, target)
+            .then_some(chat.snapshot.policy.revision)
+    }
+
     /// The question `request` suspends its Run: the wait is recorded with the answer's
     /// `Suspended`, in the change that makes the Loop wait for it, and the Run gets its release.
     pub(crate) fn suspend_for_question(
@@ -376,7 +521,14 @@ impl Agent {
                 loop_id: chat.snapshot.chat_loop.id,
                 run_id: wait.run_id.into(),
             };
-            let is_resolved = matches!(wait.state, WaitState::Resolved { .. });
+            let is_resolved = matches!(
+                wait.state,
+                WaitState::Resolved { .. } | WaitState::Allowed { .. }
+            );
+            let waits_for_person = matches!(
+                wait.kind,
+                WaitKind::Question { .. } | WaitKind::Permission { .. }
+            );
             let holds_slot = !is_resolved
                 && matches!(
                     wait.kind,
@@ -387,6 +539,7 @@ impl Agent {
             chat_loop.run_id = Some(wait.run_id.into());
             chat_loop.recover_state(match wait.kind {
                 WaitKind::Question { .. } => LoopState::WaitingQuestion,
+                WaitKind::Permission { .. } => LoopState::WaitingPermission,
                 _ => LoopState::Running,
             });
             let cancel = CancellationToken::new();
@@ -493,6 +646,25 @@ impl Agent {
                         tail = RebuiltTail::Subagent { child, call_id };
                     }
                 }
+                // The call is prepared again once the person allowed it, under an operation of
+                // its own.
+                WaitKind::Permission { request, .. } => {
+                    if !is_resolved {
+                        chat.snapshot.permissions.push((**request).clone());
+                        let (sender, receiver) = oneshot::channel();
+                        if let Ok(owner) = PermissionOwner::new(chat_id.into(), wait.loop_id) {
+                            self.inner.approvals.lock().await.insert(
+                                request.id,
+                                PendingApproval {
+                                    sender,
+                                    owner,
+                                    operation: None,
+                                },
+                            );
+                        }
+                        tail = RebuiltTail::Permission(receiver);
+                    }
+                }
                 WaitKind::Children { .. } => {
                     tail = RebuiltTail::Children {
                         at_call: call_id.clone(),
@@ -502,7 +674,7 @@ impl Agent {
             }
             // A wait that ended, or a slot-holding wait whose slot another Run took, goes on once
             // the Run gets the slot.
-            if is_resolved || (!holds_slot && !matches!(wait.kind, WaitKind::Question { .. })) {
+            if is_resolved || (!holds_slot && !waits_for_person) {
                 chat.ready_runs.push_back(wait.run_id.into());
             }
             rebuilt.push(RebuiltRun {
@@ -570,6 +742,19 @@ impl Agent {
                     reply = receiver => reply.map(|_: PendingReply| ()).map_err(|_| QUESTION_EXPIRED.to_string()),
                 };
                 let waited = takes_slot(reply).await;
+                if self.leave_if_released(&receipt).await {
+                    return;
+                }
+                self.resume_start(&receipt, wait_id, waited).await
+            }
+            RebuiltTail::Permission(receiver) => {
+                let answer = tokio::select! {
+                    biased;
+                    _ = release.cancelled() => Err(RUN_RELEASED.to_string()),
+                    _ = cancel.cancelled() => Err(PERMISSION_CANCELLED.to_string()),
+                    answer = receiver => answer.map(|_: PermissionAnswer| ()).map_err(|_| PERMISSION_EXPIRED.to_string()),
+                };
+                let waited = takes_slot(answer).await;
                 if self.leave_if_released(&receipt).await {
                     return;
                 }
@@ -831,7 +1016,8 @@ impl Agent {
 
     /// Where the rebuilt Run goes on: at its waiting call, with the result the reply decided, or
     /// with the error its wait ended in, as the asking Run's own call reports a cancelled or
-    /// expired question. An error when the Chat no longer holds the wait.
+    /// expired question. A call a person allowed runs again there instead: its wait ends first,
+    /// so no host runs it twice. An error when the Chat no longer holds the wait.
     async fn resume_start(
         &self,
         receipt: &Receipt,
@@ -846,6 +1032,29 @@ impl Agent {
             .wait(wait_id)
             .ok_or(QUESTION_EXPIRED)?
             .clone();
+        if waited.is_ok()
+            && matches!(wait.state, WaitState::Allowed { .. })
+            && let WaitKind::Permission {
+                request, target, ..
+            } = &wait.kind
+            && let Some(call_id) = wait.resume.call_id()
+        {
+            chat.permission_grants.insert(
+                (receipt.run_id, call_id.to_owned()),
+                PermissionGrant {
+                    request: (**request).clone(),
+                    target: target.clone(),
+                },
+            );
+            chat.bookkeeping.lifecycle.end_wait(wait_id);
+            self.save(&chat.snapshot);
+            drop(chats);
+            self.commit_allowed_call(receipt.chat_id).await?;
+            return Ok(RunStart::Resume {
+                at: wait.resume,
+                result: None,
+            });
+        }
         let result = match (waited, wait.state) {
             // As the asking Run's own: an answer the user gave reaches the chain even when the
             // Run is cancelled before it takes the slot again, and so does what a child
@@ -861,7 +1070,11 @@ impl Agent {
                 chat.snapshot
                     .questions
                     .retain(|request| request.id != wait_id);
+                chat.snapshot
+                    .permissions
+                    .retain(|request| request.id != wait_id);
                 self.inner.question_answers.lock().await.remove(&wait_id);
+                self.inner.approvals.lock().await.remove(&wait_id);
                 self.save(&chat.snapshot);
                 let error = waited.err().unwrap_or_else(|| QUESTION_EXPIRED.into());
                 ModelVisibleResult {
@@ -900,6 +1113,8 @@ fn children_finished_result(error: String) -> ModelVisibleResult {
 enum RebuiltTail {
     /// The reply to an open question.
     Question(oneshot::Receiver<PendingReply>),
+    /// The answer to an open permission.
+    Permission(oneshot::Receiver<PermissionAnswer>),
     /// The child run of an open foreground call.
     Subagent { child: Receipt, call_id: String },
     /// The children an open member's wait is on, at its report call `at_call` or else before
