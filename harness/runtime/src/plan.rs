@@ -1128,6 +1128,7 @@ impl Agent {
                     reason: Some("Exit plan mode without a plan".into()),
                     mcp_server: None,
                     target: None,
+                    hooks: None,
                 },
                 cancel.clone(),
             )
@@ -1224,6 +1225,7 @@ impl Agent {
                     reason: Some("Approve the reviewed plan and choose an execution mode".into()),
                     mcp_server: None,
                     target: None,
+                    hooks: None,
                 },
                 cancel.clone(),
             )

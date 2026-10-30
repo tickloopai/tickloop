@@ -537,7 +537,14 @@ impl Agent {
                     ),
                 };
                 let answer = self
-                    .wait_for_permission(chat_id, request, operation.clone(), None, cancel.clone())
+                    .wait_for_permission(
+                        chat_id,
+                        request,
+                        operation.clone(),
+                        None,
+                        None,
+                        cancel.clone(),
+                    )
                     .await
                     .map_err(AgentError::Invalid)?;
                 if !answer.allow {

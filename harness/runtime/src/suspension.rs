@@ -126,6 +126,8 @@ pub(crate) struct PermissionGrant {
     request: PermissionRequest,
     /// What the allowed call reached, as its wait recorded it.
     target: Option<String>,
+    /// What the call's `PreToolUse` hooks decided before it waited.
+    hooks: Option<tickloop_harness_transcript::HookPreparation>,
 }
 
 impl PermissionGrant {
@@ -154,6 +156,7 @@ impl Agent {
         receipt: &Receipt,
         request: &PermissionRequest,
         target: Option<String>,
+        hooks: Option<tickloop_harness_transcript::HookPreparation>,
     ) -> CancellationToken {
         let call_id = request.execution.call_key();
         let operation_id = chat
@@ -177,6 +180,7 @@ impl Agent {
                     operation_id,
                     target,
                     nested_index,
+                    hooks,
                 },
                 ResumePoint::InBatch {
                     assistant_message,
@@ -218,6 +222,25 @@ impl Agent {
                     .get(&(receipt.run_id, operation.call_id.clone()))
             })
             .is_some_and(|grant| grant.allows(operation, mcp_server, target))
+    }
+
+    /// What the `PreToolUse` hooks of the call `call_id` a person allowed while its Run waited
+    /// durably decided before it waited: the call prepared again takes it instead of running
+    /// the same hooks again.
+    pub(crate) async fn granted_hook_preparation(
+        &self,
+        receipt: &Receipt,
+        call_id: &str,
+    ) -> Option<tickloop_harness_transcript::HookPreparation> {
+        self.inner
+            .chats
+            .lock()
+            .await
+            .get(&receipt.chat_id)?
+            .permission_grants
+            .get(&(receipt.run_id, call_id.to_owned()))?
+            .hooks
+            .clone()
     }
 
     /// Takes the grant a person gave `operation` while its Run waited durably, giving the
@@ -1043,7 +1066,10 @@ impl Agent {
         if waited.is_ok()
             && matches!(wait.state, WaitState::Allowed { .. })
             && let WaitKind::Permission {
-                request, target, ..
+                request,
+                target,
+                hooks,
+                ..
             } = &wait.kind
         {
             chat.permission_grants.insert(
@@ -1051,6 +1077,7 @@ impl Agent {
                 PermissionGrant {
                     request: (**request).clone(),
                     target: target.clone(),
+                    hooks: hooks.clone(),
                 },
             );
             chat.bookkeeping.lifecycle.end_wait(wait_id);

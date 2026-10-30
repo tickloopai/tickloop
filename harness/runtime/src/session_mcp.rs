@@ -130,6 +130,7 @@ impl crate::Agent {
                     request,
                     session_operation.clone(),
                     None,
+                    None,
                     cancel.clone(),
                 )
                 .await;

@@ -3629,3 +3629,218 @@ async fn a_batch_going_on_after_a_reload_cites_the_sources_its_ended_search_foun
     );
     answering.shutdown().await;
 }
+
+/// A user's `PreToolUse` hook named `command` for MCP calls.
+fn mcp_pre_tool_hook(command: &str) -> tickloop_harness_protocol::hooks::ConfiguredHook {
+    use tickloop_harness_protocol::hooks::{ConfiguredHook, HookEvent, HookSource, HookTrust};
+    ConfiguredHook {
+        key: format!("PreToolUse:mcp__.*:{command}"),
+        hash: None,
+        source: HookSource::User,
+        file: "/settings.json".into(),
+        event: HookEvent::PreToolUse,
+        matcher: Some("mcp__.*".into()),
+        command: command.into(),
+        resolved_command: Some(command.into()),
+        sensitive_values: Vec::new(),
+        condition: None,
+        timeout_secs: 600,
+        background: None,
+        plugin: None,
+        trust: HookTrust::Trusted,
+    }
+}
+
+/// A durable host with a Folder whose user hooks the settings `settings` keep: the server
+/// `review`'s calls ask the person, and hooks run through `environment`.
+async fn hooked(
+    store: &Arc<InMemoryTranscriptStore>,
+    server: &McpService,
+    settings: &Arc<tickloop_harness_policy::settings::MemorySettingsStore>,
+    environment: &Arc<tickloop_harness_runtime::environment::memory::MemoryEnvironment>,
+    replies: Vec<Vec<Content>>,
+) -> Agent {
+    use tickloop_harness_protocol::mcp::McpUnruled;
+    let tools =
+        admission_provider_over(server, Arc::new(Mutex::new(McpUnruled::Person)), false).await;
+    let mut options = options(PromptPolicy::DurableApproval);
+    options.settings = Some(settings.clone());
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            search: None,
+            transcripts: Some(store.clone()),
+            environment: Some(environment.clone()),
+            models: ChosenModels::new(Arc::new(ScriptedModel::new(replies))),
+        },
+        options,
+    )
+    .unwrap();
+    agent.install_host_tools(tools).unwrap();
+    agent
+}
+
+/// A `PreToolUse` hook rewrote the call with a value of its own before the call waited: the
+/// instance that goes on after the person allows it takes that rewrite instead of running the
+/// hook again, and the call runs once; a background hook the call also matched does not run
+/// again either. Hooks that changed meanwhile run again, and the call they rewrite differently
+/// is put to the person again.
+#[tokio::test]
+async fn a_call_allowed_after_a_rebuild_keeps_what_its_hooks_decided() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tickloop_harness_policy::settings::{MemorySettingsStore, SettingsStore, SettingsUpdate};
+    use tickloop_harness_protocol::hooks::{HookBackground, HookList};
+    use tickloop_harness_runtime::environment::memory::{MemoryCommandRun, MemoryEnvironment};
+    const REWRITE: &str = "rewrite.sh";
+    const BACKGROUND_AUDIT: &str = "background-audit.sh";
+    for (hooks_change, with_background) in [(false, false), (false, true), (true, false)] {
+        let mut hooks = vec![mcp_pre_tool_hook(REWRITE)];
+        if with_background {
+            hooks.push(tickloop_harness_protocol::hooks::ConfiguredHook {
+                background: Some(HookBackground::Async),
+                ..mcp_pre_tool_hook(BACKGROUND_AUDIT)
+            });
+        }
+        let folder = tempfile::tempdir().unwrap();
+        let folder_path = folder.path().canonicalize().unwrap();
+        let settings = Arc::new(MemorySettingsStore::default());
+        settings
+            .write(SettingsUpdate::TrustDirectory(folder_path.clone()))
+            .unwrap();
+        settings.set_hooks(HookList {
+            hooks: hooks.clone(),
+            ..Default::default()
+        });
+        let environment = Arc::new(MemoryEnvironment::new());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let audits = Arc::new(AtomicUsize::new(0));
+        let audited = audits.clone();
+        environment.define_command(BACKGROUND_AUDIT, move |_| {
+            audited.fetch_add(1, Ordering::SeqCst);
+            MemoryCommandRun::default()
+        });
+        let rewrite = |runs: Arc<AtomicUsize>| {
+            move |spec: &tickloop_harness_runtime::environment::CommandSpec| {
+                let input: serde_json::Value = serde_json::from_slice(&spec.stdin).unwrap();
+                let nonce = runs.fetch_add(1, Ordering::SeqCst);
+                let mut rewritten = input["tool_input"].clone();
+                rewritten["nonce"] = json!(nonce);
+                let output = json!({"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "updatedInput": rewritten,
+                }});
+                MemoryCommandRun {
+                    stdout: output.to_string().into_bytes(),
+                    ..Default::default()
+                }
+            }
+        };
+        environment.define_command(REWRITE, rewrite(runs.clone()));
+        let server = McpService::start().await;
+        server.set_tools(json!([{"name": "read", "inputSchema": {"type": "object"}}]));
+        server.set_result(json!({"content": [{"type": "text", "text": "MCP_OK"}]}));
+        let store = Arc::new(InMemoryTranscriptStore::new());
+
+        let asking = hooked(
+            &store,
+            &server,
+            &settings,
+            &environment,
+            vec![call(CALL, "mcp__review__read", json!({"q": "status"}))],
+        )
+        .await;
+        let chat = asking.create_chat(folder_path.clone()).await.unwrap();
+        let turn = asking
+            .advance(chat, prompt("Read the service.", Delivery::Queue))
+            .await
+            .unwrap();
+        let TurnOutcome::Waiting(TurnWait::Permission(request)) = outcome(&turn).await else {
+            panic!("the call waits for the person's approval");
+        };
+        assert_eq!(request.input, json!({"q": "status", "nonce": 0}));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        asking.shutdown().await;
+
+        if hooks_change {
+            // Another hook joins: the hooks that would run are not the ones that ran.
+            settings.set_hooks(HookList {
+                hooks: vec![mcp_pre_tool_hook(REWRITE), mcp_pre_tool_hook("audit.sh")],
+                ..Default::default()
+            });
+            environment.define_command("audit.sh", |_| MemoryCommandRun::default());
+        }
+        let answering = hooked(&store, &server, &settings, &environment, vec![text(DONE)]).await;
+        let admissions = watch_admissions(&answering);
+        let reply = answering
+            .advance(chat, answer(&request, PermissionReply::AllowOnce))
+            .await
+            .unwrap();
+        assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
+        if hooks_change {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while answering
+                    .snapshot(chat)
+                    .await
+                    .unwrap()
+                    .permissions
+                    .is_empty()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the call rewritten again is put to the person again");
+            assert_eq!(
+                runs.load(Ordering::SeqCst),
+                2,
+                "the changed hooks ran again"
+            );
+            assert!(
+                server.calls().is_empty(),
+                "nothing runs on the old approval"
+            );
+            let again = answering
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .permissions
+                .remove(0);
+            assert_eq!(again.input, json!({"q": "status", "nonce": 1}));
+            assert_eq!(
+                *admissions.lock().unwrap(),
+                [format!("asked {}", again.name)]
+            );
+        } else {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                answering.settled_input(chat, turn.input_id()),
+            )
+            .await
+            .expect("the allowed call goes on without asking again")
+            .unwrap();
+            assert_eq!(runs.load(Ordering::SeqCst), 1, "the hook ran only once");
+            if with_background {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while audits.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the background hook ran when the call was first prepared");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                assert_eq!(
+                    audits.load(Ordering::SeqCst),
+                    1,
+                    "the background hook did not run again"
+                );
+            }
+            let calls = server.calls();
+            assert_eq!(calls.len(), 1, "the allowed call ran once");
+            assert_eq!(
+                calls[0]["params"]["arguments"],
+                json!({"q": "status", "nonce": 0})
+            );
+            assert!(admissions.lock().unwrap().is_empty());
+        }
+        answering.shutdown().await;
+    }
+}

@@ -838,6 +838,8 @@ struct PermissionPrompt {
     mcp_server: Option<String>,
     /// What the call reaches, which an approval given for it is bound to.
     target: Option<String>,
+    /// What the call's `PreToolUse` hooks decided, which its wait keeps.
+    hooks: Option<tickloop_harness_transcript::HookPreparation>,
 }
 
 struct PendingApproval {
@@ -2426,15 +2428,14 @@ impl Agent {
     /// The prompt policy a model tool call's approval is decided under. A call an `ExecuteTools`
     /// batch makes waits durably as any call does: the batch makes its calls one at a time, so
     /// one that waits suspends the whole Run at its place in the batch. Any other call made
-    /// inside another call cannot wait durably, so its approval is denied as on a host that
-    /// denies whatever would prompt.
+    /// inside another call, or while a user's command prepares its input, has no place in a
+    /// tool batch to go on from, so it cannot wait durably: its approval is denied as on a host
+    /// that denies whatever would prompt.
     fn tool_prompt_policy(&self) -> PromptPolicy {
+        let has_no_batch_place = nested_calls::is_nested() && !nested_calls::waits_durably()
+            || command_skills::input_message_id().is_some();
         match self.inner.host_options.prompt_policy {
-            PromptPolicy::DurableApproval
-                if nested_calls::is_nested() && !nested_calls::waits_durably() =>
-            {
-                PromptPolicy::DenyOnPrompt
-            }
+            PromptPolicy::DurableApproval if has_no_batch_place => PromptPolicy::DenyOnPrompt,
             policy => policy,
         }
     }
@@ -5194,6 +5195,7 @@ impl Agent {
             request,
             session_operation,
             prompt.target,
+            prompt.hooks,
             cancel,
         )
         .await
@@ -5207,6 +5209,7 @@ impl Agent {
         request: PermissionRequest,
         session_operation: SessionPermissionOperation,
         target: Option<String>,
+        hooks: Option<tickloop_harness_transcript::HookPreparation>,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
         let model_receipt = request.execution.run_id().map(|run_id| Receipt {
@@ -5257,7 +5260,8 @@ impl Agent {
             chat.snapshot.permissions.push(request.clone());
             let release = match &model_receipt {
                 Some(receipt) if waits_durably => {
-                    let release = self.suspend_for_permission(chat, receipt, &request, target);
+                    let release =
+                        self.suspend_for_permission(chat, receipt, &request, target, hooks);
                     self.save_now(&chat.snapshot);
                     release
                 }

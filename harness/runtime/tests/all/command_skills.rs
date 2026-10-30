@@ -2197,74 +2197,96 @@ async fn merged_plain_guidance_does_not_invalidate_the_started_invocations_prepa
 }
 
 /// On a host that keeps durable approvals, a command's shell that would ask a person is denied
-/// as before: only an `ExecuteTools` batch's calls wait durably, and a command never activates
-/// on a shell nobody ran.
+/// as before, whether the model or the user invoked the command: only an `ExecuteTools` batch's
+/// calls wait durably, and a command never activates on a shell nobody ran.
 #[tokio::test]
 async fn a_command_shell_that_would_ask_is_denied_on_a_durable_approval_host() {
     use tickloop_harness_runtime::WaitHosting;
     use tickloop_harness_test_support::transcripts::InMemoryTranscriptStore;
-    let folder = tempfile::tempdir().unwrap();
-    let environment = MemoryEnvironment::new();
-    environment.define_shell(
-        "printf asked",
-        Duration::ZERO,
-        b"must-not-appear".to_vec(),
-        0,
-    );
-    let model = Arc::new(ScriptedModel::new(vec![
-        call("skill-call", "Skill", json!({"skill":"demo:check"})),
-        text("denied"),
-    ]));
-    let mut options = HarnessOptions::local(config());
-    options.waits = WaitHosting::Durable;
-    options.host.prompt_policy = tickloop_harness_protocol::PromptPolicy::DurableApproval;
-    options.tools.tick_subscriptions = false;
-    options.settings = Some(Arc::new(CommandSettings {
-        memory: Default::default(),
-        markdown: "---\ndescription: Check\n---\nGuidance !`printf asked`".into(),
-    }));
-    let agent = Agent::with_seams(
-        HarnessSeams {
-            search: None,
-            transcripts: Some(Arc::new(InMemoryTranscriptStore::new())),
-            environment: Some(Arc::new(environment)),
-            models: ChosenModels::new(model.clone()),
-        },
-        options,
-    )
-    .unwrap();
-    let chat = agent.create_chat(folder.path().into()).await.unwrap();
-    agent
-        .set_permission_rules(
-            chat,
-            vec![PermissionRule {
-                id: tickloop_ids::generate(),
-                decision: Decision::Ask,
-                tool: "Bash".into(),
-                specifier: None,
-                input: None,
-                loop_id: None,
-                persistent: false,
-            }],
+    for user in [false, true] {
+        let folder = tempfile::tempdir().unwrap();
+        let environment = MemoryEnvironment::new();
+        environment.define_shell(
+            "printf asked",
+            Duration::ZERO,
+            b"must-not-appear".to_vec(),
+            0,
+        );
+        let model = Arc::new(ScriptedModel::new(if user {
+            vec![]
+        } else {
+            vec![
+                call("skill-call", "Skill", json!({"skill":"demo:check"})),
+                text("denied"),
+            ]
+        }));
+        let mut options = HarnessOptions::local(config());
+        options.waits = WaitHosting::Durable;
+        options.host.prompt_policy = tickloop_harness_protocol::PromptPolicy::DurableApproval;
+        options.tools.tick_subscriptions = false;
+        options.tools.user_skills = true;
+        options.settings = Some(Arc::new(CommandSettings {
+            memory: Default::default(),
+            markdown: "---\ndescription: Check\n---\nGuidance !`printf asked`".into(),
+        }));
+        let agent = Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: Some(Arc::new(InMemoryTranscriptStore::new())),
+                environment: Some(Arc::new(environment)),
+                models: ChosenModels::new(model.clone()),
+            },
+            options,
         )
-        .await
         .unwrap();
-    let mut events = agent.subscribe();
-    let receipt = agent.submit(chat, "Use command".into()).await.unwrap();
-    loop {
-        let event = next_event(&mut events).await;
-        if event.run_id != receipt.run_id {
-            continue;
-        }
-        match event.kind {
-            EventKind::PermissionRequested { .. } => panic!("a command's shell never waits"),
-            EventKind::Completed { .. } | EventKind::Failed(_) => break,
-            _ => {}
-        }
+        let chat = agent.create_chat(folder.path().into()).await.unwrap();
+        agent
+            .set_permission_rules(
+                chat,
+                vec![PermissionRule {
+                    id: tickloop_ids::generate(),
+                    decision: Decision::Ask,
+                    tool: "Bash".into(),
+                    specifier: None,
+                    input: None,
+                    loop_id: None,
+                    persistent: false,
+                }],
+            )
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        let receipt = if user {
+            agent.invoke_skill(chat, "demo:check", "").await.unwrap()
+        } else {
+            agent.submit(chat, "Use command".into()).await.unwrap()
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = next_event(&mut events).await;
+                if event.run_id != receipt.run_id {
+                    continue;
+                }
+                match event.kind {
+                    EventKind::PermissionRequested { .. } => {
+                        panic!("{user}: a command's shell never waits")
+                    }
+                    EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the run ends");
+        let observation = agent.observe(chat, 0).await.unwrap();
+        assert!(observation.snapshot.invoked_skills.is_empty(), "{user}");
+        assert!(observation.snapshot.permissions.is_empty(), "{user}");
+        assert!(
+            !format!("{:?}", observation.snapshot.messages).contains("must-not-appear"),
+            "{user}"
+        );
+        agent.shutdown().await;
     }
-    let observation = agent.observe(chat, 0).await.unwrap();
-    assert!(observation.snapshot.invoked_skills.is_empty());
-    assert!(observation.snapshot.permissions.is_empty());
-    assert!(!format!("{:?}", observation.snapshot.messages).contains("must-not-appear"));
-    agent.shutdown().await;
 }

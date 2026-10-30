@@ -1220,6 +1220,10 @@ pub enum WaitKind {
         /// resume point then names that batch call, which goes on at this call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nested_index: Option<usize>,
+        /// What the call's `PreToolUse` hooks decided before it waited: the call prepared again
+        /// takes this instead of running them again, while the same hooks would run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hooks: Option<HookPreparation>,
     },
     /// A foreground `Subagent` call waits for its child's run to end and report.
     #[serde(rename_all = "camelCase")]
@@ -1236,6 +1240,32 @@ pub enum WaitKind {
     /// A voluntary handover stopped the Run at a safe point: whoever holds the Chat next goes on
     /// with the same attempt where the wait says, once the Run takes the execution slot.
     Handover,
+}
+
+/// What a call's `PreToolUse` hooks decided, kept with the call's wait.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HookPreparation {
+    /// The input the call was prepared with, the hooks' rewrite when they gave one.
+    pub input: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<HookPreparedPermission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// What the hooks told the model, which follows the call's result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feedback: Vec<String>,
+    /// A token-free identity of the hooks that ran: a change to them makes the call run its
+    /// hooks again.
+    pub hooks: String,
+}
+
+/// What a call's `PreToolUse` hooks decided about its admission, short of denying it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HookPreparedPermission {
+    Allow,
+    Ask,
 }
 
 /// Where a Run continues.
@@ -1851,6 +1881,7 @@ mod tests {
                 operation_id: Uuid::nil(),
                 target: Some("target".into()),
                 nested_index: None,
+                hooks: None,
             },
             resume: ResumePoint::InBatch {
                 assistant_message: Uuid::nil(),

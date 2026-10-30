@@ -235,6 +235,19 @@ struct Runnable {
     command: String,
 }
 
+/// A token-free identity of the hooks `runnable`: each one's declaration and trust, without
+/// the plugin's sensitive values, hashed.
+fn hooks_identity(runnable: &[Runnable]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for runnable in runnable {
+        let hook = runnable.hook.clone().for_views();
+        hash.update(serde_json::to_vec(&hook).expect("a hook serializes"));
+        hash.update([0]);
+    }
+    format!("{:x}", hash.finalize())
+}
+
 /// Claude Code's `permission_mode` for an execution mode.
 fn permission_mode(mode: ExecutionMode) -> &'static str {
     match mode {
@@ -320,6 +333,9 @@ impl Agent {
         if runnable.is_empty() {
             return HookVerdict::default();
         }
+        // Every hook the call matched, those that run in the background included, as
+        // [`Self::hooks_identity`] names them.
+        let identity = hooks_identity(&runnable);
         let transcript_path = match self.hook_transcript_path(receipt.chat_id).await {
             Ok(Some(path)) => path.to_string_lossy().into_owned(),
             Ok(None) => String::new(),
@@ -355,12 +371,13 @@ impl Agent {
             futures_util::future::join_all(session_end_runs),
         )
         .await;
-        let (verdict, warning) = HookVerdict::merge(
+        let (mut verdict, warning) = HookVerdict::merge(
             runnable
                 .iter()
                 .zip(&finished)
                 .map(|(runnable, run)| (&runnable.hook.source, &run.response)),
         );
+        verdict.hooks = Some(identity);
         if let Some(warning) = &warning {
             tracing::warn!("{} hooks: {warning}", call.event.name());
         }
@@ -381,6 +398,22 @@ impl Agent {
         )
         .await;
         verdict
+    }
+
+    /// The identity of the hooks `call` would run now, in the foreground or the background, as
+    /// [`HookVerdict::hooks`] names the ones that ran; `None` when none would.
+    pub(crate) async fn hooks_identity(
+        &self,
+        receipt: &Receipt,
+        call: &HookCall,
+    ) -> Option<String> {
+        let (context, settings) = self.hook_context(receipt).await?;
+        let hooks = tokio::task::spawn_blocking(move || settings.hooks(Some(&context.folder)))
+            .await
+            .ok()?
+            .hooks;
+        let runnable = self.select_hooks(receipt, call, hooks).await;
+        (!runnable.is_empty()).then(|| hooks_identity(&runnable))
     }
 
     async fn hook_context(

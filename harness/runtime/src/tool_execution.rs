@@ -856,9 +856,35 @@ struct RegisteredCall {
 struct HookGate {
     permission: Option<crate::hooks::HookPermission>,
     reason: Option<String>,
+    /// What the hooks decided, kept for the call's wait, when hooks ran.
+    preparation: Option<tickloop_harness_transcript::HookPreparation>,
 }
 
 impl HookGate {
+    /// The gate the hooks decided before the call waited, as its wait kept it.
+    fn kept(preparation: tickloop_harness_transcript::HookPreparation) -> Self {
+        use tickloop_harness_transcript::HookPreparedPermission;
+        Self {
+            permission: preparation.permission.map(|permission| match permission {
+                HookPreparedPermission::Allow => crate::hooks::HookPermission::Allow,
+                HookPreparedPermission::Ask => crate::hooks::HookPermission::Ask,
+            }),
+            reason: preparation.reason.clone(),
+            preparation: Some(preparation),
+        }
+    }
+
+    fn prepared_permission(
+        permission: crate::hooks::HookPermission,
+    ) -> Option<tickloop_harness_transcript::HookPreparedPermission> {
+        use tickloop_harness_transcript::HookPreparedPermission;
+        match permission {
+            crate::hooks::HookPermission::Allow => Some(HookPreparedPermission::Allow),
+            crate::hooks::HookPermission::Ask => Some(HookPreparedPermission::Ask),
+            crate::hooks::HookPermission::Deny => None,
+        }
+    }
+
     fn asks(&self) -> bool {
         self.permission == Some(crate::hooks::HookPermission::Ask)
     }
@@ -1371,7 +1397,31 @@ impl Agent {
         {
             return Ok(ToolCallOutcome::not_admitted(error));
         }
-        let (input, hook_gate, pre_tool_feedback) = if registration.is_some() {
+        // A call a person allowed while its Run waited takes what its hooks decided then, while
+        // the same hooks would run: running them again could rewrite it differently. No
+        // PreToolUse hook runs for it again, a background one included: each already ran when
+        // the call was first prepared, and a background hook decides nothing.
+        let kept = match self.granted_hook_preparation(receipt, &id).await {
+            Some(kept)
+                if self
+                    .pre_tool_hooks(receipt, &id, &name, &input)
+                    .await
+                    .as_deref()
+                    == Some(kept.hooks.as_str()) =>
+            {
+                Some(kept)
+            }
+            _ => None,
+        };
+        let (input, hook_gate, pre_tool_feedback) = if let Some(kept) = kept {
+            if let Some(registered) = &registration
+                && let Err(error) = validate_registered_input(registered, &kept.input)
+            {
+                return Ok(ToolCallOutcome::not_admitted(error));
+            }
+            let feedback = crate::hooks::ToolHookFeedback::kept(kept.feedback.clone());
+            (kept.input.clone(), HookGate::kept(kept), feedback)
+        } else if registration.is_some() {
             match self
                 .pre_tool_use(receipt, &id, &name, input.clone(), &cancel)
                 .await
@@ -1395,6 +1445,7 @@ impl Agent {
                     permission,
                     reason,
                     feedback,
+                    hooks,
                 } => {
                     let route = registration.as_ref().map(|tool| &tool.route);
                     let rewritten = if rewritten == input {
@@ -1426,7 +1477,23 @@ impl Agent {
                             ..ToolCallOutcome::not_admitted(error)
                         });
                     }
-                    (rewritten, HookGate { permission, reason }, feedback)
+                    let preparation =
+                        hooks.map(|hooks| tickloop_harness_transcript::HookPreparation {
+                            input: rewritten.clone(),
+                            permission: permission.and_then(HookGate::prepared_permission),
+                            reason: reason.clone(),
+                            feedback: feedback.lines().to_vec(),
+                            hooks,
+                        });
+                    (
+                        rewritten,
+                        HookGate {
+                            permission,
+                            reason,
+                            preparation,
+                        },
+                        feedback,
+                    )
                 }
             }
         } else {
@@ -2048,6 +2115,7 @@ impl Agent {
                                     .as_ref()
                                     .and_then(|call| call.target())
                                     .map(str::to_owned),
+                                hooks: hook_gate.preparation.clone(),
                             },
                             cancel.clone(),
                         )
@@ -2728,6 +2796,7 @@ impl Agent {
                                         reason: approval_reason,
                                         mcp_server: None,
                                         target: None,
+                                        hooks: hook_gate.preparation.clone(),
                                     },
                                     cancel.clone(),
                                 )

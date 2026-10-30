@@ -339,6 +339,8 @@ pub(crate) struct HookVerdict {
     pub stop_reason: Option<String>,
     /// A run was cancelled: the turn was interrupted or stopped.
     pub cancelled: bool,
+    /// The identity of the hooks that ran, in the foreground or the background, when any did.
+    pub hooks: Option<String>,
 }
 
 impl HookVerdict {
