@@ -798,6 +798,18 @@ pub fn upgrade_saved_legacy_builtin_model(config: ModelConfig) -> ModelConfig {
 mod tests {
     use super::*;
 
+    /// A managed client names another provider's model `provider/model`, which stays
+    /// unambiguous only while built-in model ids contain no `/`.
+    #[test]
+    fn built_in_model_ids_contain_no_slash() {
+        let profiles = ModelCatalog::defaults().profiles();
+        assert!(!profiles.is_empty());
+        assert!(
+            profiles.iter().all(|config| !config.model_id.contains('/')),
+            "a built-in model id contains `/`"
+        );
+    }
+
     #[test]
     fn default_catalog_copies_keep_nested_changes_local_to_each_caller() {
         let original = ModelCatalog::defaults();

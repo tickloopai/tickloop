@@ -1294,3 +1294,66 @@ mod network_tests {
         assert!(!format!("{error:?}").contains("secret"));
     }
 }
+
+#[cfg(test)]
+mod signed_in_tests {
+    use super::*;
+
+    fn zai() -> tickloop_harness_protocol::ModelConfig {
+        crate::cards::ModelCatalog::defaults()
+            .profiles()
+            .into_iter()
+            .find(|config| config.provider_id == "zai-global-api")
+            .unwrap()
+    }
+
+    fn scope(root: &std::path::Path, environment_keys: &[&str]) -> ProviderCredentialScope {
+        ProviderCredentialScope {
+            config_root: Some(root.to_owned()),
+            environment_keys: environment_keys.iter().map(|key| (*key).into()).collect(),
+            service_account_path: Ok(None),
+            service_account_configured: Ok(false),
+        }
+    }
+
+    #[test]
+    fn an_api_key_provider_is_signed_in_by_a_saved_or_environment_key_only() {
+        let root = provider_test_support::root();
+        let config = zai();
+        assert_eq!(
+            provider_signed_in(&config, &scope(root.path(), &[])),
+            Ok(false)
+        );
+        assert_eq!(
+            provider_signed_in(&config, &scope(root.path(), &["ZAI_API_KEY"])),
+            Ok(true)
+        );
+        crate::credentials::save_api_key(root.path(), "ZAI_API_KEY", "key").unwrap();
+        assert_eq!(
+            provider_signed_in(&config, &scope(root.path(), &[])),
+            Ok(true)
+        );
+        let local = tickloop_harness_protocol::ModelConfig {
+            api_key_env: String::new(),
+            ..config
+        };
+        assert_eq!(
+            provider_signed_in(&local, &scope(root.path(), &[])),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_login_provider_is_signed_in_only_by_a_saved_login() {
+        let root = provider_test_support::root();
+        let codex = crate::cards::ModelCatalog::defaults()
+            .profiles()
+            .into_iter()
+            .find(|config| config.provider_id == "openai-codex")
+            .unwrap();
+        assert_eq!(
+            provider_signed_in(&codex, &scope(root.path(), &[])),
+            Ok(false)
+        );
+    }
+}

@@ -492,7 +492,8 @@ async fn acp_real_model_multiple_turns_and_sessions_keep_context_isolated() {
 }
 
 /// A second signed-in provider's models are offered beside the current provider's, grouped by
-/// provider, and choosing one switches the session to that provider.
+/// provider and named `provider/model` whichever provider is current; a bare id names only the
+/// current provider's model, and choosing another provider's switches the session to it.
 #[tokio::test]
 async fn acp_offers_every_signed_in_providers_models_and_switches_between_them() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -513,25 +514,60 @@ async fn acp_offers_every_signed_in_providers_models_and_switches_between_them()
     .await;
     let created = wire.response(2).await;
     let model = &created["result"]["configOptions"][0];
-    assert_eq!(model["currentValue"], "deepseek-flash", "{created}");
-    let groups: Vec<_> = model["options"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|group| group["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(groups, ["DeepSeek API", "Z.AI Global API"], "{created}");
-    let session = created["result"]["sessionId"].as_str().unwrap().to_owned();
-    wire.request(
-        3,
-        "session/set_config_option",
-        json!({"sessionId":session,"configId":"model","type":"select","value":"glm-5.3"}),
-    )
-    .await;
-    let switched = wire.response(3).await;
     assert_eq!(
-        switched["result"]["configOptions"][0]["currentValue"], "glm-5.3",
+        model["currentValue"], "deepseek-api/deepseek-flash",
+        "{created}"
+    );
+    let groups = model["options"].as_array().unwrap();
+    let names: Vec<_> = groups.iter().map(|group| &group["name"]).collect();
+    assert_eq!(names, ["DeepSeek API", "Z.AI Global API"], "{created}");
+    let values = |group: &Value| -> Vec<String> {
+        group["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["value"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let deepseek = values(&groups[0]);
+    assert!(deepseek.contains(&"deepseek-api/deepseek-flash".to_owned()));
+    assert!(
+        deepseek
+            .iter()
+            .all(|value| value.starts_with("deepseek-api/"))
+    );
+    assert!(
+        values(&groups[1])
+            .iter()
+            .all(|value| value.starts_with("zai-global-api/")),
+        "{created}"
+    );
+    let session = created["result"]["sessionId"].as_str().unwrap().to_owned();
+    let set = |id: u64, value: &str| {
+        (
+            id,
+            json!({"sessionId":session,"configId":"model","type":"select","value":value}),
+        )
+    };
+    let (id, params) = set(3, "glm-5.3");
+    wire.request(id, "session/set_config_option", params).await;
+    let rejected = wire.response(3).await;
+    assert!(rejected.get("error").is_some(), "{rejected}");
+    let (id, params) = set(4, "zai-global-api/glm-5.3");
+    wire.request(id, "session/set_config_option", params).await;
+    let switched = wire.response(4).await;
+    let model = &switched["result"]["configOptions"][0];
+    assert_eq!(
+        model["currentValue"], "zai-global-api/glm-5.3",
         "{switched}"
+    );
+    assert_eq!(values(&model["options"][0]), deepseek, "{switched}");
+    let (id, params) = set(5, "glm-5.3");
+    wire.request(id, "session/set_config_option", params).await;
+    let bare = wire.response(5).await;
+    assert_eq!(
+        bare["result"]["configOptions"][0]["currentValue"], "zai-global-api/glm-5.3",
+        "{bare}"
     );
     wire.finish().await;
 }

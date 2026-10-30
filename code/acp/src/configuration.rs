@@ -5,7 +5,9 @@ use std::collections::HashSet;
 
 use agent_client_protocol::Error;
 use serde_json::{Value, json};
-use tickloop_code_access::{ManagedConfiguration, ManagedConfigurationChange, UserInput};
+use tickloop_code_access::{
+    ManagedConfiguration, ManagedConfigurationChange, ManagedModelInfo, UserInput,
+};
 use tickloop_code_client::managed::ManagedSession;
 use tickloop_harness::protocol::{ExecutionMode, ReasoningEffort};
 
@@ -82,7 +84,7 @@ fn project(config: &ManagedConfiguration) -> Result<Value, Error> {
         ));
     }
     let mut seen = HashSet::new();
-    let mut groups: Vec<(&str, Vec<Value>)> = Vec::new();
+    let mut groups: Vec<(&ManagedModelInfo, Vec<Value>)> = Vec::new();
     for model in config
         .models
         .iter()
@@ -90,8 +92,10 @@ fn project(config: &ManagedConfiguration) -> Result<Value, Error> {
     {
         let option = json!({"value": model.id, "name": model.name});
         match groups.last_mut() {
-            Some((provider, options)) if *provider == model.provider => options.push(option),
-            _ => groups.push((&model.provider, vec![option])),
+            Some((first, options)) if first.provider_id == model.provider_id => {
+                options.push(option)
+            }
+            _ => groups.push((model, vec![option])),
         }
     }
     if !seen.contains(config.model_id.as_str()) {
@@ -105,8 +109,9 @@ fn project(config: &ManagedConfiguration) -> Result<Value, Error> {
         json!(
             groups
                 .into_iter()
-                .map(|(provider, options)| {
-                    json!({"group": provider, "name": provider, "options": options})
+                .map(|(first, options)| {
+                    json!({"group": first.provider_id, "name": first.provider_name,
+                           "options": options})
                 })
                 .collect::<Vec<_>>()
         )
@@ -159,18 +164,30 @@ fn change(
         .as_str()
         .ok_or_else(|| invalid("configuration value must be a string"))?;
     match config_id {
-        "model"
-            if config
+        "model" => {
+            // A bare model id, as offered before other providers were, names only the current
+            // provider's model, so it never selects another provider.
+            let current = config
                 .models
                 .iter()
-                .any(|model| model.id == value && !value.is_empty()) =>
-        {
+                .find(|model| model.id == config.model_id);
+            let model = config
+                .models
+                .iter()
+                .find(|model| {
+                    !value.is_empty()
+                        && (model.id == value
+                            || current.is_some_and(|current| {
+                                current.provider_id == model.provider_id
+                                    && model.id == format!("{}/{value}", model.provider_id)
+                            }))
+                })
+                .ok_or_else(|| invalid("model was not offered by this session"))?;
             Ok(ManagedConfigurationChange {
-                model_id: Some(value.to_owned()),
+                model_id: Some(model.id.clone()),
                 ..Default::default()
             })
         }
-        "model" => Err(invalid("model was not offered by this session")),
         "mode" => {
             let mode = supported_modes(config)
                 .into_iter()
@@ -297,7 +314,6 @@ mod tests {
     use agent_client_protocol::schema::v1::{
         NewSessionResponse, SessionNotification, SetSessionConfigOptionResponse,
     };
-    use tickloop_code_access::ManagedModelInfo;
 
     fn config() -> ManagedConfiguration {
         ManagedConfiguration {
@@ -306,7 +322,8 @@ mod tests {
             models: vec![ManagedModelInfo {
                 id: "provider/model".into(),
                 name: "Model".into(),
-                provider: "Provider".into(),
+                provider_id: "provider".into(),
+                provider_name: "Provider".into(),
             }],
             modes: vec![
                 ExecutionMode::Auto,
@@ -343,10 +360,12 @@ mod tests {
     #[test]
     fn models_of_several_providers_are_grouped_by_provider() {
         let mut config = config();
+        // Two regions of one product share a display name but stay separate groups.
         config.models.push(ManagedModelInfo {
             id: "other/model".into(),
             name: "Model".into(),
-            provider: "Other provider".into(),
+            provider_id: "other".into(),
+            provider_name: "Provider".into(),
         });
         let projected = project(&config).unwrap();
         let mut new = projected.clone();
@@ -355,15 +374,12 @@ mod tests {
         let wire = serde_json::to_value(decoded).unwrap();
         let groups = wire["configOptions"][0]["options"].as_array().unwrap();
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[1]["name"], "Other provider");
+        assert_eq!(groups[1]["group"], "other");
         assert_eq!(groups[1]["options"][0]["value"], "other/model");
-        assert_eq!(
-            change(&config, "model", &json!("other/model"))
-                .unwrap()
-                .model_id
-                .as_deref(),
-            Some("other/model")
-        );
+        let selected = |value: &str| change(&config, "model", &json!(value)).unwrap().model_id;
+        assert_eq!(selected("other/model").as_deref(), Some("other/model"));
+        // A bare id names the current provider's model, never another provider's.
+        assert_eq!(selected("model").as_deref(), Some("provider/model"));
     }
 
     #[test]

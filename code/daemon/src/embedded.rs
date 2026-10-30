@@ -1,7 +1,7 @@
 use crate::access_error::agent_access_error;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     sync::{
@@ -854,7 +854,7 @@ impl EmbeddedAgentAccess {
                             self.managed_models(&current, entry.launch.config_root.clone())
                                 .await
                                 .into_iter()
-                                .find_map(|(offered, config)| (offered == id).then_some(config))
+                                .find(|config| qualified_model_id(config) == id)
                                 .ok_or_else(|| {
                                     AccessError::invalid(
                                         "model is not in the session model directory",
@@ -2066,12 +2066,30 @@ impl EmbeddedAgentAccess {
         let current = &snapshot.model;
         let models = self
             .managed_models(current, entry.launch.config_root.clone())
-            .await
-            .into_iter()
-            .map(|(id, config)| ManagedModelInfo {
-                id,
-                name: config.name,
-                provider: config.provider_name,
+            .await;
+        let mut providers_named = HashMap::<&str, HashSet<&str>>::new();
+        for config in &models {
+            providers_named
+                .entry(&config.provider_name)
+                .or_default()
+                .insert(&config.provider_id);
+        }
+        let models = models
+            .iter()
+            .map(|config| ManagedModelInfo {
+                id: qualified_model_id(config),
+                name: config.name.clone(),
+                provider_id: config.provider_id.clone(),
+                // Regions of one product share its display name; only then is the region added.
+                provider_name: match &config.connection {
+                    Some(connection)
+                        if providers_named[config.provider_name.as_str()].len() > 1
+                            && let Some(region) = &connection.region =>
+                    {
+                        format!("{} · {}", config.provider_name, region.name)
+                    }
+                    _ => config.provider_name.clone(),
+                },
             })
             .collect();
         let ceiling = if let Ok(Some(metadata)) =
@@ -2096,7 +2114,7 @@ impl EmbeddedAgentAccess {
         };
         let _ = execution;
         Ok(ManagedConfiguration {
-            model_id: current.model_id.clone(),
+            model_id: qualified_model_id(current),
             mode: snapshot.policy.mode,
             models,
             modes,
@@ -2105,79 +2123,52 @@ impl EmbeddedAgentAccess {
         })
     }
 
-    /// Every model of each signed-in built-in provider, as the Console offers them, with the
-    /// option id a managed client selects it by: the bare model id for the provider that owns
-    /// it (the current provider first, else the first listed), `provider/model` for the others.
-    /// Built-in model ids contain no `/`, so the two forms never collide.
+    /// The models of the current provider and of each signed-in built-in provider, filtered as
+    /// the Console's model page filters them; a managed client names each by its
+    /// [`qualified_model_id`]. As in the Console, only the current provider's account directory
+    /// is read; other providers' models are offered unverified, so their sign-ins cost no
+    /// network call.
     async fn managed_models(
         &self,
         current: &tickloop_harness::protocol::ModelConfig,
         config_root: Option<std::path::PathBuf>,
-    ) -> Vec<(String, tickloop_harness::protocol::ModelConfig)> {
-        let scope =
-            tickloop_harness::model::auth::current_provider_credential_scope(config_root.clone());
-        let mut providers: Vec<Vec<tickloop_harness::protocol::ModelConfig>> = Vec::new();
-        for config in tickloop_harness::model::cards::ModelCatalog::defaults().profiles() {
-            match providers.last_mut() {
-                Some(provider) if provider[0].provider_id == config.provider_id => {
-                    provider.push(config)
-                }
-                _ => providers.push(vec![config]),
-            }
-        }
-        providers.retain(|provider| {
-            provider[0].provider_id == current.provider_id
-                || tickloop_harness::model::auth::provider_signed_in(&provider[0], &scope)
-                    == Ok(true)
-        });
+    ) -> Vec<tickloop_harness::protocol::ModelConfig> {
+        use tickloop_harness::model::{access::AccessCatalog, auth, cards};
         let cancel = CancellationToken::new();
-        let directories = futures_util::future::join_all(providers.iter().map(|provider| {
-            tokio::time::timeout(
-                Duration::from_secs(15),
-                self.inner.account_models.discover(
-                    &provider[0],
-                    config_root.as_deref(),
-                    false,
-                    &cancel,
-                ),
-            )
-        }))
+        let directory = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.inner
+                .account_models
+                .discover(current, config_root.as_deref(), false, &cancel),
+        )
         .await;
         cancel.cancel();
-        // A provider whose directory cannot be read keeps its catalog models, as in the Console.
-        let listed: Vec<_> = providers
+        let directory = directory.ok().and_then(Result::ok);
+        let scope = auth::current_provider_credential_scope(config_root);
+        let defaults = cards::ModelCatalog::defaults();
+        let access = AccessCatalog::defaults();
+        let mut signed_in = HashMap::new();
+        defaults
+            .profiles()
             .into_iter()
-            .zip(directories)
-            .flat_map(|(provider, directory)| {
-                let directory = directory.ok().and_then(Result::ok);
-                provider.into_iter().filter(move |config| {
-                    (config.provider_id == current.provider_id
-                        && config.model_id == current.model_id)
-                        || directory.as_ref().is_none_or(|directory| {
+            .filter(|config| {
+                if config.provider_id == current.provider_id && config.model_id == current.model_id
+                {
+                    return true;
+                }
+                let visible = access
+                    .ordinary_candidate(config, &defaults)
+                    .unwrap_or_else(|| cards::is_default_visible(config));
+                visible
+                    && if config.provider_id == current.provider_id {
+                        directory.as_ref().is_none_or(|directory| {
                             directory.availability(&config.model).selectable()
                         })
-                })
-            })
-            .collect();
-        let mut owners = HashMap::new();
-        for config in listed
-            .iter()
-            .filter(|config| config.provider_id == current.provider_id)
-            .chain(&listed)
-        {
-            owners
-                .entry(config.model_id.clone())
-                .or_insert_with(|| config.provider_id.clone());
-        }
-        listed
-            .into_iter()
-            .map(|config| {
-                let id = if owners[&config.model_id] == config.provider_id {
-                    config.model_id.clone()
-                } else {
-                    format!("{}/{}", config.provider_id, config.model_id)
-                };
-                (id, config)
+                    } else {
+                        *signed_in
+                            .entry(config.provider_id.clone())
+                            .or_insert_with(|| auth::provider_signed_in(config, &scope) == Ok(true))
+                    }
             })
             .collect()
     }
@@ -3239,4 +3230,10 @@ fn hosted_access_error(error: tickhost_connect::host_error::HostError) -> Access
         AccessErrorCode::Unavailable
     };
     AccessError::new(code, error.to_string())
+}
+
+/// The one option id that names a model, the same whichever provider is current; built-in
+/// model ids contain no `/`, so it is unambiguous.
+fn qualified_model_id(config: &tickloop_harness::protocol::ModelConfig) -> String {
+    format!("{}/{}", config.provider_id, config.model_id)
 }
