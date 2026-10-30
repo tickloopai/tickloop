@@ -707,7 +707,9 @@ fn mergeable_inputs<'chat>(chat: &'chat Chat, active: &Receipt) -> Vec<&'chat Pe
                 }
                 Some(command_skills::UserSkillPreparation::Started) => true,
                 Some(command_skills::UserSkillPreparation::Complete) => false,
-                None => !command_skills::ordinary_guidance_is_active(chat, pending.receipt.run_id),
+                None => {
+                    !command_skills::user_skill_prepared_without_shell(chat, pending.receipt.run_id)
+                }
             }
         {
             is_behind_held_prompt = true;
@@ -2123,7 +2125,11 @@ impl Agent {
             .lock()
             .await
             .values()
-            .map(|chat| chat.snapshot.clone())
+            .map(|chat| {
+                let mut snapshot = chat.snapshot.clone();
+                chat.project_pending_input_eligibility(&mut snapshot.pending_inputs);
+                snapshot
+            })
             .collect()
     }
 
@@ -3102,7 +3108,7 @@ impl Agent {
                 tickloop_harness_protocol::UserSkillInvocation {
                     name: invoked_skill.name.clone(),
                     source: invoked_skill.source.clone(),
-                    prepared_guidance_hash: None,
+                    prepared_without_shell: false,
                 },
             );
             if invoked_skill.shell_commands.is_empty() {
@@ -4345,14 +4351,14 @@ impl Agent {
             return;
         }
         if let Some(skill) = pending.skill_guidance.take()
-            && let Some(hash) = command_skills::prepared_guidance_hash(&skill)
+            && skill.shell_preprocessing != Some(true)
         {
             chat.snapshot.user_skill_invocations.insert(
                 pending.receipt.run_id,
                 tickloop_harness_protocol::UserSkillInvocation {
                     name: skill.name.clone(),
                     source: skill.source.clone(),
-                    prepared_guidance_hash: Some(hash),
+                    prepared_without_shell: true,
                 },
             );
             record_invoked_skill(chat, skill);
@@ -5566,6 +5572,7 @@ impl Agent {
             .ok_or(AgentError::NotFound)?
             .snapshot
             .clone();
+        chats[&chat_id].project_pending_input_eligibility(&mut snapshot.pending_inputs);
         snapshot.approval_records = chats[&chat_id]
             .denial_window
             .records

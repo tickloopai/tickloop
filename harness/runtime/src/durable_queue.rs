@@ -180,14 +180,14 @@ impl Agent {
             }
             if pending.is_skill_invocation
                 && let Some(skill) = &pending.skill_guidance
-                && let Some(hash) = super::command_skills::prepared_guidance_hash(skill)
+                && skill.shell_preprocessing != Some(true)
             {
                 chat.snapshot.user_skill_invocations.insert(
                     pending.receipt.run_id,
                     tickloop_harness_protocol::UserSkillInvocation {
                         name: skill.name.clone(),
                         source: skill.source.clone(),
-                        prepared_guidance_hash: Some(hash),
+                        prepared_without_shell: true,
                     },
                 );
                 chat.user_skill_preparations.insert(

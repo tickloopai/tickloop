@@ -76,7 +76,8 @@ impl SessionSource {
 
 /// What the session and turn hooks keep for a Chat in this process.
 ///
-/// `PendingInput::armed` in the live snapshot controls scheduling. On Process hosts only,
+/// `PendingInput::armed` in the internal snapshot controls scheduling. Read views also exclude
+/// inputs already claimed by a preparing Run from independent queue eligibility. On Process hosts only,
 /// the persisted queue copy is disarmed before input hooks run: that existing ledger bit
 /// marks input to retain, but not start, after a restart. Explicit continuation re-arms the
 /// live copy without erasing this retention marker; committing the prompt clears the queue.

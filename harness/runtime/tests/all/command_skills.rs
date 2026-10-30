@@ -842,7 +842,7 @@ async fn old_checkpoint_retains_queued_guidance_without_rebuilding_an_execution_
                 invocation
                     .as_object_mut()
                     .unwrap()
-                    .remove("prepared_guidance_hash");
+                    .remove("prepared_without_shell");
             }
             checkpoint["chats"][0]
                 .as_object_mut()
@@ -2076,5 +2076,122 @@ async fn a_prior_plain_invocation_cannot_prove_a_later_shell_invocation_prepared
             .iter()
             .all(|operation| operation.run_id != shell.run_id)
     );
+    restored.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn merged_plain_guidance_does_not_invalidate_the_started_invocations_preparation() {
+    use super::durable_queue::{Script, Step};
+    use tickloop_harness_protocol::hooks::{
+        ConfiguredHook, HookEvent, HookList, HookSource, HookTrust,
+    };
+    use tickloop_harness_runtime::{WaitHosting, environment::memory::MemoryCommandRun};
+    use tickloop_harness_test_support::transcripts::InMemoryTranscriptStore;
+    let folder = tempfile::tempdir().unwrap();
+    std::fs::write(folder.path().join("notes.txt"), "note").unwrap();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let memory = MemorySettingsStore::default();
+    memory
+        .write(SettingsUpdate::TrustDirectory(
+            folder.path().canonicalize().unwrap(),
+        ))
+        .unwrap();
+    memory.set_hooks(HookList {
+        hooks: vec![ConfiguredHook {
+            key: "read".into(),
+            hash: None,
+            source: HookSource::User,
+            file: "/settings.json".into(),
+            event: HookEvent::PreToolUse,
+            matcher: Some("Read".into()),
+            command: "hold-read".into(),
+            resolved_command: Some("hold-read".into()),
+            sensitive_values: Vec::new(),
+            condition: None,
+            timeout_secs: 600,
+            background: None,
+            plugin: None,
+            trust: HookTrust::Trusted,
+        }],
+        ..Default::default()
+    });
+    let settings = Arc::new(CommandSettings {
+        memory,
+        markdown: "---\ndescription: Check\n---\nGuidance: $ARGUMENTS".into(),
+    });
+    let make = |store: Arc<InMemoryTranscriptStore>, model: Arc<Script>| {
+        let environment = MemoryEnvironment::new();
+        let notify = entered.clone();
+        environment.define_command("hold-read", move |_| {
+            notify.notify_one();
+            MemoryCommandRun {
+                duration: Duration::from_secs(300),
+                ..Default::default()
+            }
+        });
+        let mut options = HarnessOptions::local(config());
+        options.settings = Some(settings.clone());
+        options.waits = WaitHosting::Durable;
+        options.host.prompt_policy = tickloop_harness_protocol::PromptPolicy::DenyOnPrompt;
+        options.tools.tick_subscriptions = false;
+        options.tools.user_skills = true;
+        Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: Some(store),
+                environment: Some(Arc::new(environment)),
+                models: ChosenModels::new(model),
+            },
+            options,
+        )
+        .unwrap()
+    };
+    let model = Script::new(vec![
+        Step::Reply(call("read", "Read", json!({"file_path":"notes.txt"}))),
+        Step::Hang,
+    ]);
+    let first = make(store.clone(), model.clone());
+    let chat = first.create_chat(folder.path().into()).await.unwrap();
+    first
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let original = first
+        .invoke_skill(chat, "demo:check", "GUIDANCE_A")
+        .await
+        .unwrap();
+    entered.notified().await;
+    first
+        .invoke_skill(chat, "demo:check", "GUIDANCE_B")
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    model.until_holding().await;
+    assert!(model.requests().last().unwrap().contains("GUIDANCE_B"));
+    first.sync().await.unwrap();
+    let crash = Arc::new(InMemoryTranscriptStore::new());
+    crash.seed(chat, store.lines(chat), store.position(chat).unwrap());
+    first.shutdown().await;
+    let model = Script::new(vec![Step::Reply(text("continued"))]);
+    let restored = make(crash, model.clone());
+    restored.resume_chat(chat).await.unwrap();
+    let mut events = restored.subscribe();
+    restored.continue_loop(chat).await.unwrap();
+    loop {
+        let event = next_event(&mut events).await;
+        if event.run_id != original.run_id {
+            continue;
+        }
+        match event.kind {
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => {
+                panic!("a prepared plain invocation must continue: {error}")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(model.requests().len(), 1);
+    assert!(model.requests()[0].contains("GUIDANCE_B"));
     restored.shutdown().await;
 }

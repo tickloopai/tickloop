@@ -9,6 +9,7 @@ const QUEUE_PROOF: &str = "queue-proof.json";
 const OTHER_VIEW_SUBMIT: &str = "other-view-submit";
 const QUEUE_DISCONNECTED: &str = "queue-disconnected";
 const HOOK_RELEASE: &str = "release-hook";
+const GROUP_HOOK_READY: &str = "group-hook-ready";
 const QUEUED_MESSAGE: &str = "Hello";
 const INITIAL_MESSAGE: &str = "Queue initial input";
 
@@ -125,15 +126,20 @@ fn pending_input_pty_fixture() {
                     calls: AtomicUsize::new(0),
                     requests: Mutex::new(Vec::new()),
                 });
-                let core = if std::env::var(QUEUE_ROUTE).as_deref() == Ok("hooks") {
+                let core = if matches!(std::env::var(QUEUE_ROUTE).as_deref(), Ok("hooks" | "merged-hooks")) {
                     use tickloop_harness::protocol::hooks::{ConfiguredHook, HookEvent, HookList, HookSource, HookTrust};
                     use tickloop_harness::runtime::{HarnessOptions, HarnessSeams};
                     use tickloop_harness::runtime::environment::memory::{MemoryCommandRun, MemoryEnvironment};
                     let environment = Arc::new(MemoryEnvironment::new());
-                    environment.define_command("wait-for-prompt", |_| MemoryCommandRun {
-                        duration: if std::path::Path::new(HOOK_RELEASE).exists() { Duration::ZERO } else { Duration::from_secs(60) },
-                        stdout: b"session context".to_vec(),
-                        ..Default::default()
+                    let merged_hooks = std::env::var(QUEUE_ROUTE).as_deref() == Ok("merged-hooks");
+                    environment.define_command("wait-for-prompt", move |spec| {
+                        let input: serde_json::Value = serde_json::from_slice(&spec.stdin).unwrap();
+                        let group = input["prompt"] == format!("{QUEUED_MESSAGE}\n\n{QUEUED_MESSAGE}");
+                        if group { std::fs::write(GROUP_HOOK_READY, "").unwrap(); }
+                        MemoryCommandRun {
+                            duration: if std::path::Path::new(HOOK_RELEASE).exists() || merged_hooks && !group { Duration::ZERO } else { Duration::from_secs(60) },
+                            stdout: b"session context".to_vec(), ..Default::default()
+                        }
                     });
                     environment.define_command("session-context", |_| MemoryCommandRun {
                         stdout: b"session context".to_vec(), ..Default::default()
@@ -182,7 +188,9 @@ fn pending_input_pty_fixture() {
                     let mut resumed_hook=false;
                     loop {
                         if let Some(snapshot) = proof_core.list_chats().await.into_iter().next() {
-                            if !resumed_hook && std::path::Path::new(HOOK_RELEASE).exists() && snapshot.pending_inputs.iter().any(|input| !input.armed) {
+                            if !resumed_hook && std::path::Path::new(HOOK_RELEASE).exists()
+                                && snapshot.chat_loop.state == LoopState::Interrupted
+                                && snapshot.pending_inputs.iter().any(|input| !input.armed) {
                                 resumed_hook=true;
                                 proof_core.continue_loop(snapshot.id).await.unwrap();
                             }
@@ -190,6 +198,9 @@ fn pending_input_pty_fixture() {
                                 other_view.display_chat(Some(snapshot.id.into())).await.unwrap();
                                 for _ in 0..2 {
                                     other_view.submit(snapshot.id.into(),QUEUED_MESSAGE.into()).await.unwrap();
+                                }
+                                if std::env::var(QUEUE_ROUTE).as_deref() == Ok("merged-hooks") {
+                                    proof_core.interrupt(snapshot.id).await.unwrap();
                                 }
                                 submitted_elsewhere=true;
                             }
@@ -525,7 +536,11 @@ fn a_prompt_waiting_for_session_hooks_stays_queued_then_echoes_once() {
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
     loop {
         let proof = wait_queue_proof(&fixture, directory.path(), 0, 1);
-        if proof["pending_receipts"][0]["armed"] == false {
+        if proof["pending_receipts"][0]["armed"] == false
+            && proof["interrupted"]
+                .as_array()
+                .is_some_and(|runs| !runs.is_empty())
+        {
             break;
         }
         assert!(
@@ -554,6 +569,42 @@ fn a_prompt_waiting_for_session_hooks_stays_queued_then_echoes_once() {
         1
     );
     std::fs::write(directory.path().join(QUEUE_STAGE), "release-1").unwrap();
+}
+
+#[test]
+fn send_now_skips_every_input_already_owned_by_the_running_prompt_hook() {
+    let (mut fixture, directory) = start_queue_fixture("merged-hooks");
+    fixture.wait_for("Tickloop");
+    fixture.send(format!("{INITIAL_MESSAGE}\r").as_bytes());
+    wait_queue_proof(&fixture, directory.path(), 1, 0);
+    std::fs::write(directory.path().join(OTHER_VIEW_SUBMIT), "").unwrap();
+    let deadline = Instant::now() + RECOVERY_TIMEOUT;
+    while !directory.path().join(GROUP_HOOK_READY).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the grouped prompt hook did not start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fixture.repaint_after_recovery("two inputs reserved by the hook", |frame| {
+        screen::queued_inputs(frame).len() == 2 && frame.contains("esc to interrupt")
+    });
+    fixture.send(b"Urgent follow-up.\r");
+    wait_queue_proof(&fixture, directory.path(), 1, 3);
+    fixture.repaint_after_recovery("an independent input can send now", |frame| {
+        screen::queued_inputs(frame).len() == 3 && frame.contains("esc to interrupt")
+    });
+    fixture.send(b"\x1b[13;5u");
+    let proof = wait_queue_proof(&fixture, directory.path(), 2, 2);
+    assert_eq!(proof["request_hellos"], 0, "{proof}");
+    let frame = fixture.repaint_after_recovery("the independent input was consumed", |frame| {
+        frame
+            .lines()
+            .any(|line| line.trim() == "❯ Urgent follow-up.")
+            && screen::queued_inputs(frame).len() == 2
+    });
+    assert_eq!(screen::queued_inputs(&frame).len(), 2);
+    std::fs::write(directory.path().join(QUEUE_STAGE), "release-2").unwrap();
 }
 
 #[test]

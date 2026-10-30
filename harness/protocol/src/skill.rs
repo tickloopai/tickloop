@@ -77,8 +77,8 @@ pub struct InvokedSkill {
 pub struct UserSkillInvocation {
     pub name: String,
     pub source: SkillSource,
-    /// SHA256 of this input's prepared guidance when it needs no Shell. Missing for Shell
-    /// plans and older records, which cannot establish that preparation finished.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prepared_guidance_hash: Option<String>,
+    /// This input's guidance was fully prepared without requiring Shell. This input-bound
+    /// fact survives later same-name invocations replacing the current guidance cache.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prepared_without_shell: bool,
 }

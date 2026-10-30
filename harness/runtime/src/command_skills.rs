@@ -1,7 +1,6 @@
 //! Command preprocessing uses the same prepared Bash execution as an ordinary tool call.
 use super::*;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tickloop_harness_policy::skills::SkillExpansion;
 use tickloop_harness_protocol::ProposedToolCall;
 
@@ -22,29 +21,11 @@ pub(super) fn shell_input(name: &str, command: &str) -> Value {
     serde_json::json!({"command": command, "description": format!("Prepare /{name}"), "run_in_background": false})
 }
 
-pub(super) fn prepared_guidance_hash(
-    skill: &tickloop_harness_protocol::InvokedSkill,
-) -> Option<String> {
-    (skill.shell_preprocessing != Some(true))
-        .then(|| format!("{:x}", Sha256::digest(skill.content.as_bytes())))
-}
-
-pub(super) fn ordinary_guidance_is_active(chat: &Chat, run: RunId) -> bool {
+pub(super) fn user_skill_prepared_without_shell(chat: &Chat, run: RunId) -> bool {
     chat.snapshot
         .user_skill_invocations
         .get(&run)
-        .is_some_and(|invocation| {
-            invocation
-                .prepared_guidance_hash
-                .as_ref()
-                .is_some_and(|expected| {
-                    chat.snapshot.invoked_skills.iter().any(|skill| {
-                        skill.name == invocation.name
-                            && skill.source == invocation.source
-                            && prepared_guidance_hash(skill).as_ref() == Some(expected)
-                    })
-                })
-        })
+        .is_some_and(|invocation| invocation.prepared_without_shell)
 }
 
 impl Agent {
@@ -93,7 +74,7 @@ impl Agent {
                 return Ok(false);
             }
             if !chat.user_skill_preparations.contains_key(&receipt.run_id)
-                && ordinary_guidance_is_active(chat, receipt.run_id)
+                && user_skill_prepared_without_shell(chat, receipt.run_id)
             {
                 return Ok(false);
             }

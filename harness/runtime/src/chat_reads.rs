@@ -25,12 +25,28 @@ pub struct ChatSummary {
     pub parent_chat: Option<ChatId>,
 }
 
+impl Chat {
+    /// Read views expose effective queue eligibility: inputs already claimed by a running
+    /// prompt preparation cannot independently be sent now. Only the exported copy changes.
+    pub(super) fn project_pending_input_eligibility(&self, pending: &mut [PendingInput]) {
+        for input in pending {
+            input.armed &= !self
+                .hook_state
+                .session
+                .preparing_inputs
+                .values()
+                .any(|reserved| reserved.contains(&input.receipt.run_id));
+        }
+    }
+}
+
 impl Agent {
     /// What the Chat is doing now, without its history.
     pub async fn status(&self, chat: ChatId) -> Result<ChatStatus, AgentError> {
         let chats = self.inner.chats.lock().await;
         let read = chats.get(&chat).ok_or(AgentError::NotFound)?;
         let mut status = ChatStatus::of(&read.snapshot);
+        read.project_pending_input_eligibility(&mut status.pending_inputs);
         status.mode_before_plan = read.snapshot.policy.mode_before_plan;
         status.task_board = shared_tasks::view(&chats, chat);
         status.provider_failures = self.inner.provider_failures.lock().unwrap().clone();
