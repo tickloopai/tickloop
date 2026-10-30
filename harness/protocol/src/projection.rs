@@ -11,13 +11,14 @@ use crate::{
     Message, Protocol, RewindPoint, Role, RunId, render_input_context, render_reference,
 };
 
-/// The guidance notes the model can still see, by Skill name and by MCP server name.
+/// The Skill, MCP and execution environment guidance the model can still see.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VisibleGuidance {
     pub skills: BTreeMap<String, (String, bool)>,
     pub mcp_servers: BTreeMap<String, String>,
     /// The digest of the MCP configuration warnings the model was last told.
     pub mcp_warnings: Option<String>,
+    pub environment: Option<String>,
 }
 
 /// A conversation whose tool calls and results cannot be paired into one model history.
@@ -86,11 +87,7 @@ impl ChatSnapshot {
     /// withdrew it.
     pub fn visible_guidance(&self) -> VisibleGuidance {
         let mut visible = VisibleGuidance::default();
-        for note in self
-            .host_notes
-            .range(self.active_start()..)
-            .map(|(_, note)| note)
-        {
+        for (index, note) in self.host_notes.range(self.active_start()..) {
             match note {
                 HostNote::Guidance(GuidanceNote::Skill {
                     name,
@@ -109,6 +106,12 @@ impl ChatSnapshot {
                 }
                 HostNote::Guidance(GuidanceNote::McpWarnings { digest }) => {
                     visible.mcp_warnings = Some(digest.clone());
+                }
+                HostNote::Guidance(GuidanceNote::Environment { digest }) => {
+                    // A boundary retains the last delivery state, not its model-visible text.
+                    if !self.is_compact_boundary(*index) {
+                        visible.environment = digest.clone();
+                    }
                 }
                 HostNote::Guidance(GuidanceNote::Withdrawn {
                     skills,

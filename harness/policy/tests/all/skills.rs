@@ -1,5 +1,83 @@
-use tickloop_harness_policy::skills::{SkillCaller, SkillRegistry};
+use tickloop_harness_policy::skills::{SkillCaller, SkillError, SkillRegistry};
 use tickloop_harness_protocol::SkillSource;
+
+#[test]
+fn builtin_registry_omits_tickloop_without_reserving_its_name() {
+    let registry = SkillRegistry::builtin();
+    assert_eq!(
+        registry
+            .definitions()
+            .map(|skill| (skill.name.as_str(), &skill.source))
+            .collect::<Vec<_>>(),
+        [
+            ("loop", &SkillSource::BuiltIn),
+            ("slides", &SkillSource::BuiltIn)
+        ]
+    );
+    assert!(!registry.model_listing().contains("- tickloop [Built-in]"));
+    assert!(
+        registry
+            .user_definitions()
+            .all(|skill| skill.name != "tickloop")
+    );
+    for caller in [SkillCaller::Model, SkillCaller::User] {
+        assert_eq!(
+            registry.expand("tickloop", "", caller),
+            Err(SkillError::Unknown("tickloop".into()))
+        );
+        assert_eq!(
+            registry
+                .expand("loop", "5m check the build", caller)
+                .unwrap()
+                .source,
+            SkillSource::BuiltIn
+        );
+    }
+    assert!(registry.model_listing().contains("- loop [Built-in]"));
+    assert!(!registry.model_listing().contains("- slides [Built-in]"));
+    assert_eq!(
+        registry.expand("slides", "", SkillCaller::Model),
+        Err(SkillError::ModelInvocationDisabled("slides".into()))
+    );
+    assert_eq!(
+        registry
+            .expand("slides", "release review", SkillCaller::User)
+            .unwrap()
+            .source,
+        SkillSource::BuiltIn
+    );
+
+    let markdown = "---\nname: tickloop\ndescription: Custom guidance\n---\nCustom guidance";
+    for source in [
+        SkillSource::Project {
+            path: "/project/tickloop/SKILL.md".into(),
+        },
+        SkillSource::User {
+            path: "/user/tickloop/SKILL.md".into(),
+        },
+        SkillSource::Plugin {
+            plugin: "sample".into(),
+            path: "/plugin/tickloop/SKILL.md".into(),
+        },
+    ] {
+        let mut registry = SkillRegistry::builtin();
+        registry.register_markdown(markdown, source.clone(), &[]);
+        let name = if matches!(source, SkillSource::Plugin { .. }) {
+            "sample:tickloop"
+        } else {
+            "tickloop"
+        };
+        assert!(registry.model_listing().contains(&format!("- {name} [")));
+        assert!(registry.user_definitions().any(|skill| skill.name == name));
+        for caller in [SkillCaller::Model, SkillCaller::User] {
+            let expansion = registry.expand(name, "", caller).unwrap();
+            assert_eq!(expansion.name, name);
+            assert_eq!(expansion.source, source);
+            assert!(expansion.content.ends_with("Custom guidance"));
+        }
+        assert!(registry.warnings().is_empty());
+    }
+}
 
 #[test]
 fn user_short_names_resolve_uniquely_without_changing_model_names() {

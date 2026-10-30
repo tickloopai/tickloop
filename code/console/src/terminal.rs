@@ -97,6 +97,7 @@ mod scrollback;
 mod selection;
 mod settings;
 mod shell_input;
+mod stall_watch;
 mod status_area;
 mod style;
 mod subagent_panel;
@@ -1942,6 +1943,12 @@ async fn interact(
     startup: StartupState,
     config_root: Option<PathBuf>,
 ) -> Result<(), String> {
+    #[cfg(not(test))]
+    if console.is_interactive()
+        && let Some(root) = &config_root
+    {
+        stall_watch::install(root);
+    }
     // This is a View integration, not a daemon integration: only a terminal actually hosted
     // by Herdr owns a pane identity. Ordinary terminals never start the reporter.
     let mut herdr_reporter = herdr_agent::Reporter::from_environment(console.is_interactive());
@@ -2011,6 +2018,8 @@ async fn interact_with_herdr(
     ));
     let mut artifact_loads = tokio::task::JoinSet::new();
     let mut tick_package_tasks = ticks_work::TickPackageTasks::new(agent.clone());
+    let mut monitor_actions =
+        tick_actions::MonitorActionQueue::new(agent.clone(), console.clone(), config_root.clone());
     let mut mcp_tasks = mcp_work::McpTasks::default();
     let mut hook_tasks = hooks_work::HookTasks::default();
     // While `/mcp` shows servers that are still connecting, it reads them again this often.
@@ -2216,6 +2225,7 @@ async fn interact_with_herdr(
         write_warning(console, HANDOFF_AGENT_ENDED)?;
     }
     loop {
+        let preparing = stall_watch::enter("main loop: before select");
         observed_run_starts.retain(|run, _| pending.contains_key(run));
         awaited_mcp_servers.retain(|run, _| pending.contains_key(run));
         suggestible_runs.retain(|run| pending.contains_key(run));
@@ -3027,13 +3037,16 @@ async fn interact_with_herdr(
         let global_refresh_enabled = agent.recovery_refresh_enabled();
         #[cfg(not(test))]
         let global_refresh_enabled = true;
+        drop(preparing);
         tokio::select! {
             _ = background_poll.tick(), if background_work.is_waiting() => {},
             _ = activation_refresh.tick(), if interactive && activation_checks.is_empty() => {
+                let _stall = stall_watch::enter("main loop: activation refresh");
                 let initial = std::mem::take(&mut initial_activation);
                 activation_checks.spawn(runtime_upgrade::check(agent.clone(), initial));
             },
             checked = activation_checks.join_next(), if !activation_checks.is_empty() => {
+                let _stall = stall_watch::enter("main loop: activation check");
                 ready_runtime = None;
                 match checked {
                 Some(Ok(Ok(mut activation))) => {
@@ -3060,6 +3073,7 @@ async fn interact_with_herdr(
                 }
             },
             result = completed_task_cleanups.join_next(), if !completed_task_cleanups.is_empty() => {
+                let _stall = stall_watch::enter("main loop: task cleanup");
                 match result {
                     Some(Ok(Ok(()))) => {},
                     Some(Ok(Err(error))) => {
@@ -3074,29 +3088,40 @@ async fn interact_with_herdr(
             },
             _ = artifact_refresh.tick(), if console.artifacts_picker_is_open()? => {},
             result = artifact_loads.join_next(), if !artifact_loads.is_empty() => {
+                let _stall = stall_watch::enter("main loop: artifact load");
                 if let Some(Ok((request, result))) = result { console.artifact_page_loaded(&request, result)?; }
             },
+            result = monitor_actions.finished(), if monitor_actions.is_running() => {
+                let _stall = stall_watch::enter("main loop: Monitor action finished");
+                if let Err((chat, error)) = result { console.report_monitor_error(chat, &error)?; }
+                status_dirty=true;
+            },
             result = tick_package_tasks.join_next(), if !tick_package_tasks.is_empty() => {
+                let _stall = stall_watch::enter("main loop: Tick package task");
                 if let Some((panel, result)) = result && let Some(root) = config_root.as_deref() {
                     ticks_work::finish(console, root, panel, result, &mut tick_package_tasks)?;
                 }
             },
             result = mcp_tasks.join_next(), if !mcp_tasks.is_empty() => {
+                let _stall = stall_watch::enter("main loop: MCP task");
                 if let Some((panel, done)) = result && let Some(root) = config_root.as_deref() {
                     mcp_work::finish(console, root, agent, panel, done, &mut mcp_tasks)?;
                 }
             },
             done = hook_tasks.join_next(), if !hook_tasks.is_empty() => {
+                let _stall = stall_watch::enter("main loop: hook task");
                 if let Some(done) = done {
                     hooks_work::finish(console, agent, done, &mut hook_tasks)?;
                 }
             },
             _ = mcp_refresh.tick(), if console.mcp_panel_awaiting_connections()?.is_some() => {
+                let _stall = stall_watch::enter("main loop: MCP refresh");
                 if let Some(panel) = console.mcp_panel_awaiting_connections()? && let Some(root) = config_root.as_deref() {
                     mcp_work::refresh(root, agent, panel, &mut mcp_tasks);
                 }
             },
             result = suggestions.join_next(), if !suggestions.is_empty() => {
+                let _stall = stall_watch::enter("main loop: prompt suggestion");
                 if let Some(Ok((request, mut result))) = result {
                     let suppression = if selected_chat != Some(request.chat.into()) || overview_active {
                         Some("discarded: Agent View changed")
@@ -3122,6 +3147,7 @@ async fn interact_with_herdr(
                 }
             },
             result = menus.next_provider_update(), if discovery_active || search_test_active => {
+                let _stall = stall_watch::enter("main loop: provider update");
                 match result {
                     menus::ProviderUpdate::Search(result) => menus.finish_search_test(console, result)?,
                     menus::ProviderUpdate::Models(result) => menus.finish_discovery(agent, console, result).await?,
@@ -3129,6 +3155,7 @@ async fn interact_with_herdr(
                 status_dirty = true;
             },
             (login_id, update) = login::next_login_update(&mut logins), if login_updates_pending => {
+                let _stall = stall_watch::enter("main loop: login update");
                 match update {
                     Some(LoginUpdate::Device { address, code }) => logins[&login_id].flow.show_device(console, &address, &code)?,
                     Some(LoginUpdate::Browser { address, callback }) => logins.get_mut(&login_id).unwrap().flow.show_browser(console, address, callback)?,
@@ -3170,6 +3197,7 @@ async fn interact_with_herdr(
                 status_dirty = true;
             },
             result = async { logout.as_mut().unwrap().next().await }, if logout_active => {
+                let _stall = stall_watch::enter("main loop: logout");
                 logout.take();
                 match result {
                     Ok(()) => {
@@ -3195,6 +3223,7 @@ async fn interact_with_herdr(
                 else if !login_active && !logout_active && let Some(command)=menu_commands.pop_front() {Some(InputEvent::Line(command))}
                 else {input.recv().await}
             }, if !eof || (!logout_active && (!paused_inputs.is_empty() || !menu_commands.is_empty())) => {
+                let _stall = stall_watch::enter("main loop: input");
                 // Opening the overview, navigating, restoring or any other View action may show
                 // the conversation again, so a merged-input block only spans uninterrupted events.
                 merged_echoes.close_all();
@@ -3203,9 +3232,7 @@ async fn interact_with_herdr(
                 }
                 let line = match line {
                     Some(InputEvent::TickAction { chat, action }) if selected_chat == Some(chat.into()) && !overview_active && !login_active => {
-                        let context = tick_actions::TickActionContext { agent, console, root:config_root.as_deref(), chat };
-                        if let Err(error) = tick_actions::execute(action,context).await { console.report_monitor_error(chat, &error)?; }
-                        status_dirty=true;
+                        monitor_actions.submit(chat, action)?;
                         continue;
                     }
                     Some(InputEvent::TickAction { .. }) => continue,
@@ -4730,6 +4757,10 @@ async fn interact_with_herdr(
                 }
             }},
             event = next_event(&mut events, &mut feed_gaps, &mut deferred_events, visual_pacing_pending) => {
+                let _stall = stall_watch::enter_with(|| match &event {
+                    Ok(event) => format!("main loop: agent event {} #{} of {}", stall_watch::variant_name(&event.kind), event.sequence, event.chat_id.public()),
+                    Err(_) => "main loop: lost events recovery".to_owned(),
+                });
                 if matches!(&event, Ok(event) if Some(event.chat_id) == selected_chat && matches!(event.kind, EventKind::Started | EventKind::InputMerged { .. } | EventKind::ConversationRewound { .. })) {
                     console.clear_prompt_suggestion()?;
                 }
@@ -5208,7 +5239,7 @@ async fn interact_with_herdr(
                 Err(EventInterruption::Closed) => return Err("agent event stream closed".into()),
                 }
             },
-            event = user_shell_events.recv() => match event {
+            event = user_shell_events.recv() => { let _stall = stall_watch::enter("main loop: user shell event"); match event {
                 Ok(record) if user_shell_offsets.contains_key(&record.id) => {
                     status_dirty=true;
                     let observation=observe_user_shell_record(&mut foreground_shells,&mut backgrounded_shells,&record);
@@ -5254,8 +5285,9 @@ async fn interact_with_herdr(
                     }
                 },
                 Err(broadcast::error::RecvError::Closed) => return Err("user shell event stream closed".into()),
-            },
+            }},
             Some(result)=compactions.join_next_with_id(), if !compactions.is_empty() => {
+                let _stall = stall_watch::enter("main loop: compaction");
                 status_dirty=true;
                 let task_id=match &result {Ok((id,_))=>*id,Err(error)=>error.id()};
                 compaction_chats.remove(&task_id).ok_or("unknown compaction task")?;
@@ -5266,6 +5298,7 @@ async fn interact_with_herdr(
                 }
             },
             completion=directed_summaries.join_next(), if !directed_summaries.is_empty() => {
+                let _stall = stall_watch::enter("main loop: directed summary");
                 status_dirty=true;
                 match completion?.ok_or("directed summary task disappeared")? {
                     SummaryTaskCompletion::Finished {metadata,result} => match *result {
@@ -5297,6 +5330,7 @@ async fn interact_with_herdr(
                 }
             },
             _ = global_refresh.tick(), if global_refresh_enabled => {
+                let _stall = stall_watch::enter("main loop: global refresh");
                 match global.refresh().await {
                     Ok(_)=>{
                         if let Ok(Some(receipt))=global.reconcile_dispatch().await {
@@ -5436,13 +5470,16 @@ async fn interact_with_herdr(
                 }
             },
             _ = update_notice_refresh.tick(), if interactive && !visual_pacing_pending && update_monitor.is_some() => {
+                let _stall = stall_watch::enter("main loop: update notice");
                 installation_notice = update_monitor.as_ref().and_then(|monitor| monitor.notice());
             },
             _ = animation_refresh.tick(), if interactive && !visual_pacing_pending && (thinking_frame_due || (!prefers_reduced_motion && (!pending.is_empty() || !directed_summaries.is_empty()))) => {
+                let _stall = stall_watch::enter("main loop: animation");
                 thinking_frame_due = false;
                 activity_dirty = true;
             },
             _ = transcript_refresh.tick(), if interactive && transcript_refresh_due => {
+                let _stall = stall_watch::enter("main loop: transcript refresh");
                 transcript_refresh_due = false;
                 if let Some(chat) = selected_chat
                     && let Some(id) = console.open_transcript()?
@@ -5452,14 +5489,17 @@ async fn interact_with_herdr(
                 }
             },
             _ = elapsed_refresh.tick(), if interactive && !visual_pacing_pending && (prefers_reduced_motion && running_activity.as_ref().is_some_and(|activity| activity.started_at.is_some())) => {
+                let _stall = stall_watch::enter("main loop: elapsed refresh");
                 activity_dirty = true;
             },
             _ = tokio::task::yield_now(), if visual_pacing_pending => {
+                let _stall = stall_watch::enter("main loop: visual pacing");
                 if let Some(reply) = reply_lines.values_mut().find(|reply| Some(reply.chat_id) == selected_chat.map(Into::into) && reply.has_complete_line()) {
                     write_next_reply_line(console, reply)?;
                 }
             },
             _ = member_probe.tick(), if interactive && !overview_active => {
+                let _stall = stall_watch::enter("main loop: member probe");
                 // A slow host never stalls input: the probe runs beside the loop and reports back.
                 if let Some(probe) = console.claim_member_probe()? {
                     let console = console.clone();
@@ -5481,9 +5521,11 @@ async fn interact_with_herdr(
                 }
             },
             _ = subscription_refresh.tick(), if interactive && !overview_active && console.monitor_has_entries()? => {
+                let _stall = stall_watch::enter("main loop: subscription refresh");
                 monitor_refresh_due = true;
             },
             _ = prompt_watchdog_refresh.tick(), if selected_chat.is_some() => {
+                let _stall = stall_watch::enter("main loop: prompt watchdog");
                 let chat=selected_chat.expect("selected Chat checked above");
                 check_shell_prompt_watchdog(
                     &task_center,
@@ -5493,7 +5535,7 @@ async fn interact_with_herdr(
                     prompt_watchdog_epoch.elapsed(),
                 ).await?;
             },
-            notification = task_notifications.recv() => match notification {
+            notification = task_notifications.recv() => { let _stall = stall_watch::enter("main loop: task notification"); match notification {
                 Ok(notification) if !overview_active && Some(notification.chat_id)==selected_chat => {
                     console.write_task_notification(&notification)?;
                     status_dirty=true;
@@ -5512,8 +5554,9 @@ async fn interact_with_herdr(
                 },
                 Err(broadcast::error::RecvError::Lagged(_)) => {},
                 Err(broadcast::error::RecvError::Closed) => return Err("task notification stream closed".into()),
-            },
+            }},
             signal = tokio::signal::ctrl_c() => {
+                let _stall = stall_watch::enter("main loop: Ctrl+C");
                 signal.map_err(|_| "cannot listen for terminal interrupt")?;
                 outln!(console, "\nClosing this View; Agent work continues.");
                 return Ok(());

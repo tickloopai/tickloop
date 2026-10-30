@@ -604,8 +604,7 @@ fn item_tokens(items: &[ContextItem], name: &str) -> u64 {
         .map_or(0, |item| item.tokens)
 }
 
-/// The shape of a fresh Chat in which the user typed only a greeting: the host had already
-/// written the MCP server instructions and the tickloop Skill's guidance into its history.
+/// Historical guidance remains attributable even after the built-in Skill is retired.
 #[tokio::test]
 async fn host_notes_count_apart_from_what_the_user_typed() {
     let (agent, chat_id, _directory) = agent_with_catalog().await;

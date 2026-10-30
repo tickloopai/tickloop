@@ -681,12 +681,21 @@ async fn overview_title_fallback_uses_short_task_or_shell_text_before_generation
 #[tokio::test]
 async fn creating_with_an_unknown_skill_rejects_without_registering_an_empty_agent() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = Agent::new_embedded(
+    let skill_directory = directory.path().join(".tickloop/skills/guide");
+    std::fs::create_dir_all(&skill_directory).unwrap();
+    std::fs::write(
+        skill_directory.join("SKILL.md"),
+        "---\nname: guide\ndescription: Test guidance\n---\nGuide $ARGUMENTS",
+    )
+    .unwrap();
+    let runtime = Agent::open_embedded(
+        directory.path().join("state"),
         tickloop_harness::test_support::config(),
         Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
             tickloop_harness::test_support::text("loaded"),
         ])),
-    );
+    )
+    .unwrap();
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let create = |name: &str| CommandEnvelope {
         daemon_epoch: access.daemon_epoch(),
@@ -731,7 +740,7 @@ async fn creating_with_an_unknown_skill_rejects_without_registering_an_empty_age
         catalog(&access).await.is_empty(),
         "a rejected first Skill leaves no empty Agent behind"
     );
-    let accepted = access.execute(create("tickloop")).await.unwrap();
+    let accepted = access.execute(create("guide")).await.unwrap();
     assert!(accepted.into_result().is_ok());
     assert_eq!(catalog(&access).await.len(), 1);
     runtime.shutdown().await;

@@ -146,6 +146,11 @@ impl LocalShells {
         *self.sandbox.write().unwrap() = Some(settings);
     }
 
+    pub(crate) fn guidance(&self, folder: Option<&str>) -> ExecutionGuidance {
+        let settings = self.sandbox.read().unwrap().clone();
+        super::sandbox::guidance(settings.as_ref(), folder)
+    }
+
     pub(crate) fn tasks(&self) -> Arc<ShellTasks> {
         self.tasks.clone()
     }

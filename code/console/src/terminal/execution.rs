@@ -478,6 +478,13 @@ impl EventForwarder {
             return true;
         }
         self.forwarded_through = event.sequence;
+        let _phase = super::stall_watch::enter_with(|| {
+            format!(
+                "feed {}: waiting for event delivery to forward event {}",
+                event.chat_id.public(),
+                event.sequence
+            )
+        });
         let covered = tokio::select! {
             _ = cancel.cancelled() => return false,
             covered = self.event_delivery.lock() => covered,
@@ -618,7 +625,7 @@ impl ConsoleExecution {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                access,
+                access: Arc::new(super::stall_watch::WatchedAccess(access)),
                 upgrades_supported: false,
                 epoch,
                 launch,
@@ -1436,6 +1443,13 @@ impl ConsoleExecution {
                         let Some(inner) = weak.upgrade() else {
                             break;
                         };
+                        let _phase = super::stall_watch::enter_with(|| {
+                            format!(
+                                "feed {}: resync after event {}",
+                                chat.public(),
+                                forwarder.forwarded_through
+                            )
+                        });
                         match inner
                             .missed_events(execution, forwarder.forwarded_through)
                             .await
@@ -1494,6 +1508,7 @@ impl ConsoleExecution {
     }
 
     pub(super) async fn pause_event_delivery(&self) -> EventRecovery {
+        let _phase = super::stall_watch::enter("event recovery: waiting for event delivery");
         EventRecovery {
             covered: self.inner.event_delivery.clone().lock_owned().await,
             inner: self.inner.clone(),
@@ -5007,9 +5022,12 @@ mod tests {
         Arc<Recording>,
         ConsoleExecution,
     ) {
-        let runtime = tickloop_harness::runtime::Agent::new_embedded(
+        use tickloop_code_settings::local_agent::LocalAgent;
+
+        let runtime = tickloop_harness::runtime::Agent::new_with_user_settings_embedded(
             model.clone(),
             Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
+            tickloop_code_settings::UserSettings::in_root(directory),
         );
         let actual = EmbeddedAgentAccess::new(runtime.clone());
         let epoch = actual.daemon_epoch();
@@ -5682,6 +5700,13 @@ mod tests {
         accepted: impl Fn(&CommandResult) -> bool,
     ) {
         let directory = tempfile::tempdir().unwrap();
+        let skill_directory = directory.path().join(".tickloop/skills/guide");
+        std::fs::create_dir_all(&skill_directory).unwrap();
+        std::fs::write(
+            skill_directory.join("SKILL.md"),
+            "---\nname: guide\ndescription: Test guidance\n---\nGuide $ARGUMENTS",
+        )
+        .unwrap();
         let (runtime, access, terminal) = recording_terminal(directory.path());
         let chat = terminal
             .create_from_draft(directory.path().into())
@@ -5741,12 +5766,7 @@ mod tests {
     async fn a_late_accepted_skill_is_adopted_instead_of_sent_again() {
         assert_late_accepted_input_is_adopted(
             "skill",
-            async |terminal, chat| {
-                terminal
-                    .invoke_skill(chat, "tickloop", "")
-                    .await
-                    .map(|_| ())
-            },
+            async |terminal, chat| terminal.invoke_skill(chat, "guide", "").await.map(|_| ()),
             |command| {
                 matches!(
                     command,
@@ -5767,7 +5787,7 @@ mod tests {
             "queued",
             async |terminal, chat| {
                 terminal
-                    .queue_command(chat, "/tickloop".into())
+                    .queue_command(chat, "/guide".into())
                     .await
                     .map(|_| ())
             },

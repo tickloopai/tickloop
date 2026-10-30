@@ -268,7 +268,6 @@ fn loop_is_a_built_in_skill_the_user_and_the_model_can_invoke() {
     for registry in [
         SkillRegistry::discover(folder.path(), None),
         SkillRegistry::builtin(),
-        SkillRegistry::builtin_without_ticks(),
     ] {
         assert!(registry.contains("loop"));
         assert!(!registry.is_user_only("loop"));
@@ -449,7 +448,7 @@ fn a_chat_without_a_folder_uses_only_the_config_root_loop_file() {
         &config_root.path().join(".tickloop/loop.md"),
         "not a project",
     );
-    let mut registry = SkillRegistry::builtin_without_ticks();
+    let mut registry = SkillRegistry::builtin();
     registry.set_loop_instructions(std::sync::Arc::new(LoopFiles::new(
         None,
         Some(config_root.path()),

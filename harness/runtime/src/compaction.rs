@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use super::ChatBookkeeping;
 use tickloop_harness_protocol::{
-    COMPACT_BOUNDARY_TEXT, ChatSnapshot, CompactBoundary, CompactionMarker, Content, Message, Role,
-    SummarizeMetadata, Usage,
+    COMPACT_BOUNDARY_TEXT, ChatSnapshot, CompactBoundary, CompactionMarker, Content, GuidanceNote,
+    HostNote, Message, Role, SummarizeMetadata, Usage,
 };
 
 /// Source of one message in the conversation after compaction.
@@ -197,6 +197,14 @@ impl CompactionLayout {
                     compacted.messages.push(message);
                 }
                 MessageSource::Boundary => {
+                    // Loading a full compact starts at this boundary, not at the old notes, and a
+                    // directed summary drops the notes of the messages it summarizes; either way
+                    // the boundary keeps what the summary may still carry, so it can be withdrawn.
+                    if let Some(note) = snapshot.host_notes.values().rev().find(|note| {
+                        matches!(note, HostNote::Guidance(GuidanceNote::Environment { .. }))
+                    }) {
+                        compacted.host_notes.insert(index, note.clone());
+                    }
                     compacted.messages.push(Message {
                         role: Role::System,
                         content: vec![Content::Text {

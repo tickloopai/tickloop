@@ -31,6 +31,7 @@ const TASK_ROWS: usize = 2;
 const GOAL_ROWS: usize = 2;
 const MINIMUM_TICK_SECTION_ROWS: usize = 3;
 const TICK_PREFETCH_ROWS: usize = 8;
+const ACTION_WAITING_STATUS: &str = "Waiting for previous action";
 const EMPTY_MONITOR_TEXT: &str = "Nothing to monitor";
 /// The end of the row whose card has the focus: keys go to its Tick.
 const FOCUSED_CARD_MARK: &str = "input";
@@ -179,6 +180,8 @@ pub(super) struct Monitor {
     /// its place.
     reconciled_order: Vec<MonitorTarget>,
     pub(super) action_error: Option<String>,
+    /// An action of this Chat waits behind one its host has not answered yet.
+    pub(super) action_waiting: bool,
     tick_anchor: Option<InstanceRef>,
     expanded_tasks: bool,
     goal_continued_at_ms: Option<u64>,
@@ -1507,11 +1510,14 @@ impl Monitor {
         self.frame(width, height, display, now_ms).lines
     }
 
-    /// The status line under the list: an action's error, or the selected row's state while the
-    /// list itself has the keyboard.
+    /// The status line under the list: an action's error, a waiting action, or the selected row's
+    /// state while the list itself has the keyboard.
     fn selected_status(&self) -> String {
         if let Some(error) = &self.action_error {
             return error.clone();
+        }
+        if self.action_waiting {
+            return ACTION_WAITING_STATUS.to_owned();
         }
         if !self.focused || self.card_focused {
             return String::new();
@@ -1677,6 +1683,7 @@ impl Monitor {
         now_ms: u64,
     ) -> usize {
         let has_status = self.action_error.is_some()
+            || self.action_waiting
             || (self.detail.is_none()
                 && !self.expanded_tasks
                 && !self.selected_status().is_empty());
@@ -2196,7 +2203,10 @@ impl Monitor {
         }
         lines.extend(goal_lines);
         if show_footer {
-            if let Some(entry) = self.selected().filter(|_| self.action_error.is_none()) {
+            if let Some(entry) = self
+                .selected()
+                .filter(|_| self.action_error.is_none() && !self.action_waiting)
+            {
                 use unicode_width::UnicodeWidthStr;
                 let title = super::safe_line(&entry.title);
                 let details = list_row::row_details(entry.tone, &entry.notes, now_ms);
@@ -4228,6 +4238,25 @@ mod scrolling_tests {
             status(&monitor).contains("Cannot open"),
             "an action's error stays"
         );
+    }
+
+    #[test]
+    fn a_waiting_action_shows_on_the_status_line_wherever_the_keyboard_is() {
+        let display = DisplayProfile::default();
+        let mut monitor = monitor(2);
+        observe(&mut monitor, &[0], 5_000);
+        let status = |monitor: &Monitor| texts(&monitor.frame(30, 12, display, 6_000)).join("\n");
+        monitor.action_waiting = true;
+        assert!(status(&monitor).contains(ACTION_WAITING_STATUS));
+        assert!(!status(&monitor).contains("Agent unread"));
+        monitor.focused = false;
+        assert!(status(&monitor).contains(ACTION_WAITING_STATUS));
+        assert_eq!(monitor.side_content_height(30, 12, display, 6_000), 12);
+        monitor.action_error = Some("Cannot open".into());
+        assert!(status(&monitor).contains("Cannot open"), "an error wins");
+        monitor.action_error = None;
+        monitor.action_waiting = false;
+        assert!(!status(&monitor).contains(ACTION_WAITING_STATUS));
     }
 
     #[test]

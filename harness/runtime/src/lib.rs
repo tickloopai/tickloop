@@ -1271,13 +1271,7 @@ impl Agent {
         folder: Option<&Path>,
     ) -> Arc<tickloop_harness_policy::skills::SkillRegistry> {
         Arc::new(self.inner.settings.as_ref().map_or_else(
-            || {
-                if folder.is_some() {
-                    tickloop_harness_policy::skills::SkillRegistry::builtin()
-                } else {
-                    tickloop_harness_policy::skills::SkillRegistry::builtin_without_ticks()
-                }
-            },
+            tickloop_harness_policy::skills::SkillRegistry::builtin,
             |settings| settings.skills(folder),
         ))
     }
@@ -1598,7 +1592,7 @@ impl Agent {
                         .is_some_and(|provider| provider.remote_skill_is_current(&skill.source))
                 }
                 tickloop_harness_protocol::SkillSource::BuiltIn
-                    if skill.name == "artifact-draft" =>
+                    if matches!(skill.name.as_str(), "artifact-draft" | "tickloop") =>
                 {
                     false
                 }
@@ -3553,6 +3547,14 @@ impl Agent {
         let timing = timing::Phase::new("announce_guidance");
         Box::pin(self.announce_guidance(receipt)).await?;
         drop(timing);
+        if registry
+            .resolve(tickloop_harness_tools::BASH_TOOL_NAME)
+            .is_some()
+        {
+            let timing = timing::Phase::new("announce_environment_guidance");
+            Box::pin(self.announce_environment_guidance(receipt, &cancel)).await?;
+            drop(timing);
+        }
         let user_context = self.user_context(receipt.chat_id).await?;
         let timing = timing::Phase::new("announce_date_change");
         Box::pin(self.announce_date_change(receipt)).await?;

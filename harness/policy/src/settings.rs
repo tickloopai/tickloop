@@ -125,12 +125,8 @@ pub enum SettingsStoreError {
 pub trait SettingsStore: Send + Sync {
     fn read(&self, project: Option<&Path>) -> SettingsSnapshot;
     fn write(&self, change: SettingsUpdate) -> Result<(), SettingsStoreError>;
-    fn skills(&self, folder: Option<&Path>) -> crate::skills::SkillRegistry {
-        if folder.is_some() {
-            crate::skills::SkillRegistry::builtin()
-        } else {
-            crate::skills::SkillRegistry::builtin_without_ticks()
-        }
+    fn skills(&self, _folder: Option<&Path>) -> crate::skills::SkillRegistry {
+        crate::skills::SkillRegistry::builtin()
     }
     fn loop_instructions(
         &self,

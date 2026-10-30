@@ -225,6 +225,10 @@ impl ExecutionPort for LocalPort {
                     self.authority.check(self.scope.chat)?;
                     Ok(ExecutionInspection::Description(description))
                 }
+                ExecutionQuery::Guidance => Ok(ExecutionInspection::Guidance(match &self.shells {
+                    Some(shells) => shells.guidance(self.scope.folder.as_deref()),
+                    None => sandbox::guidance(None, self.scope.folder.as_deref()),
+                })),
                 ExecutionQuery::Capabilities => {
                     Ok(ExecutionInspection::Capabilities(self.capabilities))
                 }

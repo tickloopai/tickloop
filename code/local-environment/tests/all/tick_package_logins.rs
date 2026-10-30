@@ -14,7 +14,6 @@ use tickloop_code_local_environment::hosted::{
     tools::HostedTickTools,
     worker_control::{DaemonControl, WorkerControlGrant},
 };
-use tickloop_harness::policy::skills::TICKLOOP_SKILL;
 use tickloop_harness::protocol::{Content, EventKind, Role};
 use tickloop_harness::runtime::{Agent, host_tools::HostToolProvider};
 use tickloop_harness::test_support::{ScriptedModel, config, next_event, text};
@@ -139,8 +138,7 @@ fn a_package_login_state_follows_its_saved_credentials_at_once() {
 }
 
 #[tokio::test]
-async fn each_model_request_lists_the_plugins_without_login_states_with_the_fields_the_tickloop_skill_names()
- {
+async fn model_context_lists_plugin_capabilities_without_login_states() {
     let directory = tempfile::tempdir().unwrap();
     let cwd = directory.path().canonicalize().unwrap();
     let packages = PluginStore::in_config_root(&cwd.join("config"));
@@ -191,25 +189,39 @@ async fn each_model_request_lists_the_plugins_without_login_states_with_the_fiel
         [(json!("plain"), None), (json!("sample"), None)],
         "a login changes without the model, so the system prompt leaves it out"
     );
-    for field in listed[0].as_object().unwrap().keys() {
-        assert!(
-            TICKLOOP_SKILL.contains(&format!("`{field}`")),
-            "the tickloop Skill names the package field {field}"
-        );
-    }
-    // An open reports the states a plugin's missing login can have.
-    for login in [
-        WorkspacePluginLogin::LoggedOut,
-        WorkspacePluginLogin::Expired,
-        WorkspacePluginLogin::Unknown,
+    assert_eq!(
+        listed[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "description",
+            "enabled",
+            "executable",
+            "has_tick",
+            "id",
+            "name",
+            "version"
+        ]
+        .into_iter()
+        .collect()
+    );
+    let manage = requests[0]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "TickManage")
+        .unwrap();
+    for guidance in [
+        "workspace_host.plugins",
+        "<package>:usage",
+        "plugin_login",
+        "/ticks",
     ] {
-        let login = serde_json::to_value(login).unwrap();
-        assert!(
-            TICKLOOP_SKILL.contains(&format!("`{}`", login.as_str().unwrap())),
-            "the tickloop Skill names the login state {login}"
-        );
+        assert!(manage.description.contains(guidance), "{guidance}");
     }
-    assert!(TICKLOOP_SKILL.contains("`plugin_login`"));
+    assert!(!manage.description.contains("load the tickloop Skill"));
 }
 
 #[test]

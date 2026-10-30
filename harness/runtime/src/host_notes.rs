@@ -13,7 +13,11 @@ use tickloop_harness_protocol::{
     Message, Receipt, Role, SharedTask, SkillSource,
 };
 
-use crate::{Agent, AgentError, Chat, host_tools::McpServerInstructions};
+use crate::{
+    Agent, AgentError, Chat,
+    environment::{ExecutionAuthority, ExecutionInspection, ExecutionQuery, ExecutionScope},
+    host_tools::McpServerInstructions,
+};
 use tickloop_harness_protocol::tags::single_line;
 
 /// Claude Code's `POST_COMPACT_MAX_TOKENS_PER_SKILL` and `POST_COMPACT_SKILLS_TOKEN_BUDGET`.
@@ -274,6 +278,87 @@ impl Agent {
             .map_err(AgentError::Storage)
     }
 
+    pub(super) async fn announce_environment_guidance(
+        &self,
+        receipt: &Receipt,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), AgentError> {
+        let Some(environment) = &self.inner.environment else {
+            return Ok(());
+        };
+        let folder = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
+            if chat.active_run != Some(receipt.run_id) {
+                return Ok(());
+            }
+            chat.snapshot.folder.clone()
+        };
+        let Some(folder) = folder else {
+            return Ok(());
+        };
+        let Ok(port) = environment.bind(
+            ExecutionScope {
+                chat: receipt.chat_id,
+                folder: Some(folder.to_string_lossy().into_owned()),
+            },
+            ExecutionAuthority::with_cancellation(receipt.chat_id, cancel.clone()),
+        ) else {
+            return Ok(());
+        };
+        let inspection = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(tickloop_harness_model::ModelError::Cancelled.into()),
+            inspection = port.inspect(ExecutionQuery::Guidance) => inspection,
+        };
+        let Ok(ExecutionInspection::Guidance(guidance)) = inspection else {
+            // An unconfirmed environment must not withdraw instructions it supplied earlier.
+            return Ok(());
+        };
+        let current = guidance.content.as_deref().map(digest);
+        let (snapshot, bookkeeping) = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats
+                .get_mut(&receipt.chat_id)
+                .ok_or(AgentError::NotFound)?;
+            if chat.active_run != Some(receipt.run_id) || cancel.is_cancelled() {
+                return Ok(());
+            }
+            let previous = if current.is_some() {
+                chat.snapshot.visible_guidance().environment
+            } else {
+                // A compact summary can still mention guidance that is now withdrawn.
+                chat.snapshot
+                    .host_notes
+                    .values()
+                    .rev()
+                    .find_map(|note| match note {
+                        HostNote::Guidance(GuidanceNote::Environment { digest }) => {
+                            Some(digest.clone())
+                        }
+                        _ => None,
+                    })
+                    .flatten()
+            };
+            if previous == current {
+                return Ok(());
+            }
+            let text = guidance.content.map_or(guidance.withdrawal, |content| {
+                format!("Current execution environment guidance replaces any earlier environment guidance. It grants no additional permissions.\n\n{content}")
+            });
+            append_note(
+                &mut chat.snapshot,
+                receipt,
+                text,
+                HostNote::Guidance(GuidanceNote::Environment { digest: current }),
+            );
+            (chat.snapshot.clone(), chat.bookkeeping.clone())
+        };
+        self.checkpoint_transcript(&snapshot, &bookkeeping)
+            .await
+            .map_err(AgentError::Storage)
+    }
+
     /// Writes the guidance in effect that the model cannot see yet, after the history it already
     /// has: Claude Code keeps a Skill's guidance where its call put it and announces MCP server
     /// instructions as `mcp_instructions_delta` attachments, so every later request resends the
@@ -498,7 +583,11 @@ fn guiding_skills(chat: &Chat) -> Vec<InvokedSkill> {
         .iter()
         .filter(|invoked| match invoked.source {
             SkillSource::Remote { .. } => invoked.run_id == chat.active_run,
-            SkillSource::BuiltIn if invoked.name == "artifact-draft" => false,
+            SkillSource::BuiltIn
+                if matches!(invoked.name.as_str(), "artifact-draft" | "tickloop") =>
+            {
+                false
+            }
             SkillSource::BuiltIn => invoked.run_id.is_none() || invoked.run_id == chat.active_run,
             SkillSource::Later(_) => false,
             _ => true,

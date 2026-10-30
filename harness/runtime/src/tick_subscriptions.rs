@@ -167,7 +167,7 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: TICK_MANAGE.into(),
         description: format!(
-            "Manage this Chat's Tick subscriptions. action=subscribe requires tick_instance_id and optionally frequency ({periods}; default {}). A Shell Tick is immediate and takes no frequency. An artifact uses its association rather than a subscription. action=unsubscribe requires subscription, the subscription id. A quiet period delivers nothing; state updates merge to the latest value. Opening or reading a Tick never subscribes automatically. Report that observation started only when the result says ready: true; for ready: false, inspect the returned link instead of subscribing again.",
+            "Manage this Chat's Tick subscriptions. Subscribe only when the user wants continued observation. action=subscribe requires tick_instance_id and optionally frequency ({periods}; default {}). A Shell Tick is immediate and takes no frequency. An artifact uses its association rather than a subscription. action=unsubscribe requires subscription, the subscription id. A quiet period delivers nothing; state updates merge to the latest value. Opening or reading a Tick never subscribes automatically. Report that observation started only when the result says ready: true; for ready: false, inspect the returned link instead of subscribing again. A link that stays Disconnected has exhausted its reconnects: unsubscribe then subscribe again only when the user requests a retry. A reopened instance needs an explicitly chosen new subscription.",
             DEFAULT_FREQUENCY.name()
         ),
         input_schema: json!({"type":"object","properties":{

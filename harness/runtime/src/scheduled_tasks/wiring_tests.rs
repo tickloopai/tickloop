@@ -781,30 +781,37 @@ fn task_with(prompt: &str) -> ScheduledTask {
 async fn a_scheduled_skill_instruction_invokes_a_skill_the_agent_may_use() {
     let model = HoldingModel::new(vec![text("Ready.")]);
     let (_directory, agent, chat) = local_agent(model).await;
-    let chats = agent.inner.chats.lock().await;
-    let chat = &chats[&chat];
-    let (invoked, wrappers) = run_input(chat, &task_with("/tickloop check the Ticks"), None);
+    let mut chats = agent.inner.chats.lock().await;
+    let chat = chats.get_mut(&chat).unwrap();
+    Arc::make_mut(&mut chat.skills).register_markdown(
+        "---\nname: review\ndescription: Review changes\n---\nReview the requested changes.",
+        tickloop_harness_protocol::SkillSource::Project {
+            path: "/project/review/SKILL.md".into(),
+        },
+        &[],
+    );
+    let (invoked, wrappers) = run_input(chat, &task_with("/review check the changes"), None);
     assert_eq!(
         wrappers,
         vec![ScheduledInputWrapper::Skill {
-            instruction: "/tickloop check the Ticks".into()
+            instruction: "/review check the changes".into()
         }]
     );
     assert_eq!(
         invoked,
         format!(
-            "Scheduled task {}: invoke the `tickloop` Skill with the Skill tool with the arguments `check the Ticks`.",
+            "Scheduled task {}: invoke the `review` Skill with the Skill tool with the arguments `check the changes`.",
             task_text(TASK)
         )
     );
     assert_eq!(
-        run_input(chat, &task_with("/tickloop"), None).0,
+        run_input(chat, &task_with("/review"), None).0,
         format!(
-            "Scheduled task {}: invoke the `tickloop` Skill with the Skill tool.",
+            "Scheduled task {}: invoke the `review` Skill with the Skill tool.",
             task_text(TASK)
         )
     );
-    let instruction = "  /tickloop   check the Ticks \n";
+    let instruction = "  /review   check the changes \n";
     let (input, wrappers) = run_input(chat, &task_with(instruction), None);
     assert_eq!(input, invoked);
     let identity = tickloop_harness_protocol::TriggerIdentity::ScheduledTask {

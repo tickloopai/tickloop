@@ -37,7 +37,7 @@ Tickloop (tickloop.ai) is a terminal AI agent for code and office work: the `tic
 - Every tool input schema is a flat object: top-level `type: object` with `properties`. A tool with several forms distinguishes them with an enum field and checks the per-form rules at runtime. Do not use `oneOf`/`anyOf`/`allOf`: GLM and other OpenAI-compatible models emit empty arguments for them.
 - A new model protocol is only a new adapter in `harness/model`; the runtime and tool execution contain no vendor checks. The provider catalog is compiled into the program (`harness/model/src/providers/*.yaml`, registered in `harness/model/src/cards.rs`); read the project Skill `.tickloop/skills/model-integration/` before changing models or provider integrations.
 - A subagent's Bash and direct `!` Shell run under the frozen parent permissions, current tightening rules and single-use approval; the cwd is not an OS sandbox. A family shares its own private temporary-result/scratchpad directory; other families get no access, and symlinks escaping it are not allowed either.
-- The system Skill `tickloop` (`harness/policy/skills/tickloop/SKILL.md`) must match the actual tools and permissions and describe only capabilities that exist. Each data source's argv belongs in the Skill shipped with its Tick package (`<package>:usage`), never hard-coded in the system Skill.
+- Native Tick guidance belongs in the fixed tool descriptions, not a prerequisite Skill. Each data source's argv belongs in its Tick package's `<package>:usage` Skill. Keep tool descriptions independent of live instances and login state; retire loaded guidance with an appended host note, never by rewriting conversation history.
 
 ## Interaction rules
 

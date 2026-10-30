@@ -42,6 +42,7 @@ fn breakdown() -> ContextBreakdown {
             item("/home/user/.tickloop/AGENTS.md", 9_000),
             item("/work/project/AGENTS.md", 4_500),
         ],
+        // Historical context may still name the retired built-in Skill.
         skills: vec![item("tickloop", 1_500), item("notes:summarize", 800)],
         tool_search_results: vec![item("SearchTools quote stock", 1_800)],
         messages: vec![item("User messages", 3_000), item("Tool results", 6_200)],
@@ -355,7 +356,7 @@ fn names_from_servers_and_files_cannot_control_the_terminal() {
 }
 
 #[test]
-fn host_notes_show_apart_from_what_the_user_typed() {
+fn historical_host_notes_show_apart_from_what_the_user_typed() {
     let mut noted = breakdown();
     noted.messages = vec![item("User messages", 4), item("Assistant messages", 110)];
     noted.host_notes = vec![

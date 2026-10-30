@@ -5,6 +5,44 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
+test('workspace tests rebuild the CLI before script tests and stop if the build fails', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'workspace-build-test-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  copyFileSync(resolve('Makefile'), join(directory, 'Makefile'));
+  const bin = join(directory, 'bin');
+  mkdirSync(bin);
+  const executable = join(directory, 'target/debug/tickloop');
+  mkdirSync(join(directory, 'target/debug'), { recursive: true });
+  const calls = join(directory, 'calls');
+  writeFileSync(join(bin, 'cargo'), `#!${process.execPath}
+    const fs = require('node:fs');
+    if (process.argv.includes('--version')) process.exit(0);
+    if (process.argv[2] !== 'build') process.exit(1);
+    fs.appendFileSync(${JSON.stringify(calls)}, 'build\\n');
+    if (fs.existsSync(${JSON.stringify(join(directory, 'fail'))})) process.exit(1);
+    fs.writeFileSync(${JSON.stringify(executable)}, 'current');
+  `, { mode: 0o755 });
+  writeFileSync(join(bin, 'node'), `#!${process.execPath}
+    const fs = require('node:fs');
+    fs.appendFileSync(${JSON.stringify(calls)}, process.argv.includes('--test') ? 'scripts\\n' : 'workspace\\n');
+    if (fs.readFileSync(${JSON.stringify(executable)}, 'utf8') !== 'current') process.exit(1);
+  `, { mode: 0o755 });
+  for (const state of ['stale', 'missing', 'failed']) {
+    rmSync(calls, { force: true });
+    if (state === 'missing') rmSync(executable);
+    else writeFileSync(executable, 'stale');
+    if (state === 'failed') writeFileSync(join(directory, 'fail'), '');
+    const result = spawnSync('make', ['test-workspace', 'PACKAGE_TARGET=fixture'], {
+      cwd: directory,
+      env: { ...process.env, PATH: `${bin}:/usr/bin:/bin`, HOME: directory, MAKEFLAGS: '', MAKELEVEL: '' },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status === 0, state !== 'failed', `${state}: ${result.stderr}`);
+    assert.deepEqual(readFileSync(calls, 'utf8').trim().split('\n'),
+      state === 'failed' ? ['build'] : ['build', 'scripts', 'workspace']);
+  }
+});
+
 test('workspace runner removes its temporary roots on success and failure', t => {
   const directory = mkdtempSync(join(tmpdir(), 'workspace-runner-test-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -18,7 +56,7 @@ test('workspace runner removes its temporary roots on success and failure', t =>
   writeFileSync(join(bin, 'node'), `#!/bin/sh\ncase "$1" in *test-workspace.mjs) exec '${process.execPath}' "$@";; esac\n`, { mode: 0o755 });
   writeFileSync(join(bin, 'cargo'), `#!${process.execPath}
     const fs = require('node:fs');
-    if (process.argv.includes('--version')) process.exit(0);
+    if (process.argv.includes('--version') || process.argv[2] === 'build') process.exit(0);
     fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify([process.env.TICKLOOP_CONFIG_DIR, process.env.TICKLOOP_TMPDIR, process.env.TICKLOOP_DEBUG ?? null]));
     process.exit(fs.existsSync(${JSON.stringify(join(directory, 'fail'))}) ? 1 : 0);
   `, { mode: 0o755 });

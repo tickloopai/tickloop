@@ -1,111 +1,29 @@
 use tickloop_code_settings::skills::SkillDiscovery;
-use tickloop_code_settings::skills::{
-    SLIDES_SKILL, SkillCaller, SkillError, SkillRegistry, TICKLOOP_SKILL,
-};
+use tickloop_code_settings::skills::{SLIDES_SKILL, SkillCaller, SkillError, SkillRegistry};
 
 #[test]
-fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
-    for contract in [
-        "`hosted:`",
-        "`shell:<task id>`",
-        "`artifact:<origin>/<artifact_id>`",
-        "`protocol: true`",
-        "terminal Tick",
-        "`frequency`",
-        "`high`",
-        "`medium`",
-        "`low`",
-        "`ready: true`",
-        "Esc leaves the card",
-        "An artifact takes no Tick Subscription",
-        "`workspace_host.plugins`",
-        "`<package>:usage`",
-        "`<package>:<skill>`",
-        "`tick-<package>`",
-        "`plugin_login`",
-        "`logged_out`",
-        "`expired`",
-        "`unknown`",
-        "carried no `plugin_login`",
-        "from `/ticks` in this Agent",
-        "Available page of `/ticks`",
-        "Installed page of `/ticks`",
-        "No Agent restart is needed",
-        "never suggest `!` for a login",
-        "never log in, log out, install, update or uninstall a package yourself",
-        "Null `data` means no content yet",
-        "read it again shortly",
-        "`data.connection`",
-        "`retrying`",
-        "`not_authorized`",
-        "`failed`",
-        "`Disconnected`",
-    ] {
-        assert!(TICKLOOP_SKILL.contains(contract), "{contract}");
-    }
-    for retired in [
-        // Login states left the system prompt: an open reports a missing login instead.
-        "`login` state",
-        "`logged_in`",
-        "`not_required`",
-        "the state is read again for every request",
-        "read the body with `ArtifactRead` when the task needs it",
-        "herdr:",
-        "every_seconds",
-        "5–86400",
-        "tickhost_executable",
-        "\"open\", \"--\"",
-        "Terminal Observation",
-        "every 5 seconds",
-        "text snapshot",
-        "exits that Tick",
-        "idle minutes",
-        "from idling out",
-        "builtin",
-        "tick_executable",
-        "TICK_EXECUTABLE",
-        "PROVIDER TICK",
-        "tick-longbridge",
-        "tick-futu",
-        "\"quote\"",
-        "\"kline\"",
-        "--period",
-        "MEMBER_ID",
-        "TSLA.US",
-        "on PATH",
-        "tickloop tick",
-        "bin/tick-longbridge auth",
-        "TICK_PACKAGE_ROOT",
-        "auth status",
-        "login command the package's Skill names",
-        "doc or page",
-        "reader_executable",
-        "tick-reader",
-        "longbridge",
-        "futu",
-        "K-line",
-        "stock",
-        "tickloop plugin enable",
-        "tickloop plugin configure",
-        "nest delegation",
-        // Ticks are no longer shown in Herdr Panes.
-        "`integration`",
-        "placement",
-        "Herdr Pane",
-        "ReadWorkspace",
-        "directly delegated children",
-        "names your own root",
-        "newest Loop",
-        "`armed`",
-        "SearchTools",
-        "ExecuteTools",
-        "ListMcpResourcesTool",
-        "Subagent",
-        "MCP",
-        "Loop",
-        "16 KiB",
-    ] {
-        assert!(!TICKLOOP_SKILL.contains(retired), "{retired}");
+fn discovered_builtins_have_no_generic_tickloop_skill() {
+    let directory = tempfile::tempdir().unwrap();
+    let registry = SkillRegistry::discover(directory.path(), None);
+    assert_eq!(
+        registry
+            .definitions()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        ["loop", "slides"]
+    );
+    assert!(!registry.contains("tickloop"));
+    assert!(!registry.model_listing().contains("- tickloop [Built-in]"));
+    assert!(
+        registry
+            .user_definitions()
+            .all(|skill| skill.name != "tickloop")
+    );
+    for caller in [SkillCaller::Model, SkillCaller::User] {
+        assert_eq!(
+            registry.expand("tickloop", "", caller),
+            Err(SkillError::Unknown("tickloop".into()))
+        );
     }
 }
 
@@ -119,7 +37,7 @@ fn artifact_guidance_is_not_duplicated_in_the_builtin_registry() {
             .expand("artifact-draft", "", SkillCaller::Model)
             .is_err()
     );
-    assert!(registry.model_listing().contains("tickloop"));
+    assert!(registry.model_listing().contains("- loop [Built-in]"));
 }
 
 #[test]

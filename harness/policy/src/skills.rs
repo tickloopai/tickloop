@@ -11,13 +11,12 @@ use tickloop_harness_protocol::{InvokedSkill, RemoteSkillDefinition, SkillSource
 
 use crate::loop_skill::{self, LoopInstructionSource, MaintenanceInstructions};
 
-pub const TICKLOOP_SKILL: &str = include_str!("../skills/tickloop/SKILL.md");
 /// `/slides`: only the user invokes it, and its body guides only the run it starts.
 pub const SLIDES_SKILL: &str = include_str!("../skills/slides/SKILL.md");
 /// `/loop`: its expansion carries the host's reading of the arguments, see [`loop_skill`].
 pub const LOOP_SKILL: &str = include_str!("../skills/loop/SKILL.md");
 pub const LOOP_SKILL_NAME: &str = "loop";
-pub const BUILTIN_SKILLS: [&str; 3] = [TICKLOOP_SKILL, SLIDES_SKILL, LOOP_SKILL];
+pub const BUILTIN_SKILLS: [&str; 2] = [SLIDES_SKILL, LOOP_SKILL];
 pub const SKILL_TOOL_NAME: &str = "Skill";
 /// In the body of a Tick package's Skill, the directory the package is installed in.
 pub const PACKAGE_ROOT_VARIABLE: &str = "${TICK_PACKAGE_ROOT}";
@@ -162,10 +161,6 @@ struct Frontmatter {
 impl SkillRegistry {
     pub fn builtin() -> Self {
         Self::with_builtins(BUILTIN_SKILLS)
-    }
-
-    pub fn builtin_without_ticks() -> Self {
-        Self::with_builtins([SLIDES_SKILL, LOOP_SKILL])
     }
 
     pub fn with_builtins<'a>(builtins: impl IntoIterator<Item = &'a str>) -> Self {

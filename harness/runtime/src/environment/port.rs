@@ -114,8 +114,17 @@ pub struct ExecutionCapabilities {
     pub shell_output: ShellOutputDelivery,
 }
 
+/// Model-safe guidance supplied by the environment, not permission or execution facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionGuidance {
+    /// `None` authoritatively withdraws guidance; an unavailable query must return an error.
+    pub content: Option<String>,
+    pub withdrawal: String,
+}
+
 pub enum ExecutionQuery {
     Capabilities,
+    Guidance,
     Instances,
     Receipt(Uuid),
     Preparation(PreparationId),
@@ -668,6 +677,7 @@ pub enum ExecutionReceipt {
 #[derive(Debug)]
 pub enum ExecutionInspection {
     Capabilities(ExecutionCapabilities),
+    Guidance(ExecutionGuidance),
     Instances(Vec<InstanceRef>),
     Receipt(ExecutionReceipt),
     Validated,
