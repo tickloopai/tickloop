@@ -18,8 +18,9 @@ use super::{
 };
 use tickloop_harness::protocol::{
     BranchPublicItem, BranchPublicSource, ChatSnapshot, CommandSnapshot, CommandState, Content,
-    EventKind, ExecutionMode, FOLDED_TICK_REPLY_CHARACTERS, InputContext, LocalMessage, LoopState,
-    Receipt, Role, SUBAGENT_TOOL_NAME, SavedChat, ToolResult, UserShellRecord, UserShellState,
+    EventKind, ExecutionMode, FOLDED_TICK_REPLY_CHARACTERS, InputContext, LATER_CONTENT_TEXT,
+    LocalMessage, LoopState, Receipt, Role, SUBAGENT_TOOL_NAME, SavedChat, ToolResult,
+    UserShellRecord, UserShellState,
 };
 
 const COMMAND_OUTPUT_PAGE_BYTES: usize = 16 * 1024;
@@ -1491,11 +1492,18 @@ fn append_public_message(
                 }
                 history.after_rejection = presentation::is_rejection(&result);
             }
+            Content::Later(_) if message.role != Role::System => {
+                history.push_role(
+                    format!("  {LATER_CONTENT_TEXT}\n"),
+                    super::style::Role::MutedText,
+                );
+            }
             Content::ToolUse { .. }
             | Content::ToolResult { .. }
             | Content::Thinking { .. }
             | Content::ProtocolData { .. }
-            | Content::Image { .. } => {}
+            | Content::Image { .. }
+            | Content::Later(_) => {}
         }
     }
 }
@@ -1605,11 +1613,30 @@ fn append_nested_calls(
 fn append_input_contexts(history: &mut PublicHistoryBuilder, contexts: &[InputContext]) {
     for context in contexts {
         let (kind, label, truncated) = match context {
+            InputContext::PromptText { text } => {
+                history.push_str(&safe_text(text));
+                continue;
+            }
             InputContext::File(text) => ("file", text.path.display().to_string(), text.truncated),
             InputContext::Directory(text) => {
                 ("directory", text.path.display().to_string(), text.truncated)
             }
             InputContext::Image(image) => ("image", image.origin.label(), false),
+            InputContext::Resource(resource) => {
+                let kind = if resource.content.is_some() {
+                    "resource"
+                } else {
+                    "resource reference"
+                };
+                let label = serde_json::json!({
+                    "uri": resource.uri,
+                    "mime_type": resource.mime_type,
+                    "name": resource.name,
+                })
+                .to_string();
+                (kind, label, false)
+            }
+            InputContext::Later(_) => ("context", LATER_CONTENT_TEXT.into(), false),
         };
         let truncated = if truncated { " · truncated" } else { "" };
         history.push_str(&format!(

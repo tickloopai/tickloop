@@ -20,13 +20,14 @@
 //! and the Worker waits for them with its other `SessionEnd` hooks; what they print tells no one.
 
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tickloop_harness_protocol::hooks::{
     HookBackground, HookBackgroundPhase, HookDecision, HookEvent, HookRunOutcome,
 };
 use tickloop_harness_protocol::{Message, Receipt, TaskNotification, local_messages};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::task_tracker::TaskTrackerToken;
 
 use super::{
     ChatHookState, CommandRun, FinishedRun, HookCall, HookContext, HookResponse, Runnable,
@@ -36,6 +37,7 @@ use crate::Agent;
 
 /// The exit status with which an `asyncRewake` hook wakes the model.
 const REWAKE_EXIT_CODE: i32 = 2;
+const MANAGED_HOOK_CLEANUP_BUDGET: Duration = Duration::from_secs(10);
 /// Claude Code's `rewakeSummary` when a hook declares none.
 const DEFAULT_REWAKE_SUMMARY: &str = "Stop hook feedback";
 
@@ -133,6 +135,7 @@ pub(super) struct BackgroundRun {
     background: HookBackground,
     stdin: Vec<u8>,
     cancel: CancellationToken,
+    _tracked: TaskTrackerToken,
 }
 
 impl BackgroundRun {
@@ -158,12 +161,35 @@ impl BackgroundRun {
                 &self.runnable,
                 &self.background,
                 run,
+                self.context.background_generation,
             )
             .await;
     }
 }
 
 impl Agent {
+    pub(crate) async fn settle_managed_hooks(
+        &self,
+        chat_id: tickloop_harness_protocol::ChatId,
+    ) -> Result<(), String> {
+        let tasks = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats.get_mut(&chat_id).ok_or("Chat is unavailable")?;
+            chat.hook_state.cancel_background();
+            chat.hook_state.background_tasks.close();
+            chat.hook_state.background_tasks.clone()
+        };
+        tokio::time::timeout(MANAGED_HOOK_CLEANUP_BUDGET, tasks.wait())
+            .await
+            .map_err(|_| "background Hook cleanup exceeded 10 seconds".to_owned())?;
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or("Chat is unavailable")?;
+        if std::mem::take(&mut chat.hook_state.command_outcome_unknown) {
+            return Err("Hook command outcome unknown; execution was not retried".into());
+        }
+        Ok(())
+    }
+
     /// Records that `runnable` goes on in the background for `call` and returns what ends it
     /// there: for `SessionEnd`, `cancel`, the event's own budget; for any other event, the
     /// Chat's background lifetime. `None` when the Chat is gone, the event was ended or stopped
@@ -175,7 +201,7 @@ impl Agent {
         call: &HookCall,
         runnable: &Runnable,
         cancel: &CancellationToken,
-    ) -> Option<CancellationToken> {
+    ) -> Option<(CancellationToken, TaskTrackerToken)> {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&receipt.chat_id)?;
         // Checked under the lock `/stop` takes, so an event it ended, or one prepared before it,
@@ -203,7 +229,7 @@ impl Agent {
         record.background = Some(HookBackgroundPhase::Started);
         record_hook_run(self, chat, receipt, record);
         self.save(&chat.snapshot);
-        Some(lifetime)
+        Some((lifetime, chat.hook_state.background_tasks.token()))
     }
 
     /// Starts `runnable` in the background for `call` and records its start; its event does not
@@ -218,7 +244,7 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Option<BackgroundRun> {
         let background = runnable.hook.background.clone()?;
-        let lifetime = self
+        let (lifetime, tracked) = self
             .record_background_start(receipt, context, call, &runnable, cancel)
             .await?;
         Some(BackgroundRun {
@@ -231,6 +257,7 @@ impl Agent {
             background,
             stdin: stdin.to_vec(),
             cancel: lifetime,
+            _tracked: tracked,
         })
     }
 
@@ -250,11 +277,12 @@ impl Agent {
         execution_cancel: CancellationToken,
         cancel: &CancellationToken,
     ) {
-        let Some(lifetime) = self
+        let Some((lifetime, tracked)) = self
             .record_background_start(receipt, context, call, runnable, cancel)
             .await
         else {
             execution_cancel.cancel();
+            let _ = execution.await;
             return;
         };
         let agent = self.clone();
@@ -262,7 +290,9 @@ impl Agent {
         let runnable = runnable.clone();
         let event = call.event;
         let tool = call.tool.clone();
+        let generation = context.background_generation;
         let rest = async move {
+            let _tracked = tracked;
             let ending = tokio::select! {
                 biased;
                 () = lifetime.cancelled() => {
@@ -280,6 +310,7 @@ impl Agent {
                     &runnable,
                     &HookBackground::Async,
                     run,
+                    generation,
                 )
                 .await;
         };
@@ -292,6 +323,7 @@ impl Agent {
 
     /// Records how a background run ended and, unless the Worker is ending, tells the model
     /// what it has to say.
+    #[allow(clippy::too_many_arguments)]
     async fn finish_background_hook(
         &self,
         receipt: &Receipt,
@@ -300,6 +332,7 @@ impl Agent {
         runnable: &Runnable,
         background: &HookBackground,
         run: FinishedRun,
+        generation: u64,
     ) {
         let label = hook_label(event, tool);
         let response = &run.response;
@@ -346,7 +379,9 @@ impl Agent {
             };
             record_hook_run(self, chat, receipt, record);
             let mut wakes = false;
-            if let Some(notice) = notice {
+            if let Some(notice) = notice
+                && chat.hook_state.background_generation == generation
+            {
                 let message = notice.message();
                 if rewakes {
                     chat.hook_state.session.note_rewake(message.clone());
@@ -371,6 +406,10 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{HarnessOptions, HarnessSeams, ToolPolicy};
+    use std::sync::Arc;
+    use tickloop_harness_protocol::AgentHostOptions;
+    use tickloop_harness_test_support::{ScriptedModel, config, harness::ChosenModels};
 
     fn text(notice: &HookNotice) -> String {
         match &notice.message().content[0] {
@@ -417,5 +456,48 @@ mod tests {
         assert!(notification.contains("Stop hook system message: formatted"));
         assert!(notification.contains("Stop hook additional context: 2 files changed"));
         assert!(!notification.contains("noise"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn managed_settlement_fails_until_a_cancelled_hook_confirms_completion() {
+        let agent = Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: None,
+                environment: Some(Arc::new(
+                    crate::environment::memory::MemoryEnvironment::new(),
+                )),
+                models: ChosenModels::new(Arc::new(ScriptedModel::new(Vec::new()))),
+            },
+            HarnessOptions {
+                tools: ToolPolicy::acp(),
+                host: AgentHostOptions::embedded_defaults(),
+                ..HarnessOptions::local(config())
+            },
+        )
+        .unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let chat_id = agent.create_chat(folder.path().to_owned()).await.unwrap();
+        let (cancel, pending) = {
+            let mut chats = agent.inner.chats.lock().await;
+            let chat = chats.get_mut(&chat_id).unwrap();
+            (
+                chat.hook_state.background_cancel(&agent.inner.shutdown),
+                chat.hook_state.background_tasks.token(),
+            )
+        };
+        let started = tokio::time::Instant::now();
+        let error = agent.settle_managed(chat_id, false).await.unwrap_err();
+        assert!(cancel.is_cancelled());
+        assert!(
+            error
+                .to_string()
+                .contains("background Hook cleanup exceeded 10 seconds"),
+            "{error}"
+        );
+        assert!(started.elapsed() >= MANAGED_HOOK_CLEANUP_BUDGET);
+        drop(pending);
+        agent.settle_managed(chat_id, false).await.unwrap();
+        agent.shutdown().await;
     }
 }

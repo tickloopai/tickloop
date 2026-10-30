@@ -1252,6 +1252,15 @@ impl Agent {
         } else {
             input
         };
+        let input = if name == "TaskUpdate"
+            && registration
+                .as_ref()
+                .is_some_and(|tool| matches!(tool.route, ToolRoute::SharedTask))
+        {
+            shared_tasks::prepared_update_input(input)
+        } else {
+            input
+        };
         if cancel.is_cancelled() {
             return Err("run interrupted before tool preparation".into());
         }
@@ -1275,11 +1284,12 @@ impl Agent {
         {
             return Ok(ToolCallOutcome::not_admitted(
                 if self.inner.tool_policy.web_search {
-                    tickloop_harness_tools::web_search::DISABLED_MESSAGE
+                    tickloop_harness_tools::web_search::disabled_message(
+                        self.inner.web_search_settings.as_deref(),
+                    )
                 } else {
-                    UNOFFERED_WEB_SEARCH_MESSAGE
-                }
-                .into(),
+                    UNOFFERED_WEB_SEARCH_MESSAGE.into()
+                },
             ));
         }
         if registration.is_none() && shared_tasks::is_task_tool(&name) {
@@ -2375,6 +2385,24 @@ impl Agent {
                         chat.snapshot.operations.push(operation.clone());
                         self.save(&chat.snapshot);
                     }
+                    // Only a managed host's history replay reads recorded edits.
+                    if operation.file_change.is_some()
+                        && self.inner.tool_policy.is_managed()
+                        && let Some(recorder) = &self.inner.recorder
+                        && let Ok(Some(review)) = self
+                            .operation_review(receipt.chat_id, receipt.run_id, &id)
+                            .await
+                    {
+                        recorder.record_edit(
+                            receipt.chat_id,
+                            tickloop_harness_transcript::RecordedEditEntry {
+                                operation_id: operation.id,
+                                run_id: receipt.run_id.into(),
+                                call_id: id.clone(),
+                                review,
+                            },
+                        );
+                    }
                     let (
                         mut decision,
                         explicit_ask,
@@ -3277,6 +3305,14 @@ mod tests {
                 true,
             ))
             .chain(tick_subscriptions::definitions())
+            .chain(
+                [
+                    shared_tasks::TaskToolAccess::Enabled,
+                    shared_tasks::TaskToolAccess::Finishing,
+                ]
+                .into_iter()
+                .flat_map(shared_tasks::definitions),
+            )
             .chain(skills.tool_definition())
             .chain(crate::mcp_resources::definitions())
             .chain(crate::tick_tools::definitions())
@@ -3307,6 +3343,7 @@ mod tests {
             "ArtifactUpload",
             "CronCreate",
             "ScheduleWakeup",
+            "TaskUpdate",
         ] {
             assert!(
                 definitions.iter().any(|definition| definition.name == name),

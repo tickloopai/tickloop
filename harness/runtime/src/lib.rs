@@ -25,6 +25,8 @@ mod handover;
 pub use handover::HandOver;
 mod harness;
 pub use citations::{CitationQueryError, VisibleCitations, visible_citations_at};
+use task_board_history::ConversationChange;
+pub use task_board_history::{TaskBoardQueryError, task_boards_at};
 
 pub use harness::{
     CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, PersonWait, PersonWaitKind,
@@ -41,7 +43,9 @@ mod lifecycle;
 mod loop_state_notes;
 pub mod terminal_input;
 pub use lifecycle::InputLedgerState;
+mod acp_claims;
 mod loop_lease;
+mod managed_configuration;
 pub mod mcp;
 mod mcp_http;
 mod mcp_resources;
@@ -53,6 +57,7 @@ mod scheduled_tasks;
 mod secret_redaction;
 mod timing;
 pub use scheduled_tasks::{NewScheduledTask, ScheduledTaskEdit};
+pub mod session_mcp;
 pub mod tick_adapter;
 pub mod tick_stream;
 pub mod tick_tools;
@@ -112,6 +117,7 @@ mod commands;
 mod permission_management;
 mod plan;
 mod shared_tasks;
+mod task_board_history;
 mod tick_content;
 mod tick_subscriptions;
 mod tick_trim;
@@ -375,6 +381,7 @@ struct Inner {
     chat_leases: loop_lease::ChatLeases,
     /// The Trigger sources' own states, taken over from the store with each newly taken lease.
     trigger_source_states: std::sync::RwLock<Vec<Arc<dyn wakeup::TriggerSourceState>>>,
+    acp_claims: Mutex<HashMap<ChatId, std::fs::File>>,
     approvals: Mutex<HashMap<Uuid, PendingApproval>>,
     question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::PendingReply>>>,
     closed: AtomicBool,
@@ -394,6 +401,8 @@ struct Inner {
     host_rules: Vec<PermissionRule>,
     /// The host's own section of every conversation's system prompt.
     system_prompt_addition: Option<String>,
+    /// Where the user changes web search settings, which WebSearch names when search cannot run.
+    web_search_settings: Option<String>,
     /// The permits each request to a model's vendor takes, in order.
     request_gates: Vec<Arc<tokio::sync::Semaphore>>,
     /// Where every Chat's shell commands run: the Tickhost.
@@ -438,6 +447,14 @@ struct ChatBookkeeping {
     dependency_baseline: Option<BTreeMap<PathBuf, String>>,
     tick_creation_receipts: Vec<approval_context::TickCreationReceipt>,
     denial_references: BTreeMap<usize, DenialReference>,
+    /// The Loop state each Loop state note told the model, by message index, which its entry
+    /// records for a load to restore.
+    #[serde(default)]
+    loop_state_views: BTreeMap<usize, serde_json::Value>,
+    /// The model and private history source of each assistant message that a later version
+    /// recorded with values this version does not know, kept as written for its entry.
+    #[serde(default)]
+    later_provenance: BTreeMap<usize, persistence::LaterProvenance>,
     /// Project partition (normalized working directory) owning each persistent rule in the rule
     /// set; deletions and modifications are written back to that partition.
     persistent_rule_projects: BTreeMap<Uuid, PathBuf>,
@@ -459,6 +476,14 @@ struct ChatBookkeeping {
     lifecycle: lifecycle::Lifecycle,
     /// The answer each message is part of.
     message_responses: BTreeMap<usize, tickloop_harness_protocol::ResponseId>,
+    /// The root Chat's task boards as they stood at the end of each message they were recorded
+    /// at, which its Transcript keeps as task board checkpoints.
+    #[serde(default)]
+    task_board_checkpoints: BTreeMap<usize, task_board_history::TaskBoards>,
+    /// Whether the Chat's Transcript records task board checkpoints; one from before them keeps
+    /// its board when the conversation moves.
+    #[serde(default)]
+    has_task_board_checkpoints: bool,
 }
 
 /// What a Subagent's Chat takes from its parent's.
@@ -483,10 +508,14 @@ struct Chat {
     family_stopping: bool,
     task_checkpoint_pending: bool,
     family_finishing: HashSet<RunId>,
+    /// A managed Chat's Runs started since its last settlement, which answers for their
+    /// unresolved outcomes once; ordinary Chats keep none.
+    unsettled_runs: HashSet<RunId>,
     snapshot: ChatSnapshot,
     bookkeeping: ChatBookkeeping,
     start_new_tool_result_message: bool,
-    /// What the model was last told of the Loop in this process; a load starts untold.
+    /// What the model was last told of the Loop: a load restores what the latest Loop state note
+    /// recorded.
     announced_loop_state: Option<loop_state_notes::AnnouncedLoopState>,
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
@@ -1088,7 +1117,8 @@ fn answerable_permission_request(
         .cloned()
         .ok_or_else(|| AgentError::Invalid("permission request expired".into()))?;
     let answerable = match request.execution {
-        PermissionExecution::ToolCall { run_id, .. } => {
+        PermissionExecution::ToolCall { run_id, .. }
+        | PermissionExecution::HostOperation { run_id, .. } => {
             chat.run_cancel(run_id)
                 .is_some_and(|cancel| !cancel.is_cancelled())
                 && chat.snapshot.chat_loop.run_id == Some(run_id)
@@ -2224,6 +2254,7 @@ impl Agent {
             scheduled_task_expiry,
             scheduled_task_min_interval,
             trust_model_scheduled_tasks,
+            web_search_settings,
         } = options;
         let model = tickloop_harness_model::cards::model_for_persistent_selection(model);
         let config_root = local_state_root;
@@ -2268,6 +2299,7 @@ impl Agent {
                 recorder,
                 chat_leases: loop_lease::ChatLeases::default(),
                 trigger_source_states: std::sync::RwLock::new(Vec::new()),
+                acp_claims: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 question_answers: Mutex::new(HashMap::new()),
                 closed: AtomicBool::new(false),
@@ -2288,6 +2320,7 @@ impl Agent {
                 citation_style,
                 host_rules,
                 system_prompt_addition,
+                web_search_settings,
                 request_gates,
                 tick_stream_installed: AtomicBool::new(false),
                 tick_deliveries: std::sync::Mutex::new(
@@ -2859,7 +2892,19 @@ impl Agent {
             ledger,
             turn,
         } = submission;
-        if contexts.len().saturating_add(paths.len()) > input_context::MAX_REFERENCES {
+        if contexts.len().saturating_add(paths.len()) > input_context::MAX_CONTEXTS {
+            return Err(AgentError::Invalid(format!(
+                "a prompt can attach at most {} contexts",
+                input_context::MAX_CONTEXTS
+            )));
+        }
+        if paths.len().saturating_add(
+            contexts
+                .iter()
+                .filter(|context| context.path().is_some())
+                .count(),
+        ) > input_context::MAX_REFERENCES
+        {
             return Err(AgentError::Invalid(format!(
                 "a prompt can attach at most {} files or directories",
                 input_context::MAX_REFERENCES
@@ -2952,7 +2997,9 @@ impl Agent {
             }
             attached_file_reads = loaded.file_reads;
         }
-        self.submit_internal(
+        // Console approval can reenter submission beneath several adapter frames. Keep the
+        // large run-admission future off that stack, including the folderless path above.
+        Box::pin(self.submit_internal(
             chat_id,
             input,
             SubmissionOptions {
@@ -2966,7 +3013,7 @@ impl Agent {
                 turn,
                 ..Default::default()
             },
-        )
+        ))
         .await
     }
 
@@ -3020,7 +3067,7 @@ impl Agent {
                 "agent is unavailable during shutdown or planned upgrade".into(),
             ));
         }
-        if input.trim().is_empty() {
+        if input.trim().is_empty() && contexts.is_empty() {
             return Err(AgentError::Invalid("input cannot be empty".into()));
         }
         let mut family_mailbox = if continues_chat {
@@ -3054,6 +3101,11 @@ impl Agent {
                 "the goal's continuation waits for the Chat's background work".into(),
             ));
         }
+        let live = if turn.placement.is_some() || turn.branch.is_some() {
+            shared_tasks::live_runs(chats.values())
+        } else {
+            Default::default()
+        };
         let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         if original.family_stopping {
             return Err(AgentError::Invalid("Subagent subtree is stopping".into()));
@@ -3082,6 +3134,23 @@ impl Agent {
         let inherit_branch_session = continues_chat && base.snapshot.branch_origin.is_some();
         let mut candidate = base.clone();
         Self::prepare_cut(base, &mut candidate, cut)?;
+        let board_moved = if cut.is_some() || staged.is_some() {
+            let change = match turn.placement {
+                Some(turn::Placement::Replacing(_)) => ConversationChange::NewAnswer,
+                _ => ConversationChange::Moved,
+            };
+            let before = cut.map_or(candidate.snapshot.messages.len(), |(index, _)| index);
+            task_board_history::follow_conversation(
+                &mut candidate.snapshot,
+                &mut candidate.bookkeeping,
+                before,
+                change,
+                &live,
+            )
+            .map_err(AgentError::Invalid)?
+        } else {
+            false
+        };
         let chat = &mut candidate;
         let is_skill_invocation = invoked_skill.is_some();
         let loop_id = chat.snapshot.chat_loop.id;
@@ -3127,7 +3196,7 @@ impl Agent {
             } else {
                 chat.user_skill_preparations.insert(
                     run_id.into(),
-                    command_skills::UserSkillPreparation::Pending(invoked_skill),
+                    command_skills::UserSkillPreparation::Pending(Box::new(invoked_skill)),
                 );
             }
         } else if trigger_source.is_none() && agent_message.is_none() {
@@ -3248,6 +3317,9 @@ impl Agent {
         {
             self.emit_conversation_rewound(original, leaf);
         }
+        if board_moved {
+            self.queue_task_boards(original);
+        }
         if turn.send_now && (original.active.is_some() || !original.parked.is_empty()) {
             original.interrupt();
         }
@@ -3264,6 +3336,9 @@ impl Agent {
         self.remember_host_context(&receipt, host_context);
         if let (Some(mut context), Some(candidate)) = (session_context, session_candidate) {
             *context = candidate;
+        }
+        if board_moved {
+            self.publish_task_board(&mut chats, chat_id, loop_id);
         }
         drop(chats);
         drop(family_mailbox);
@@ -4443,7 +4518,9 @@ impl Agent {
                 if chat.family_stopping {
                     return Ok(None);
                 }
-                self.select_next_run(chat, None, background_work)?
+                let admission = self.select_next_run(chat, None, background_work)?;
+                self.take_due_task_checkpoint(chat).await;
+                admission
             };
             match admission {
                 RunAdmission::Idle => return Ok(None),
@@ -4595,6 +4672,7 @@ impl Agent {
             chat.bookkeeping.lifecycle.take_start_back(pending);
             self.save(&chat.snapshot);
         }
+        self.take_due_task_checkpoint(chat).await;
         match admission {
             RunAdmission::Idle => Ok(TriggerTake::Waits),
             RunAdmission::ValidateTrigger(_) => Ok(TriggerTake::LookAgain),
@@ -4896,6 +4974,9 @@ impl Agent {
             let cancel = CancellationToken::new();
             candidate.active = Some(cancel.clone());
             candidate.active_run = Some(pending.receipt.run_id);
+            if self.inner.tool_policy.is_managed() {
+                candidate.unsettled_runs.insert(pending.receipt.run_id);
+            }
             let receipt = pending.receipt.clone();
             if hooks::is_user_prompt(&pending) {
                 candidate.hook_state.session.await_prompt_hooks(receipt.run_id);
@@ -4907,7 +4988,7 @@ impl Agent {
                 );
                 candidate.snapshot.pending_inputs = queued_before_hooks;
             } else {
-                self.commit_run_inputs(&mut candidate, pending, merged_inputs, Vec::new());
+                self.commit_run_inputs(&mut candidate, pending, merged_inputs, Vec::new())?;
             }
             let (messages, history_sources) = context::model_history(&candidate)?;
             let request = ModelRequest {
@@ -4948,7 +5029,18 @@ impl Agent {
         pending: PendingInput,
         merged_inputs: Vec<PendingInput>,
         notes: Vec<String>,
-    ) {
+    ) -> Result<(), AgentError> {
+        let cleared_board = if hooks::is_user_prompt(&pending) {
+            shared_tasks::cleared_finished_board(&chat.snapshot).map_err(AgentError::Invalid)?
+        } else {
+            None
+        };
+        chat.snapshot.pending_inputs.retain(|input| {
+            input.receipt.run_id != pending.receipt.run_id
+                && !merged_inputs
+                    .iter()
+                    .any(|merged| merged.receipt.run_id == input.receipt.run_id)
+        });
         let receipt = pending.receipt.clone();
         self.mark_run_inputs_handled(chat, &pending);
         chat.bookkeeping.lifecycle.start_input(receipt.run_id);
@@ -4975,6 +5067,11 @@ impl Agent {
             tickloop_harness_protocol::hooks::HookEvent::UserPromptSubmit,
             notes,
         );
+        if let Some(board) = cleared_board {
+            let loop_id = chat.snapshot.chat_loop.id;
+            chat.snapshot.task_boards.insert(loop_id, board);
+            self.queue_task_boards(chat);
+        }
         self.save(&chat.snapshot);
         self.start_response(chat, &receipt);
         self.emit(chat, &receipt, EventKind::Started);
@@ -4987,6 +5084,7 @@ impl Agent {
                 },
             );
         }
+        Ok(())
     }
 
     async fn request_permission(
@@ -5823,6 +5921,9 @@ impl Agent {
     /// failed turn, or while the Chat is stopped. An already queued input absorbs further task
     /// notifications into the same run.
     fn queue_task_continuation(&self, chat: &mut Chat, loop_id: Option<LoopId>) -> bool {
+        if self.inner.tool_policy.is_managed() {
+            return false;
+        }
         let is_being_interrupted = chat
             .active_run
             .is_some_and(|run| chat.user_cancelled_runs.contains(&run));
@@ -6076,13 +6177,23 @@ fn mcp_resource_authority_allowed(
     chat: &Chat,
     authority: &tickloop_harness_protocol::HostToolAuthority,
 ) -> bool {
-    chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
+    mcp_resource_authority_allowed_snapshot(&chat.snapshot, authority)
+}
+
+fn mcp_resource_authority_allowed_snapshot(
+    snapshot: &ChatSnapshot,
+    authority: &tickloop_harness_protocol::HostToolAuthority,
+) -> bool {
+    snapshot.delegation.as_ref().is_none_or(|delegation| {
         delegation
             .ceiling
             .host_tools
             .iter()
             .any(|(name, authorities)| {
-                (name == crate::mcp_tools::ARTIFACT_READ_TOOL || name.starts_with("mcp__"))
+                (name == crate::mcp_tools::ARTIFACT_READ_TOOL
+                    || name == crate::mcp_resources::READ_MCP_RESOURCE_TOOL
+                    || name == crate::mcp_resources::LIST_MCP_RESOURCES_TOOL
+                    || name.starts_with("mcp__"))
                     && authorities.contains(authority)
             })
     })
@@ -6140,6 +6251,7 @@ impl NewChat {
             family_stopping: false,
             task_checkpoint_pending: false,
             family_finishing: HashSet::new(),
+            unsettled_runs: HashSet::new(),
             snapshot,
             bookkeeping,
             start_new_tool_result_message: false,

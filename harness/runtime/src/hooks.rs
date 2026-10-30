@@ -80,11 +80,14 @@ pub(crate) struct ChatHookState {
     stopped_runs: HashSet<tickloop_harness_protocol::RunId>,
     /// What the session and turn hooks keep.
     pub(crate) session: session_events::SessionHookState,
-    /// Ends the hooks running in the background and the `StopFailure` hooks, at `/stop` or
-    /// shutdown; Esc leaves them.
+    /// Ends background and `StopFailure` hooks at `/stop`, managed settlement or shutdown;
+    /// Esc leaves them.
     background: Option<CancellationToken>,
-    /// How many times `/stop` ended the hooks in the background: an event prepared before a
-    /// stop starts none after it.
+    /// Register before spawning, under the Chat lock, so settlement cannot miss an unpolled run.
+    background_tasks: tokio_util::task::TaskTracker,
+    command_outcome_unknown: bool,
+    /// How many times the background lifetime ended: an event prepared before that boundary
+    /// starts no background hook after it.
     background_generation: u64,
 }
 
@@ -621,7 +624,12 @@ impl Agent {
                 .map(|output| *output)
                 .ok_or_else(|| "the execution environment returned no command output".into()),
             ExecutionOutcome::NotDispatched(error) => Err(error.message),
-            ExecutionOutcome::OutcomeUnknown { reason, .. } => Err(reason),
+            ExecutionOutcome::OutcomeUnknown { reason, .. } => {
+                if let Some(chat) = self.inner.chats.lock().await.get_mut(&receipt.chat_id) {
+                    chat.hook_state.command_outcome_unknown = true;
+                }
+                Err(reason)
+            }
         }
     }
 

@@ -1406,7 +1406,10 @@ fn project_rules_revision(settings: &Map<String, Value>, project: &Path) -> Stri
         .and_then(|project| project.get(PERMISSIONS_KEY))
         .and_then(Value::as_object)
         .and_then(|permissions| permissions.get(RULES_KEY));
-    let digest = Sha256::digest(serde_json::to_vec(&rules).expect("settings value serializes"));
+    let digest = Sha256::digest(
+        tickloop_harness::base::canonical_json_bytes(rules.unwrap_or(&Value::Null))
+            .expect("settings value serializes"),
+    );
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -1417,7 +1420,10 @@ pub fn empty_auto_settings_revision() -> AutoSettingsRevision {
 
 fn auto_settings_revision(settings: &Map<String, Value>) -> AutoSettingsRevision {
     let digest = Sha256::digest(
-        serde_json::to_vec(&settings.get(AUTO_APPROVAL_KEY)).expect("settings value serializes"),
+        tickloop_harness::base::canonical_json_bytes(
+            settings.get(AUTO_APPROVAL_KEY).unwrap_or(&Value::Null),
+        )
+        .expect("settings value serializes"),
     );
     AutoSettingsRevision::new(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }

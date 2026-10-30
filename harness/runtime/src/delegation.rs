@@ -1191,6 +1191,25 @@ impl Agent {
                         .collect();
                     if let Some(provider) = self.inner.host_tools.read().unwrap().as_ref() {
                         record_artifact_account(&mut host_tools, provider.as_ref())?;
+                        let resource_authorities = provider
+                            .mcp_resource_servers()
+                            .into_iter()
+                            .filter(|source| {
+                                crate::mcp_resource_authority_allowed_snapshot(
+                                    &snapshot,
+                                    &source.authority,
+                                )
+                            })
+                            .map(|source| source.authority)
+                            .collect::<BTreeSet<_>>();
+                        if !resource_authorities.is_empty() {
+                            for name in [
+                                crate::mcp_resources::READ_MCP_RESOURCE_TOOL,
+                                crate::mcp_resources::LIST_MCP_RESOURCES_TOOL,
+                            ] {
+                                host_tools.insert(name.to_owned(), resource_authorities.clone());
+                            }
+                        }
                     }
                     if let Some(account) = &feedback_account {
                         let authority = HostToolAuthority::Mcp {

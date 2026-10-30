@@ -318,12 +318,18 @@ async fn rewind_keeps_the_loop_and_its_subscriptions_across_restarts() {
         .filter(|message| !tickloop_harness::test_support::is_host_note(message))
         .map(message_text)
         .collect::<Vec<_>>();
-    assert!(
-        request.messages.iter().any(|message| {
-            tickloop_harness::test_support::is_host_note(message)
-                && message_text(message).contains("Tick Subscriptions:")
-        }),
-        "the loaded and rewound Chat hears what its Loop watches"
+    let loop_state_notes = request
+        .messages
+        .iter()
+        .filter(|message| tickloop_harness::test_support::is_host_note(message))
+        .map(message_text)
+        .filter(|text| text.contains("Tick Subscriptions"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        loop_state_notes.len(),
+        1,
+        "the loaded and rewound Chat keeps the note that told it what its Loop watches, and the \
+         load adds none while nothing changed: {loop_state_notes:?}"
     );
     assert_eq!(sent.first().map(String::as_str), Some("first goal"));
     assert_eq!(sent.last().map(String::as_str), Some("fourth goal"));

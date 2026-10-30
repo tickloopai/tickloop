@@ -12,6 +12,11 @@ use tickloop_harness_protocol::{
 use tickloop_harness_tools::{FileReadRecordExt, Workspace};
 
 pub(super) const MAX_REFERENCES: usize = 20;
+pub(super) const MAX_CONTEXTS: usize = 64;
+const MAX_RESOURCE_BYTES: usize = 1024 * 1024;
+const MAX_URI_BYTES: usize = 8 * 1024;
+const MAX_NAME_BYTES: usize = 4 * 1024;
+const MAX_MIME_BYTES: usize = 256;
 const MAX_RESTORED_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FILE_BYTES: usize = 64 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 1_000;
@@ -26,24 +31,57 @@ const IMAGE_EXTENSIONS: [&str; 12] = [
 pub(super) fn restored_contexts_are_valid(contexts: &[InputContext]) -> bool {
     let mut paths = HashSet::new();
     let mut pasted_ids = HashSet::new();
-    contexts.iter().all(|context| {
-        let within_limit = match context {
-            InputContext::File(text) | InputContext::Directory(text) => {
-                text.content.len() <= MAX_RESTORED_CONTEXT_BYTES
-            }
-            InputContext::Image(image) => image.image.data.len() <= MAX_BASE64_BYTES,
-        };
-        let is_unique = match context {
-            InputContext::Image(ImageContext {
-                origin: ImageOrigin::Pasted { id },
-                ..
-            }) => pasted_ids.insert(*id),
-            _ => context
-                .path()
-                .is_some_and(|path| path.to_str().is_some() && paths.insert(path.to_owned())),
-        };
-        within_limit && is_unique
-    })
+    let mut attached_ids = HashSet::new();
+    let mut resource_bytes = 0usize;
+    let mut prompt_bytes = 0usize;
+    contexts.len() <= MAX_CONTEXTS
+        && contexts.iter().all(|context| {
+            let within_limit = match context {
+                InputContext::File(text) | InputContext::Directory(text) => {
+                    text.content.len() <= MAX_RESTORED_CONTEXT_BYTES
+                }
+                InputContext::PromptText { text } => {
+                    prompt_bytes = prompt_bytes.saturating_add(text.len());
+                    prompt_bytes <= 256 * 1024
+                }
+                InputContext::Image(image) => image.image.data.len() <= MAX_BASE64_BYTES,
+                InputContext::Resource(resource) => {
+                    resource_bytes = resource_bytes
+                        .saturating_add(resource.content.as_ref().map_or(0, String::len));
+                    !resource.uri.trim().is_empty()
+                        && resource.uri.len() <= MAX_URI_BYTES
+                        && resource
+                            .name
+                            .as_ref()
+                            .is_none_or(|name| name.len() <= MAX_NAME_BYTES)
+                        && resource
+                            .mime_type
+                            .as_ref()
+                            .is_none_or(|mime| mime.len() <= MAX_MIME_BYTES)
+                        && resource_bytes <= MAX_RESOURCE_BYTES
+                }
+                InputContext::Later(_) => false,
+            };
+            let is_unique = match context {
+                InputContext::Image(ImageContext {
+                    origin: ImageOrigin::Pasted { id },
+                    ..
+                }) => pasted_ids.insert(*id),
+                InputContext::Image(ImageContext {
+                    origin: ImageOrigin::Attached { id, uri },
+                    ..
+                }) => {
+                    attached_ids.insert(*id)
+                        && uri.as_ref().is_none_or(|uri| uri.len() <= MAX_URI_BYTES)
+                }
+                // Repeated resource URIs can carry different text blocks; preserve their order.
+                InputContext::Resource(_) | InputContext::PromptText { .. } => true,
+                _ => context
+                    .path()
+                    .is_some_and(|path| path.to_str().is_some() && paths.insert(path.to_owned())),
+            };
+            within_limit && is_unique
+        })
 }
 
 /// Attached contexts, plus a read record for each file attached whole: like Claude Code's
@@ -251,6 +289,37 @@ fn read_directory(path: &Path) -> Result<(String, bool), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_contexts_are_bounded_but_repeated_uris_keep_block_order() {
+        let resource = |uri: &str, content: Option<String>| {
+            InputContext::Resource(tickloop_harness_protocol::ResourceContext {
+                uri: uri.into(),
+                mime_type: Some("text/plain".into()),
+                name: None,
+                content,
+            })
+        };
+        let uri = "file:///not-read.txt";
+        assert!(restored_contexts_are_valid(&[
+            resource(uri, Some("first".into())),
+            resource(uri, Some("second".into())),
+            resource("https://never-fetched.invalid/resource", None),
+        ]));
+        assert!(!restored_contexts_are_valid(&[resource("", None)]));
+        assert!(!restored_contexts_are_valid(&[resource(
+            &"x".repeat(MAX_URI_BYTES + 1),
+            None
+        )]));
+        assert!(!restored_contexts_are_valid(&[
+            resource(uri, Some("x".repeat(MAX_RESOURCE_BYTES))),
+            resource(uri, Some("x".into())),
+        ]));
+        assert!(!restored_contexts_are_valid(&vec![
+            resource(uri, None);
+            MAX_CONTEXTS + 1
+        ]));
+    }
 
     #[test]
     fn loads_files_and_immediate_directory_entries_without_following_outside_symlinks() {

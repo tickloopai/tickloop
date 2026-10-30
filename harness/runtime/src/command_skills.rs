@@ -12,7 +12,7 @@ pub(super) fn input_message_id() -> Option<Uuid> {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) enum UserSkillPreparation {
-    Pending(SkillExpansion),
+    Pending(Box<SkillExpansion>),
     Started,
     Complete,
 }
@@ -148,7 +148,7 @@ impl Agent {
         expansion
             .complete_shells(&outputs)
             .map_err(|error| error.to_string())?;
-        let mut invoked = tickloop_harness_protocol::InvokedSkill::try_from(expansion)
+        let mut invoked = tickloop_harness_protocol::InvokedSkill::try_from(*expansion)
             .map_err(|error| error.to_string())?;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats

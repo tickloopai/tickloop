@@ -200,6 +200,41 @@ impl HostToolProvider for CompositeHostTools {
             .flat_map(|source| source.exposure_revisions())
             .collect()
     }
+    fn session_bootstrap(&self) -> Result<Vec<PreparedHostCall>, String> {
+        let mut starts = Vec::new();
+        for source in self.sources.iter() {
+            starts.extend(source.session_bootstrap()?);
+        }
+        Ok(starts)
+    }
+    fn owns_session_start(&self, call: &PreparedHostCall) -> bool {
+        self.sources
+            .iter()
+            .any(|source| source.owns_session_start(call))
+    }
+    async fn start_session_server(
+        &self,
+        call: PreparedHostCall,
+        cancel: CancellationToken,
+    ) -> Result<(), String> {
+        let source = self
+            .sources
+            .iter()
+            .find(|source| source.owns_session_start(&call))
+            .ok_or("session MCP startup is unavailable")?;
+        source.start_session_server(call, cancel).await
+    }
+    async fn close_session(&self) -> Result<(), String> {
+        let mut failure = Ok(());
+        for result in
+            futures_util::future::join_all(self.sources.iter().map(|s| s.close_session())).await
+        {
+            if result.is_err() {
+                failure = result;
+            }
+        }
+        failure
+    }
     fn upgrade_checkpoint(&self) -> Result<Option<Value>, String> {
         let mut states = Vec::new();
         for source in self.sources.iter() {

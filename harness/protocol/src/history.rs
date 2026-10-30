@@ -166,11 +166,14 @@ pub struct RewindOutcome {
 /// Follows the `content` of Claude Code's `createCompactBoundaryMessage`.
 pub const COMPACT_BOUNDARY_TEXT: &str = "Conversation compacted";
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactTrigger {
     Manual,
     Auto,
+    /// A trigger a later version recorded, kept as written.
+    #[serde(untagged)]
+    Later(String),
 }
 
 /// Follows Claude Code's `compactMetadata`. Tickloop does not write `preservedSegment`.

@@ -2784,3 +2784,85 @@ async fn a_background_session_end_hook_runs_within_the_session_end_budget() {
         (Some(HookBackgroundPhase::Ended), HookRunOutcome::TimedOut)
     );
 }
+
+#[tokio::test]
+async fn prompt_hooks_preserve_a_finished_board_until_admission_then_allow_new_task_work() {
+    let step = AtomicUsize::new(0);
+    let routed = Arc::new(RoutedModel::new(move |request| {
+        match step.fetch_add(1, Ordering::SeqCst) {
+            0 => call(
+                "old-task",
+                "TaskCreate",
+                json!({"mutation_id": tickloop_ids::generate(), "title": "old task", "description": "old task"}),
+            ),
+            1 => {
+                let created = tickloop_harness_test_support::routed::tool_result(
+                    &request.messages,
+                    "old-task",
+                )
+                .unwrap();
+                call(
+                    "finish-old-task",
+                    "TaskUpdate",
+                    json!({"mutation_id": tickloop_ids::generate(), "task_id": created["task"]["id"], "expected_revision": 1, "action": "cancel", "result": "finished"}),
+                )
+            }
+            2 => text("old work finished"),
+            3 => call(
+                "new-task",
+                "TaskCreate",
+                json!({"mutation_id": tickloop_ids::generate(), "title": "new task", "description": "new task"}),
+            ),
+            4 => {
+                let created = tickloop_harness_test_support::routed::tool_result(
+                    &request.messages,
+                    "new-task",
+                )
+                .unwrap();
+                assert_eq!(created["task"]["title"], "new task", "{created}");
+                text("new work started")
+            }
+            step => panic!("unexpected model request {step}"),
+        }
+    }));
+    let bench = Bench::start_with(
+        Vec::new(),
+        Some(routed),
+        vec![user_hook(HookEvent::UserPromptSubmit, None, "gate.sh")],
+        true,
+    )
+    .await;
+    bench
+        .agent
+        .set_task_tools_enabled(bench.chat, true)
+        .await
+        .unwrap();
+    bench.define("gate.sh", |input| {
+        if input["prompt"] == "blocked prompt" {
+            exits(2, "", "blocked by hook")
+        } else {
+            exits(0, "", "")
+        }
+    });
+    assert!(bench.run("old work").await.failed.is_none());
+    let before = bench.agent.snapshot(bench.chat).await.unwrap();
+    let old_board = before.task_boards.get(&before.chat_loop.id).unwrap();
+    assert!(old_board.is_finished());
+    assert_eq!(old_board.tasks.len(), 1);
+
+    bench.run("blocked prompt").await;
+    let blocked = bench.agent.snapshot(bench.chat).await.unwrap();
+    let board = blocked.task_boards.get(&blocked.chat_loop.id).unwrap();
+    assert_eq!(board.revision, old_board.revision);
+    assert_eq!(board.tasks[0].title, "old task");
+    assert_eq!(bench.requests().len(), 3);
+
+    let observed = bench.run("new work").await;
+    assert!(observed.failed.is_none(), "{:?}", observed.failed);
+    let after = bench.agent.snapshot(bench.chat).await.unwrap();
+    let board = after.task_boards.get(&after.chat_loop.id).unwrap();
+    assert!(board.revision > old_board.revision);
+    assert_eq!(board.tasks.len(), 1);
+    assert_eq!(board.tasks[0].title, "new task");
+    bench.agent.shutdown().await;
+}

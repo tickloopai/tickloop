@@ -177,7 +177,8 @@ impl AgentAccess for RecoveringAgentClient {
                 Err(AccessError::new(
                     AccessErrorCode::OutcomeUnknown,
                     format!(
-                        "Command {command_id} has an unknown result in daemon {epoch}; it was not replayed"
+                        "Command {command_id} has an unknown result in daemon {epoch}; it was not replayed ({})",
+                        error.message
                     ),
                 ))
             }

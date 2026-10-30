@@ -119,7 +119,8 @@ impl ChatSnapshot {
                         .mcp_servers
                         .retain(|server, _| !mcp_servers.contains(server));
                 }
-                HostNote::HostTools(_)
+                HostNote::Guidance(GuidanceNote::Later(_))
+                | HostNote::HostTools(_)
                 | HostNote::PlanModeExit
                 | HostNote::ExecutionMode(_)
                 | HostNote::LoopState
@@ -320,7 +321,7 @@ pub fn full_summary_message(
 ) -> Message {
     let continuation = match trigger {
         CompactTrigger::Auto => CONTINUE_WITHOUT_QUESTIONS,
-        CompactTrigger::Manual => "",
+        CompactTrigger::Manual | CompactTrigger::Later(_) => "",
     };
     user_text(format!(
         "{FULL_SUMMARY_PREFIX}{}{FULL_SUMMARY_PINNED_STATE}{pinned_state}{continuation}",
@@ -484,6 +485,8 @@ pub fn history_calls_in(
     let mut calls: Vec<HistoryCall> = Vec::new();
     let mut pending: HashMap<String, Vec<usize>> = HashMap::new();
     let mut seen = HashSet::new();
+    // A model request shows the result of a later version's call as text, as it shows the call.
+    let mut later_calls = HashSet::new();
     for (message_index, message) in snapshot
         .messages
         .iter()
@@ -520,6 +523,10 @@ pub fn history_calls_in(
                         result: None,
                     });
                 }
+                Content::Later(_) => {
+                    later_calls.extend(content.later_call_id().map(str::to_owned));
+                }
+                Content::ToolResult { tool_use_id, .. } if later_calls.contains(tool_use_id) => {}
                 Content::ToolResult { tool_use_id, .. } => {
                     if message.role != Role::User {
                         return Err(InvalidConversation(
@@ -684,6 +691,14 @@ pub fn append_raw_projection(
                         content.push(Content::Text { text: format!("The result for tool call {} became available at archive message {}, after the intervening conversation. Earlier intervening turns occurred while this result was pending; its result is paired with the original call in this model context.", call.wire_id, message_index - active_start) });
                     }
                 }
+                // A prompt that opens with an attachment keeps no text of its own. Providers
+                // such as Anthropic reject an empty text block, so its contexts stand alone.
+                Content::Text { text }
+                    if text.is_empty()
+                        && snapshot
+                            .message_contexts
+                            .get(&message_index)
+                            .is_some_and(|contexts| !contexts.is_empty()) => {}
                 _ => content.push(block.clone()),
             }
         }
@@ -734,12 +749,10 @@ pub fn complete_boundaries(messages: &[Message]) -> Result<Vec<usize>, InvalidCo
     for (index, message) in messages.iter().enumerate() {
         for content in &message.content {
             match content {
-                Content::ToolUse { id, .. } => {
-                    if !pending.insert(id.clone()) {
-                        return Err(InvalidConversation(
-                            "context has duplicate unresolved tool calls".into(),
-                        ));
-                    }
+                Content::ToolUse { id, .. } if !pending.insert(id.clone()) => {
+                    return Err(InvalidConversation(
+                        "context has duplicate unresolved tool calls".into(),
+                    ));
                 }
                 Content::ToolResult { tool_use_id, .. } if !pending.remove(tool_use_id) => {
                     return Err(InvalidConversation(

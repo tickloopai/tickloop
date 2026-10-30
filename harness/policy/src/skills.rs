@@ -68,6 +68,11 @@ pub struct SkillExpansion {
     pub shell_preprocessing: Option<bool>,
 }
 
+impl SkillDefinition {
+    pub fn user_invocable(&self) -> bool {
+        self.user_invocable
+    }
+}
 impl TryFrom<SkillExpansion> for InvokedSkill {
     type Error = SkillError;
 

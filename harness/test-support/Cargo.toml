@@ -26,7 +26,8 @@ tickloop-harness-runtime = { path = "../runtime", features = ["test-support"] }
 tickloop-harness-transcript = { path = "../transcript" }
 tickloop-ids = { path = "../../tick/ids" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }
-tokio = { version = "1", features = ["full"] }
+# ExternalIoGuard pauses and resumes the clock of the tests that use it.
+tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = "0.7"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }

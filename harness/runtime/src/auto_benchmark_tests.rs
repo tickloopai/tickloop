@@ -175,7 +175,7 @@ fn benchmark_has_two_balanced_independent_frozen_sets() {
         frozen["acceptance_sha256"],
         format!(
             "{:x}",
-            Sha256::digest(serde_json::to_vec(&acceptance).unwrap())
+            Sha256::digest(tickloop_harness_base::canonical_json_bytes(&acceptance).unwrap())
         ),
         "the acceptance cases must remain frozen across development corrections"
     );

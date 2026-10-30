@@ -101,6 +101,10 @@ only the user can change the allowlist in their settings. The proxy checks a ran
 SandboxNetworkAccess tool, and this mapping adds no policy rule. Existing permission
 rules and the separate sandboxed-Bash admission path retain their own conditions.
 
+## ACP session MCP
+
+An ACP client's stdio MCP server starts only after one-time human approval, including in Full Access; explicit Deny and policy revisions still apply. Starting the server grants no permission to its tools. Session MCP tool calls are `HostToolPermission::Reviewable` and use the existing general Auto policy for the exact prepared tool, input, server authority and catalog revision. Unrequested side effects remain blocked; resource listing and reading use the existing read-only MCP resource tools and never grant local file or URL access from a resource URI. No frozen rules or counts change.
+
 ## Native Entries Not Currently Applicable
 
 - Memory Directory: No managed memory directory is provided by Tickloop.

@@ -49,7 +49,7 @@ pub(super) fn encode_request(
                     if let ToolResultContent::Blocks(blocks) = content {
                         result_images.extend(blocks.into_iter().filter_map(|block| match block {
                             ToolResultBlock::Image {source,..} => Some(json!({"type":"image_url","image_url":{"url":source.data_url()}})),
-                            ToolResultBlock::Text {..} => None,
+                            ToolResultBlock::Text {..} | ToolResultBlock::Later(_) => None,
                         }));
                     }
                 }

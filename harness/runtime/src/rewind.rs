@@ -17,6 +17,7 @@ use super::{Agent, AgentError, Chat, ChatBookkeeping};
 use crate::file_history::{
     FileHistoryError, FileHistorySnapshot, FileRestoreReport, create_first_backup,
 };
+use crate::task_board_history::{ConversationChange, LiveRuns, follow_conversation};
 use crate::transcript::private_project_temp_directory;
 use tickloop_harness_base::private_fs::PrivateDirectory;
 use tickloop_harness_protocol::local_messages::LocalMessage;
@@ -85,12 +86,18 @@ impl Agent {
             };
             let result = {
                 let mut chats = agent.inner.chats.lock().await;
+                let live = crate::shared_tasks::live_runs(chats.values());
                 let Some(chat) = chats.get_mut(&chat_id) else {
                     let _ = sender.send(Err(AgentError::NotFound));
                     return;
                 };
                 chat.active = None;
-                agent.finish_rewind(chat, point, mode, restored)
+                let loop_id = chat.snapshot.chat_loop.id;
+                let result = agent.finish_rewind(chat, point, mode, restored, &live);
+                if let Ok((_, true)) = &result {
+                    agent.publish_task_board(&mut chats, chat_id, loop_id);
+                }
+                result.map(|(outcome, _)| outcome)
             };
             let next = agent.next_run(chat_id).await;
             let (result, mut next) = match (result, next) {
@@ -195,14 +202,16 @@ impl Agent {
 
     /// Third stage of rewind: truncates the conversation according to the file restore result and
     /// the mode. The conversation is recomputed from the snapshot at the end of the occupation,
-    /// keeping changes such as input queued during it.
+    /// keeping changes such as input queued during it. The task board follows the conversation;
+    /// also tells whether it changed.
     fn finish_rewind(
         &self,
         chat: &mut Chat,
         point: RewindPoint,
         mode: RewindMode,
         restored: Option<Result<Result<FileRestoreReport, FileHistoryError>, JoinError>>,
-    ) -> Result<RewindOutcome, AgentError> {
+        live: &LiveRuns,
+    ) -> Result<(RewindOutcome, bool), AgentError> {
         let code = match restored {
             None => None,
             Some(Err(error)) => {
@@ -221,29 +230,47 @@ impl Agent {
                 ..CodeRewind::default()
             }),
         };
-        let draft = if mode.restores_conversation() {
-            let candidate = conversation_before(
+        let (draft, board_moved) = if mode.restores_conversation() {
+            let (mut snapshot, mut bookkeeping) = conversation_before(
                 &chat.snapshot,
                 &chat.bookkeeping,
                 point.message_index,
                 Some(point.execution_mode),
             )?;
-            self.replace_conversation(chat, point.message_index, point.message_id, candidate);
-            Some(RewindDraft {
+            let board_moved = follow_conversation(
+                &mut snapshot,
+                &mut bookkeeping,
+                point.message_index,
+                ConversationChange::Moved,
+                live,
+            )
+            .map_err(AgentError::Invalid)?;
+            self.replace_conversation(
+                chat,
+                point.message_index,
+                point.message_id,
+                (snapshot, bookkeeping),
+            );
+            if board_moved {
+                self.queue_task_boards(chat);
+            }
+            let draft = RewindDraft {
                 prompt: point.prompt,
                 contexts: point.contexts,
-            })
+            };
+            (Some(draft), board_moved)
         } else {
-            None
+            (None, false)
         };
         self.save(&chat.snapshot);
-        Ok(RewindOutcome {
+        let outcome = RewindOutcome {
             snapshot: chat.snapshot.clone(),
             mode,
             code,
             conversation_restored: draft.is_some(),
             draft,
-        })
+        };
+        Ok((outcome, board_moved))
     }
 
     /// Files that restoring to the target prompt would change, without touching disk. Returns
@@ -461,7 +488,12 @@ pub(super) fn conversation_before(
     candidate.message_runs.split_off(&index);
     candidate.message_contexts.split_off(&index);
     candidate_bookkeeping.denial_references.split_off(&index);
+    candidate_bookkeeping.loop_state_views.split_off(&index);
+    candidate_bookkeeping.later_provenance.split_off(&index);
     candidate_bookkeeping.message_responses.split_off(&index);
+    candidate_bookkeeping
+        .task_board_checkpoints
+        .split_off(&index);
     candidate_bookkeeping.lifecycle.restart_claims_at(index);
     candidate_bookkeeping.lifecycle.forget_tail_answer();
     candidate.message_ids.split_off(&index);

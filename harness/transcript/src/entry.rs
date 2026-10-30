@@ -25,6 +25,9 @@ pub enum Line {
     AiTitle(AiTitleEntry),
     Subagents(SubagentsEntry),
     TaskBoards(TaskBoardsEntry),
+    /// The root Chat's task boards as they stood at a chain entry; the latest record of an entry
+    /// wins.
+    TaskBoardCheckpoint(TaskBoardCheckpointEntry),
     /// The Chat's goal as it is now; the latest record wins.
     Goal(GoalEntry),
     /// A goal change the conversation shows as one line; every one is kept.
@@ -41,6 +44,10 @@ pub enum Line {
     LastPrompt(LastPromptEntry),
     BranchOrigin(BranchOriginEntry),
     Delegation(DelegationEntry),
+    /// Durable ACP origin and session-only configuration; never client credentials.
+    AcpSession(AcpSessionEntry),
+    /// Bounded, validated proposed edit hunks; never a complete file snapshot or proof of success.
+    RecordedEdit(RecordedEditEntry),
     /// Following Claude Code: a file-rewind snapshot, associated with a message on the chain by
     /// message id.
     FileHistorySnapshot(FileHistorySnapshotEntry),
@@ -136,6 +143,8 @@ pub enum MetadataKind {
     LastPrompt,
     BranchOrigin,
     Delegation,
+    AcpSession,
+    RecordedEdit,
     ArtifactTicks,
     MonitorMembers,
     Subagents,
@@ -145,6 +154,7 @@ pub enum MetadataKind {
     Provenance,
     CitationSources,
     TaskBoards,
+    TaskBoardCheckpoint,
     Goal,
     GoalEvent,
     ScheduledTasks,
@@ -169,6 +179,7 @@ impl MetadataKind {
             | Self::LastPrompt
             | Self::BranchOrigin
             | Self::Delegation
+            | Self::AcpSession
             | Self::ArtifactTicks
             | Self::MonitorMembers
             | Self::Subagents
@@ -180,10 +191,13 @@ impl MetadataKind {
             | Self::TaskBoards
             | Self::FamilyCompletions => Retention::ChatLatest,
             Self::Goal | Self::ScheduledTasks => Retention::SourceState,
-            Self::Response | Self::Input | Self::Wait | Self::NestedCall => Retention::LatestById,
-            Self::FileHistorySnapshot | Self::ContentReplacement | Self::GoalEvent => {
-                Retention::Accumulating
+            Self::Response | Self::Input | Self::Wait | Self::NestedCall | Self::RecordedEdit => {
+                Retention::LatestById
             }
+            Self::FileHistorySnapshot
+            | Self::TaskBoardCheckpoint
+            | Self::ContentReplacement
+            | Self::GoalEvent => Retention::Accumulating,
             Self::RetainedSnapshot => Retention::Snapshot,
             Self::Other => Retention::Unknown,
         }
@@ -241,6 +255,7 @@ impl Line {
             Self::AiTitle(_) => MetadataKind::AiTitle,
             Self::Subagents(_) => MetadataKind::Subagents,
             Self::TaskBoards(_) => MetadataKind::TaskBoards,
+            Self::TaskBoardCheckpoint(_) => MetadataKind::TaskBoardCheckpoint,
             Self::Goal(_) => MetadataKind::Goal,
             Self::GoalEvent(_) => MetadataKind::GoalEvent,
             Self::ScheduledTasks(_) => MetadataKind::ScheduledTasks,
@@ -253,6 +268,8 @@ impl Line {
             Self::LastPrompt(_) => MetadataKind::LastPrompt,
             Self::BranchOrigin(_) => MetadataKind::BranchOrigin,
             Self::Delegation(_) => MetadataKind::Delegation,
+            Self::AcpSession(_) => MetadataKind::AcpSession,
+            Self::RecordedEdit(_) => MetadataKind::RecordedEdit,
             Self::FileHistorySnapshot(_) => MetadataKind::FileHistorySnapshot,
             Self::ContentReplacement(_) => MetadataKind::ContentReplacement,
             Self::Response(_) => MetadataKind::Response,
@@ -263,6 +280,17 @@ impl Line {
             Self::Unknown(_) => MetadataKind::Other,
         }
     }
+}
+
+/// Public review captured from a validated sidecar at preparation time. The terminal tool
+/// result determines whether the operation succeeded; these hunks alone grant no authority.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordedEditEntry {
+    pub operation_id: Uuid,
+    pub run_id: Uuid,
+    pub call_id: String,
+    pub review: tickloop_harness_protocol::RecordedFileChangeReview,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -307,6 +335,11 @@ pub struct ChainEntry {
     /// Subagents.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub loop_state_note: bool,
+    /// Tickloop extension: on a Loop state note, the state of the Loop the model knows once it
+    /// reads the note, so a load tells only what changed since. Raw, so a later format cannot
+    /// invalidate the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_state_view: Option<serde_json::Value>,
     /// Tickloop extension: marks the host note reminding the model of the task tools, Claude
     /// Code's `task_reminder` attachment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -377,9 +410,9 @@ pub struct ChainEntry {
     /// `message.model`; Tickloop's message structure has no such field). On resume it decides
     /// whether private reasoning in the history came from the current model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<ModelIdentity>,
+    pub model: Option<Recorded<ModelIdentity>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub private_source: Option<PrivateHistorySource>,
+    pub private_source: Option<Recorded<PrivateHistorySource>>,
     /// The Loop of the run the entry belongs to (recorded when there is a `runId`). On resume it
     /// assigns plan and progress tool calls to their own Loops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -401,6 +434,65 @@ pub struct ChainEntry {
     /// and never enter the messages sent to the model.
     #[serde(rename = "loop", default, skip_serializing_if = "Option::is_none")]
     pub loop_record: Option<LoopRecord>,
+}
+
+/// A record a later version may have written with a value of one of its enums this version does
+/// not know: such a record is kept as written, and nothing acts on it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Recorded<T> {
+    Known(T),
+    Later(serde_json::Value),
+}
+
+impl<T> Recorded<T> {
+    pub fn known(&self) -> Option<&T> {
+        match self {
+            Self::Known(value) => Some(value),
+            Self::Later(_) => None,
+        }
+    }
+}
+
+/// How a record shows that a later version wrote it.
+pub trait LaterValues {
+    /// Whether `value`, which does not parse, names a value only a later version knows.
+    fn holds_later_value(value: &serde_json::Value) -> bool;
+}
+
+impl LaterValues for ModelIdentity {
+    fn holds_later_value(value: &serde_json::Value) -> bool {
+        use tickloop_harness_protocol::{ModelProvider, Protocol, names_later_variant};
+        names_later_variant::<Protocol>(&value["protocol"])
+            || names_later_variant::<ModelProvider>(&value["provider"])
+    }
+}
+
+impl LaterValues for PrivateHistorySource {
+    fn holds_later_value(value: &serde_json::Value) -> bool {
+        use tickloop_harness_protocol::{Adapter, ModelAuthSource, names_later_variant};
+        names_later_variant::<Adapter>(&value["adapter"])
+            || names_later_variant::<ModelAuthSource>(&value["auth_source"])
+    }
+}
+
+impl<T: Serialize> Serialize for Recorded<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Known(value) => value.serialize(serializer),
+            Self::Later(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T: serde::de::DeserializeOwned + LaterValues> Deserialize<'de> for Recorded<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match serde_json::from_value(value.clone()) {
+            Ok(known) => Ok(Self::Known(known)),
+            Err(_) if T::holds_later_value(&value) => Ok(Self::Later(value)),
+            Err(error) => Err(serde::de::Error::custom(error)),
+        }
+    }
 }
 
 impl ChainEntry {
@@ -504,11 +596,14 @@ pub struct CompactMetadata {
     pub display_leaf: Option<Uuid>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CompactTriggerEntry {
     Manual,
     Auto,
+    /// A trigger a later version knows, kept as written.
+    #[serde(untagged)]
+    Later(String),
 }
 
 /// Follows Claude Code's `preservedSegment`: kept messages are not rewritten, and on load their
@@ -531,11 +626,14 @@ pub struct SummarizeMetadataEntry {
 }
 
 /// Follows Claude Code's `PartialCompactDirection`.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PartialCompactDirection {
     From,
     UpTo,
+    /// A direction a later version knows, kept as written.
+    #[serde(untagged)]
+    Later(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -580,6 +678,58 @@ pub struct DelegationEntry {
     pub delegation: DelegationMetadata,
     #[serde(default = "tickloop_harness_protocol::SearchConfig::enabled_default")]
     pub search_config: Option<tickloop_harness_protocol::SearchConfig>,
+}
+
+/// The local authority boundary that created an ACP session. Paths are canonical and the
+/// directory identity detects a replacement at the same spelling after a restart.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSessionOrigin {
+    pub canonical_cwd: PathBuf,
+    pub cwd_device: u64,
+    pub cwd_inode: u64,
+    pub config_root: PathBuf,
+}
+
+impl AcpSessionOrigin {
+    pub fn capture(cwd: &std::path::Path, config_root: &std::path::Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let canonical_cwd = std::fs::canonicalize(cwd)?;
+        let metadata = std::fs::metadata(&canonical_cwd)?;
+        if !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ACP working directory is not a directory",
+            ));
+        }
+        Ok(Self {
+            canonical_cwd,
+            cwd_device: metadata.dev(),
+            cwd_inode: metadata.ino(),
+            config_root: std::fs::canonicalize(config_root)?,
+        })
+    }
+
+    pub fn matches_current(
+        &self,
+        cwd: &std::path::Path,
+        config_root: &std::path::Path,
+    ) -> std::io::Result<bool> {
+        Ok(*self == Self::capture(cwd, config_root)?)
+    }
+}
+
+/// The latest ACP session configuration. Only model identity is recorded, not its provider
+/// connection, token, environment or any MCP server configuration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSessionEntry {
+    pub chat_id: Uuid,
+    pub origin: AcpSessionOrigin,
+    pub startup_permission_ceiling: tickloop_harness_protocol::PermissionPolicy,
+    pub execution_mode: tickloop_harness_protocol::ExecutionMode,
+    pub model: ModelIdentity,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -783,6 +933,18 @@ pub struct ProvenanceEntry {
 #[serde(rename_all = "camelCase")]
 pub struct TaskBoardsEntry {
     pub chat_id: Uuid,
+    pub boards: std::collections::BTreeMap<Uuid, tickloop_harness_protocol::TaskBoard>,
+}
+
+/// The root Chat's task boards as they stood at the end of the conversation up to the chain
+/// entry `leaf`, by root Loop id. The board at any place on a chain is the one recorded for the
+/// nearest entry at or above it, so answering a prompt again starts from the board before it and
+/// another branch shows the board at its end.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskBoardCheckpointEntry {
+    pub chat_id: Uuid,
+    pub leaf: Uuid,
     pub boards: std::collections::BTreeMap<Uuid, tickloop_harness_protocol::TaskBoard>,
 }
 
@@ -1132,6 +1294,7 @@ pub struct ModelVisibleResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tickloop_harness_protocol::Content;
 
     #[test]
     fn unknown_line_types_are_kept_as_written() {
@@ -1147,8 +1310,334 @@ mod tests {
     }
 
     #[test]
+    fn acp_metadata_is_chat_latest_and_a_broken_known_record_is_not_unknown() {
+        assert_eq!(MetadataKind::AcpSession.retention(), Retention::ChatLatest);
+        assert!(serde_json::from_str::<Line>(r#"{"type":"acp-session","chatId":7}"#).is_err());
+    }
+
+    #[test]
     fn a_broken_line_of_a_known_kind_is_not_unknown() {
         assert!(serde_json::from_str::<Line>(r#"{"type":"user","uuid":7}"#).is_err());
+    }
+
+    fn guidance_line(guidance: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "user",
+            "uuid": Uuid::from_u128(1),
+            "parentUuid": null,
+            "isSidechain": false,
+            "chatId": Uuid::nil(),
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "version": "later",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Host notice"}]},
+            "isMeta": true,
+            "guidance": guidance,
+            "humanFamilyOrigin": null,
+        })
+    }
+
+    /// A guidance kind a later version adds leaves the host note's Line readable here, and
+    /// writing it back keeps what that version wrote.
+    #[test]
+    fn a_host_note_with_a_later_guidance_kind_is_kept_as_written() {
+        let raw = guidance_line(serde_json::json!({
+            "kind": "later_kind",
+            "servers": {"docs": "sha256:01"},
+            "detail": [1, 2],
+        }));
+        let line: Line = serde_json::from_value(raw.clone()).unwrap();
+        let Line::User(entry) = &line else {
+            panic!("a user Line: {line:?}");
+        };
+        assert!(matches!(
+            &entry.guidance,
+            Some(tickloop_harness_protocol::GuidanceNote::Later(later)) if later.tag() == "later_kind"
+        ));
+        assert_eq!(serde_json::to_value(&line).unwrap(), raw);
+    }
+
+    /// A chain Line of `role` with `fields` added, as a later version may write it.
+    fn chain_line(role: &str, fields: serde_json::Value) -> serde_json::Value {
+        let mut line = serde_json::json!({
+            "type": role,
+            "uuid": Uuid::from_u128(1),
+            "parentUuid": null,
+            "chatId": Uuid::nil(),
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "version": "later",
+            "message": {"role": role, "content": [{"type": "text", "text": "Hello"}]},
+            "humanFamilyOrigin": null,
+        });
+        line.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        line
+    }
+
+    /// The Line reads, and writing it back keeps what the later version wrote at each pointer;
+    /// reading that again changes nothing.
+    fn assert_kept_as_written(raw: &serde_json::Value, pointers: &[&str]) -> Line {
+        let line: Line = serde_json::from_value(raw.clone()).unwrap();
+        let written = serde_json::to_value(&line).unwrap();
+        for pointer in pointers {
+            assert_eq!(written.pointer(pointer), raw.pointer(pointer), "{pointer}");
+        }
+        let again: Line = serde_json::from_value(written.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&again).unwrap(), written);
+        line
+    }
+
+    #[test]
+    fn a_later_skill_source_is_kept_as_written() {
+        let later = serde_json::json!({"kind": "later_source", "registry": "skills.example"});
+        let raw = chain_line(
+            "user",
+            serde_json::json!({
+                "invokedSkills": [{"name": "deploy", "content": "Steps", "source": later}],
+                "userSkillInvocation": {"name": "deploy", "source": later},
+            }),
+        );
+        let line = assert_kept_as_written(
+            &raw,
+            &["/invokedSkills/0/source", "/userSkillInvocation/source"],
+        );
+        let entry = line.chain_entry().unwrap();
+        assert!(matches!(
+            &entry.invoked_skills[0].source,
+            tickloop_harness_protocol::SkillSource::Later(later) if later.tag() == "later_source"
+        ));
+        let broken = chain_line(
+            "user",
+            serde_json::json!({"userSkillInvocation": {"name": "deploy", "source": {"kind": "user"}}}),
+        );
+        assert!(serde_json::from_value::<Line>(broken).is_err());
+    }
+
+    #[test]
+    fn a_later_model_or_private_history_source_is_kept_as_written() {
+        let raw = chain_line(
+            "assistant",
+            serde_json::json!({
+                "model": {
+                    "profile": "later",
+                    "protocol": "later_protocol",
+                    "requested_model": "m",
+                    "provider": "api",
+                },
+                "privateSource": {
+                    "provider_id": "p",
+                    "endpoint_fingerprint": "f",
+                    "adapter": "messages",
+                    "service_model_id": "m",
+                    "auth_source": "later_sign_in",
+                    "credential_reference": "",
+                },
+            }),
+        );
+        let line = assert_kept_as_written(&raw, &["/model", "/privateSource"]);
+        let entry = line.chain_entry().unwrap();
+        assert!(matches!(entry.model, Some(Recorded::Later(_))));
+        assert!(matches!(entry.private_source, Some(Recorded::Later(_))));
+        let known = chain_line(
+            "assistant",
+            serde_json::json!({"model": {"profile": "p", "protocol": "messages", "requested_model": "m"}}),
+        );
+        let known: Line = serde_json::from_value(known).unwrap();
+        assert!(matches!(
+            known.chain_entry().unwrap().model,
+            Some(Recorded::Known(_))
+        ));
+        let broken = chain_line(
+            "assistant",
+            serde_json::json!({"model": {"profile": "p", "protocol": "messages"}}),
+        );
+        assert!(serde_json::from_value::<Line>(broken).is_err());
+    }
+
+    #[test]
+    fn a_later_input_context_or_image_origin_is_kept_as_written() {
+        let origin = |contexts: serde_json::Value| {
+            chain_line(
+                "user",
+                serde_json::json!({"humanFamilyOrigin": {
+                    "message_id": Uuid::from_u128(2),
+                    "source_chat_id": Uuid::from_u128(3),
+                    "source_handle": "root",
+                    "original_submission": "Look",
+                    "original_contexts": contexts,
+                    "original_paths": [],
+                    "source_session_id": Uuid::from_u128(4),
+                    "source_view_id": Uuid::from_u128(5),
+                    "source_display_version": 1,
+                }}),
+            )
+        };
+        let raw = origin(serde_json::json!([
+            {"kind": "later_context", "uri": "later://a"},
+            {
+                "kind": "image",
+                "origin": {"type": "later_origin", "from": "camera"},
+                "image": {"media_type": "image/png", "data": "AA==", "width": 1, "height": 1},
+            },
+        ]));
+        let line = assert_kept_as_written(&raw, &["/humanFamilyOrigin/original_contexts"]);
+        let contexts = &line
+            .chain_entry()
+            .unwrap()
+            .human_family_origin
+            .as_ref()
+            .unwrap()
+            .original_contexts;
+        assert!(matches!(
+            &contexts[0],
+            tickloop_harness_protocol::InputContext::Later(_)
+        ));
+        assert!(matches!(
+            &contexts[1],
+            tickloop_harness_protocol::InputContext::Image(image)
+                if matches!(image.origin, tickloop_harness_protocol::ImageOrigin::Later(_))
+        ));
+        let broken = origin(serde_json::json!([{"kind": "file"}]));
+        assert!(serde_json::from_value::<Line>(broken).is_err());
+    }
+
+    #[test]
+    fn a_later_subagent_report_status_is_kept_as_written() {
+        let report = |report: serde_json::Value| {
+            chain_line(
+                "system",
+                serde_json::json!({
+                    "subtype": LOOP_SUBTYPE,
+                    "loop": {
+                        "loopId": Uuid::from_u128(2),
+                        "state": "Idle",
+                        "subagentReport": report,
+                        "runStartedAt": null,
+                    },
+                }),
+            )
+        };
+        let raw = report(serde_json::json!({"status": "later_status", "note": "x"}));
+        let line = assert_kept_as_written(&raw, &["/loop/subagentReport"]);
+        assert!(matches!(
+            line.chain_entry()
+                .unwrap()
+                .loop_record
+                .as_ref()
+                .unwrap()
+                .subagent_report,
+            Some(tickloop_harness_protocol::SubagentReport::Later(_))
+        ));
+        let broken = report(serde_json::json!({"status": "pending"}));
+        assert!(serde_json::from_value::<Line>(broken).is_err());
+    }
+
+    #[test]
+    fn a_later_compaction_trigger_or_summary_direction_is_kept_as_written() {
+        let raw = chain_line(
+            "system",
+            serde_json::json!({
+                "subtype": COMPACT_BOUNDARY_SUBTYPE,
+                "compactMetadata": {"trigger": "later_trigger", "preTokens": 10},
+            }),
+        );
+        let line = assert_kept_as_written(&raw, &["/compactMetadata/trigger"]);
+        assert_eq!(
+            line.chain_entry()
+                .unwrap()
+                .compact_metadata
+                .as_ref()
+                .unwrap()
+                .trigger,
+            CompactTriggerEntry::Later("later_trigger".into())
+        );
+        let raw = chain_line(
+            "user",
+            serde_json::json!({
+                "isCompactSummary": true,
+                "summarizeMetadata": {"messagesSummarized": 2, "direction": "later_direction"},
+            }),
+        );
+        assert_kept_as_written(&raw, &["/summarizeMetadata/direction"]);
+        let broken = chain_line(
+            "system",
+            serde_json::json!({"compactMetadata": {"trigger": 7, "preTokens": 10}}),
+        );
+        assert!(serde_json::from_value::<Line>(broken).is_err());
+    }
+
+    #[test]
+    fn later_content_blocks_are_kept_as_written() {
+        let content = serde_json::json!([
+            {"type": "later_block", "id": "call-1", "detail": {"x": 1}},
+            {"type": "protocol_data", "protocol": "later_protocol", "value": {"type": "reasoning"}},
+            {
+                "type": "tool_result",
+                "tool_use_id": "call-0",
+                "content": [
+                    {"type": "later_result_block", "detail": 2},
+                    {"type": "image", "source": {"type": "later_source", "url": "later://i"}, "width": 1, "height": 1},
+                ],
+                "is_error": false,
+            },
+        ]);
+        let raw = chain_line(
+            "user",
+            serde_json::json!({"message": {"role": "user", "content": content}}),
+        );
+        let line = assert_kept_as_written(&raw, &["/message/content"]);
+        let blocks = &line.chain_entry().unwrap().message.content;
+        assert!(matches!(&blocks[0], Content::Later(later) if later.tag() == "later_block"));
+        assert_eq!(blocks[0].later_call_id(), Some("call-1"));
+        assert!(matches!(&blocks[1], Content::Later(later) if later.tag() == "protocol_data"));
+        assert!(matches!(
+            &blocks[2],
+            Content::ToolResult { content: tickloop_harness_protocol::ToolResultContent::Blocks(results), .. }
+                if matches!(results[0], tickloop_harness_protocol::ToolResultBlock::Later(_))
+                    && matches!(
+                        results[1],
+                        tickloop_harness_protocol::ToolResultBlock::Image {
+                            source: tickloop_harness_protocol::ImageSource::Later(_),
+                            ..
+                        }
+                    )
+        ));
+        for broken in [
+            serde_json::json!({"type": "text"}),
+            serde_json::json!({"type": "protocol_data", "protocol": "messages"}),
+            serde_json::json!({"type": "image", "source": {"type": "base64"}, "width": 1, "height": 1}),
+        ] {
+            let raw = chain_line(
+                "user",
+                serde_json::json!({"message": {"role": "user", "content": [broken]}}),
+            );
+            assert!(serde_json::from_value::<Line>(raw).is_err(), "{broken}");
+        }
+    }
+
+    /// Only an unknown kind is kept as unknown: a known kind still reads as itself, and one that
+    /// does not parse breaks its Line as before.
+    #[test]
+    fn a_known_guidance_kind_is_never_read_as_unknown() {
+        let known: Line = serde_json::from_value(guidance_line(serde_json::json!({
+            "kind": "mcp_servers",
+            "servers": {"docs": "sha256:01"},
+        })))
+        .unwrap();
+        assert!(matches!(
+            known.chain_entry().and_then(|entry| entry.guidance.as_ref()),
+            Some(tickloop_harness_protocol::GuidanceNote::McpServers { servers }) if servers.len() == 1
+        ));
+        for broken in [
+            serde_json::json!({"kind": "mcp_servers"}),
+            serde_json::json!({"kind": "skill", "name": 7}),
+            serde_json::json!({"servers": {}}),
+        ] {
+            assert!(
+                serde_json::from_value::<Line>(guidance_line(broken.clone())).is_err(),
+                "{broken}"
+            );
+        }
     }
 
     /// A store classifying a written Line by its header alone reads the kind the Line has.
@@ -1196,6 +1685,11 @@ mod tests {
                 chat_id,
                 boards: Default::default(),
             }),
+            Line::TaskBoardCheckpoint(TaskBoardCheckpointEntry {
+                chat_id,
+                leaf: Uuid::nil(),
+                boards: Default::default(),
+            }),
             Line::FamilyCompletions(FamilyCompletionsEntry {
                 chat_id,
                 completions: Vec::new(),
@@ -1216,6 +1710,23 @@ mod tests {
             Line::Provenance(ProvenanceEntry {
                 chat_id,
                 ..Default::default()
+            }),
+            Line::AcpSession(AcpSessionEntry {
+                chat_id,
+                origin: AcpSessionOrigin {
+                    canonical_cwd: PathBuf::from("/project"),
+                    cwd_device: 1,
+                    cwd_inode: 2,
+                    config_root: PathBuf::from("/config"),
+                },
+                startup_permission_ceiling: Default::default(),
+                execution_mode: tickloop_harness_protocol::ExecutionMode::Auto,
+                model: ModelIdentity {
+                    profile: "test".into(),
+                    protocol: tickloop_harness_protocol::Protocol::Responses,
+                    requested_model: "test".into(),
+                    provider: Default::default(),
+                },
             }),
             Line::LastPrompt(LastPromptEntry {
                 chat_id,

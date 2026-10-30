@@ -120,6 +120,8 @@ pub(crate) struct RetainedFold {
     goal_events: Vec<Kept>,
     /// The latest file history snapshot of each message.
     file_history: HashMap<Uuid, Kept>,
+    /// The latest task board checkpoint of each chain entry.
+    task_board_checkpoints: HashMap<Uuid, Kept>,
     unknown: HashMap<String, VecDeque<Kept>>,
     chain: LoadableChain,
     lines_since_snapshot: usize,
@@ -182,6 +184,9 @@ impl RetainedFold {
             (Retention::LatestById, Line::NestedCall(entry)) => {
                 self.by_id.insert((kind, entry.operation.id), kept);
             }
+            (Retention::LatestById, Line::RecordedEdit(entry)) => {
+                self.by_id.insert((kind, entry.operation_id), kept);
+            }
             (Retention::LatestById, Line::Wait(entry)) => {
                 self.by_id.insert((kind, entry.wait_id), kept);
             }
@@ -193,6 +198,9 @@ impl RetainedFold {
             }
             (Retention::Accumulating, Line::FileHistorySnapshot(entry)) => {
                 self.file_history.insert(entry.message_id, kept);
+            }
+            (Retention::Accumulating, Line::TaskBoardCheckpoint(entry)) => {
+                self.task_board_checkpoints.insert(entry.leaf, kept);
             }
             (Retention::Unknown, Line::Unknown(unknown)) => {
                 let lines = self.unknown.entry(unknown.kind.clone()).or_default();
@@ -266,6 +274,7 @@ impl RetainedFold {
                     || entry.operation.parent_call_id.as_ref().is_some_and(|parent| self.chain.keeps_nested_parent(entry.operation.run_id.into(), parent)),
                     |input| self.chain.keeps_entry(input),
                 ),
+                Line::RecordedEdit(entry) => self.chain.keeps_tool_result(&entry.call_id),
                 Line::Wait(entry) => {
                     matches!(entry.state, WaitState::Open | WaitState::Resolved { .. })
                         || (matches!(entry.kind, tickloop_harness_transcript::WaitKind::Question { .. })
@@ -280,7 +289,8 @@ impl RetainedFold {
             .chain(
                 self.file_history
                     .iter()
-                    .filter(|(message, _)| self.chain.keeps_entry(**message))
+                    .chain(&self.task_board_checkpoints)
+                    .filter(|(entry, _)| self.chain.keeps_entry(**entry))
                     .map(|(_, kept)| kept),
             )
             .chain(self.unknown.values().flatten())

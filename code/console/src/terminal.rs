@@ -908,11 +908,18 @@ Usage: tickloop [--cwd DIRECTORY]
        [--working-directory-is-trusted]
        [-c | --continue | -r [CHAT] | --resume [CHAT] | --chat-id CHAT] [--fork-session]
        [--no-session-persistence]
+       tickloop -p [PROMPT | -] [--output-format text|json|stream-json] [--timeout SECONDS]
+       tickloop --print [PROMPT | -] [--cwd DIRECTORY] [--working-directory-is-trusted]
+       tickloop acp [--working-directory-is-trusted]
        tickloop update [--check | --status]
        tickloop daemon stop
        tickloop tick install TICK[@MARKETPLACE] | install --path PATH | update [TICK] | uninstall TICK [--keep-data] | enable TICK | disable TICK | list [--available] | login TICK [--issuer LABEL] | logout TICK
        tickloop plugin install PLUGIN[@MARKETPLACE] | install --path PATH | update [PLUGIN] | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | validate DIRECTORY | marketplace add SOURCE | marketplace list | marketplace update [MARKETPLACE] | marketplace remove MARKETPLACE
        tickloop mcp list | add NAME URL [--header 'NAME: VALUE']... [--dir] | add NAME [--env NAME=VALUE]... [--dir] -- COMMAND [ARGUMENTS...] | remove NAME [--dir] | login NAME | logout NAME
+
+Print mode accepts piped UTF-8 input; --print aliases -p, while --p is rejected. Run tickloop -p --help for details.
+Print/ACP use new managed Chats, not Console resume. They disable questions, Plan approvals, Subagents, scheduled goals, subscriptions and persistent Artifact feedback; completion/cancel/disconnect cleans invocation-owned resources.
+ACP stdout contains protocol traffic only; it offers one-time tool permissions, cancellation, session listing and loading, and approved session-scoped stdio MCP, not client filesystem or terminal execution.
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
 Run tickloop again to start this build. Each config root (~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set) has one daemon.
@@ -1361,6 +1368,8 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         (None, None)
     };
     let launch = LaunchSpec {
+        profile: tickloop_code_access::ExecutionProfile::Local,
+        session_mcp_servers: Vec::new(),
         folder: workdir.clone(),
         additional_directories,
         config_root: config_root.clone(),

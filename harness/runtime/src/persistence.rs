@@ -42,12 +42,13 @@ use tickloop_harness_protocol::{
     TodoItem, ToolCallRecovery, Usage,
 };
 use tickloop_harness_transcript::{
-    AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, ChainEntry,
-    CompactMetadata, CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord,
-    CustomTitleEntry, DelegationEntry, FamilyCompletionsEntry, FamilyInputsEntry,
-    FileHistorySnapshotEntry, ForkedFrom, LOOP_SUBTYPE, LastPromptEntry, Line, LoopRecord,
-    MonitorMembersEntry, PartialCompactDirection, ProvenanceEntry, SentAgentMessagesEntry,
-    SubagentsEntry, SummarizeMetadataEntry,
+    AcpSessionEntry, AcpSessionOrigin, AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry,
+    COMPACT_BOUNDARY_SUBTYPE, ChainEntry, CompactMetadata, CompactTriggerEntry,
+    ContentReplacementEntry, ContentReplacementRecord, CustomTitleEntry, DelegationEntry,
+    FamilyCompletionsEntry, FamilyInputsEntry, FileHistorySnapshotEntry, ForkedFrom, LOOP_SUBTYPE,
+    LastPromptEntry, Line, LoopRecord, MonitorMembersEntry, PartialCompactDirection,
+    ProvenanceEntry, Recorded, SentAgentMessagesEntry, SubagentsEntry, SummarizeMetadataEntry,
+    TaskBoardCheckpointEntry,
 };
 
 /// Following Claude Code's `NO_RESPONSE_REQUESTED`: the assistant sentinel appended when the
@@ -228,6 +229,65 @@ struct MessageLink {
 }
 
 impl ChatRecorder {
+    pub(super) async fn acp_session(
+        &self,
+        chat: ChatId,
+    ) -> Result<Option<AcpSessionEntry>, AgentError> {
+        match self.load_chat(chat, ChatLoad::default()).await {
+            Ok(loaded) => Ok(loaded
+                .metadata
+                .acp_session
+                .filter(|entry| entry.chat_id == chat)),
+            Err(AgentError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Called while the host excludes submissions. This never takes the Chat lock or flushes
+    /// Chat snapshots, so configuration can hold that lock through its durable commit.
+    pub(super) async fn record_acp_configuration(
+        &self,
+        chat: ChatId,
+        model: &ModelConfig,
+        mode: ExecutionMode,
+    ) -> Result<(), AgentError> {
+        let _appends = self.appends.lock().await;
+        let Some(mut entry) = self.acp_session(chat).await? else {
+            return Ok(());
+        };
+        entry.model = model.identity();
+        entry.execution_mode = mode;
+        self.outbox
+            .enqueue(chat, vec![Line::AcpSession(entry)], None);
+        if let Err(error) = self.append_queued(chat, true).await {
+            self.outbox.refuse_chat(
+                chat,
+                TranscriptError::Conflict(format!(
+                    "ACP metadata commit requires reconciliation: {error}"
+                )),
+            );
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    async fn record_new_acp_metadata(&self, entry: AcpSessionEntry) -> Result<(), AgentError> {
+        let _appends = self.appends.lock().await;
+        let chat: ChatId = entry.chat_id.into();
+        self.outbox
+            .enqueue(chat, vec![Line::AcpSession(entry)], None);
+        if let Err(error) = self.append_queued(chat, true).await {
+            self.outbox.refuse_chat(
+                chat,
+                TranscriptError::Conflict(format!(
+                    "ACP metadata commit requires reconciliation: {error}"
+                )),
+            );
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     pub(super) async fn read_subagents(
         &self,
         parent: ChatId,
@@ -922,6 +982,18 @@ impl ChatRecorder {
                 blocks,
             });
             lines.push(Line::chain(role, entry));
+            // Boards recorded at an old entry, or before the boundary, stand at the new entry.
+            if compacted_bookkeeping
+                .task_board_checkpoints
+                .contains_key(&index)
+            {
+                lines.push(task_board_checkpoint_line(
+                    compacted.id,
+                    uuid,
+                    compacted_bookkeeping,
+                    index,
+                ));
+            }
         }
         if let Some(content) = loop_update {
             lines.push(record_loop(
@@ -980,6 +1052,15 @@ impl ChatRecorder {
         Some(super::plan::plans_directory(self.local.as_ref()?.root()))
     }
 
+    pub(super) fn record_edit(
+        &self,
+        chat_id: ChatId,
+        edit: tickloop_harness_transcript::RecordedEditEntry,
+    ) {
+        self.outbox
+            .enqueue(chat_id, vec![Line::RecordedEdit(edit)], None);
+    }
+
     /// Following Claude Code's `recordFileHistorySnapshot`: snapshots are appended to the Chat's
     /// Transcript as metadata entries.
     pub(super) fn record_file_history_snapshot(
@@ -1001,6 +1082,38 @@ impl ChatRecorder {
             })],
             None,
         );
+    }
+
+    /// Queues the root Chat's task boards as they stand at the end of message `index`, keyed by
+    /// that message's last entry; what the Chat changed so far is queued first, so the entry is
+    /// there.
+    fn record_task_board_checkpoint(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+        index: usize,
+    ) -> bool {
+        self.enqueue_sync(snapshot, bookkeeping);
+        let Some(leaf) = self
+            .logs
+            .lock()
+            .unwrap()
+            .get(&snapshot.id)
+            .and_then(|log| log.links.get(index)?.uuids.last().copied())
+        else {
+            return false;
+        };
+        self.outbox.enqueue(
+            snapshot.id,
+            vec![task_board_checkpoint_line(
+                snapshot.id,
+                leaf,
+                bookkeeping,
+                index,
+            )],
+            None,
+        );
+        true
     }
 
     /// The project directory of a recorded Chat in the local store.
@@ -1151,7 +1264,15 @@ impl ChatRecorder {
             let prompt = (role == Role::User
                 && !is_meta
                 && !snapshot.agent_message_origins.contains_key(&uuid))
-            .then(|| typed_prompt(&message))
+            .then(|| {
+                typed_prompt(
+                    &message,
+                    snapshot
+                        .message_contexts
+                        .get(&index)
+                        .is_some_and(|contexts| !contexts.is_empty()),
+                )
+            })
             .flatten();
             let blocks = message.content.len();
             let mut entry = chain_entry(
@@ -1447,6 +1568,25 @@ struct EntryStamp<'a> {
     folder: Option<&'a Path>,
 }
 
+fn task_board_checkpoint_line(
+    chat_id: ChatId,
+    leaf: Uuid,
+    bookkeeping: &ChatBookkeeping,
+    index: usize,
+) -> Line {
+    Line::TaskBoardCheckpoint(TaskBoardCheckpointEntry {
+        chat_id: chat_id.into(),
+        leaf,
+        boards: bookkeeping
+            .task_board_checkpoints
+            .get(&index)
+            .into_iter()
+            .flatten()
+            .map(|(loop_id, board)| (loop_id.uuid(), board.clone()))
+            .collect(),
+    })
+}
+
 fn placement(folder: Option<&Path>) -> ChatPlacement {
     folder.map_or(ChatPlacement::Folderless, |folder| {
         ChatPlacement::Folder(folder.to_path_buf())
@@ -1464,6 +1604,7 @@ fn chain_entry(
 ) -> ChainEntry {
     let is_assistant = message.role == Role::Assistant;
     let is_user = message.role == Role::User;
+    let later_provenance = bookkeeping.later_provenance.get(&index);
     let run_id = snapshot.message_runs.get(&index).copied();
     let tool_call_recoveries = snapshot
         .tool_call_recoveries
@@ -1519,6 +1660,10 @@ fn chain_entry(
             _ => None,
         },
         loop_state_note: snapshot.host_notes.get(&index) == Some(&HostNote::LoopState),
+        loop_state_view: match snapshot.host_notes.get(&index) {
+            Some(HostNote::LoopState) => bookkeeping.loop_state_views.get(&index).cloned(),
+            _ => None,
+        },
         task_reminder: snapshot.host_notes.get(&index) == Some(&HostNote::TaskReminder),
         date_change: match snapshot.host_notes.get(&index) {
             Some(HostNote::DateChange(date)) => Some(date.clone()),
@@ -1569,9 +1714,21 @@ fn chain_entry(
         is_visible_in_transcript_only: summarize_metadata.is_some_and(Option::is_none),
         usage: snapshot.message_usage.get(&index).cloned(),
         model: is_assistant
-            .then(|| snapshot.message_models.get(&index).cloned())
+            .then(|| {
+                snapshot
+                    .message_models
+                    .get(&index)
+                    .cloned()
+                    .map(Recorded::Known)
+                    .or_else(|| later_provenance.and_then(|later| later.model.clone()))
+            })
             .flatten(),
-        private_source: snapshot.message_sources.get(&index).cloned(),
+        private_source: snapshot
+            .message_sources
+            .get(&index)
+            .cloned()
+            .map(Recorded::Known)
+            .or_else(|| later_provenance.and_then(|later| later.private_source.clone())),
         loop_id: snapshot
             .message_runs
             .contains_key(&index)
@@ -1690,6 +1847,7 @@ fn record_loop(
         plan_mode_exit: false,
         execution_mode_note: None,
         loop_state_note: false,
+        loop_state_view: None,
         task_reminder: false,
         date_change: None,
         hook_note: None,
@@ -1730,9 +1888,10 @@ fn compact_metadata_entry(
 ) -> CompactMetadata {
     CompactMetadata {
         display_leaf,
-        trigger: match boundary.trigger {
+        trigger: match &boundary.trigger {
             CompactTrigger::Manual => CompactTriggerEntry::Manual,
             CompactTrigger::Auto => CompactTriggerEntry::Auto,
+            CompactTrigger::Later(trigger) => CompactTriggerEntry::Later(trigger.clone()),
         },
         pre_tokens: boundary.pre_tokens,
         user_context: boundary.user_context.clone(),
@@ -1749,9 +1908,10 @@ fn compaction_marker(entry: &ChainEntry) -> Option<CompactionMarker> {
         .filter(|_| entry.is_compact_boundary())
     {
         return Some(CompactionMarker::Boundary(CompactBoundary {
-            trigger: match metadata.trigger {
+            trigger: match &metadata.trigger {
                 CompactTriggerEntry::Manual => CompactTrigger::Manual,
                 CompactTriggerEntry::Auto => CompactTrigger::Auto,
+                CompactTriggerEntry::Later(trigger) => CompactTrigger::Later(trigger.clone()),
             },
             pre_tokens: metadata.pre_tokens,
             user_context: metadata.user_context.clone(),
@@ -1764,24 +1924,25 @@ fn compaction_marker(entry: &ChainEntry) -> Option<CompactionMarker> {
             model: None,
         }));
     }
+    // A summary whose direction only a later version knows reads as one that kept nothing.
     entry.is_compact_summary.then(|| CompactionMarker::Summary {
-        summarize_metadata: entry
-            .summarize_metadata
-            .as_ref()
-            .map(|metadata| SummarizeMetadata {
+        summarize_metadata: entry.summarize_metadata.as_ref().and_then(|metadata| {
+            Some(SummarizeMetadata {
                 messages_summarized: metadata.messages_summarized,
                 user_context: metadata.user_context.clone(),
                 direction: match metadata.direction {
                     PartialCompactDirection::From => SummaryDirection::FromHere,
                     PartialCompactDirection::UpTo => SummaryDirection::UpToHere,
+                    PartialCompactDirection::Later(_) => return None,
                 },
-            }),
+            })
+        }),
     })
 }
 
 /// A plain-text prompt typed by the user; local messages (interrupt markers, `!` commands, task
 /// notifications) do not count.
-fn typed_prompt(message: &Message) -> Option<String> {
+fn typed_prompt(message: &Message, has_contexts: bool) -> Option<String> {
     let text = message
         .content
         .iter()
@@ -1791,7 +1952,7 @@ fn typed_prompt(message: &Message) -> Option<String> {
         })
         .collect::<Option<Vec<_>>>()?
         .join("\n");
-    (!text.trim().is_empty()
+    ((!text.trim().is_empty() || has_contexts)
         && matches!(
             LocalMessage::parse(&text),
             None | Some(LocalMessage::AgentCommunication { .. })
@@ -1838,6 +1999,8 @@ struct RestoredChain {
     prompt_execution_modes: BTreeMap<usize, ExecutionMode>,
     inherited_prompts: HashSet<usize>,
     host_notes: BTreeMap<usize, HostNote>,
+    loop_state_views: BTreeMap<usize, serde_json::Value>,
+    later_provenance: BTreeMap<usize, LaterProvenance>,
     message_compactions: BTreeMap<usize, CompactionMarker>,
     message_usage: BTreeMap<usize, Usage>,
     message_sources: BTreeMap<usize, PrivateHistorySource>,
@@ -1855,6 +2018,16 @@ struct RestoredChain {
     /// it (a new slug switched to on resume is written on later entries); when none is valid, keep
     /// the first one, and rebuilding the plan warns and switches to a new slug.
     plan_slug: Option<String>,
+}
+
+/// The model and private history source a later version recorded for an assistant message with
+/// values this version does not know.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+pub(crate) struct LaterProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<Recorded<tickloop_harness_protocol::ModelIdentity>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_source: Option<Recorded<PrivateHistorySource>>,
 }
 
 /// Restores chain entries into messages and preserves user prompts with execution modes as rewind
@@ -1875,6 +2048,8 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         prompt_execution_modes: BTreeMap::new(),
         inherited_prompts: HashSet::new(),
         host_notes: BTreeMap::new(),
+        loop_state_views: BTreeMap::new(),
+        later_provenance: BTreeMap::new(),
         message_compactions: BTreeMap::new(),
         message_usage: BTreeMap::new(),
         message_sources: BTreeMap::new(),
@@ -1953,12 +2128,16 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         }
         let index = restored.messages.len();
         restored.message_ids.insert(index, entry.uuid);
-        if let Some(model) = entry
+        let mut later = LaterProvenance::default();
+        match entry
             .model
             .clone()
             .filter(|_| entry.message.role == Role::Assistant)
         {
-            restored.message_models.insert(index, model);
+            Some(Recorded::Known(model)) => {
+                restored.message_models.insert(index, model);
+            }
+            later_model => later.model = later_model,
         }
         if let Some(run_id) = entry.run_id {
             restored.message_runs.insert(index, run_id.into());
@@ -1998,6 +2177,9 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
                 .insert(index, HostNote::ExecutionMode(note));
         } else if entry.loop_state_note {
             restored.host_notes.insert(index, HostNote::LoopState);
+            if let Some(view) = &entry.loop_state_view {
+                restored.loop_state_views.insert(index, view.clone());
+            }
         } else if entry.task_reminder {
             restored.host_notes.insert(index, HostNote::TaskReminder);
         } else if let Some(date) = &entry.date_change {
@@ -2035,12 +2217,19 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         {
             restored.message_usage.insert(index, usage);
         }
-        if let Some(source) = entry
+        // Private history whose source only a later version knows is never sent to a model.
+        match entry
             .private_source
             .clone()
             .filter(|_| entry.message.role == Role::Assistant)
         {
-            restored.message_sources.insert(index, source);
+            Some(Recorded::Known(source)) => {
+                restored.message_sources.insert(index, source);
+            }
+            later_source => later.private_source = later_source,
+        }
+        if later.model.is_some() || later.private_source.is_some() {
+            restored.later_provenance.insert(index, later);
         }
         let execution_mode = entry.execution_mode.as_ref().map(|value| {
             let (mode, warning) = restored_execution_mode(value);
@@ -2055,7 +2244,14 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
             && entry.message.role == Role::User
             && !entry.is_meta
             && entry.agent_message_origin.is_none()
-            && typed_prompt(&entry.message).is_some()
+            && typed_prompt(
+                &entry.message,
+                restored
+                    .message_contexts
+                    .get(&index)
+                    .is_some_and(|contexts| !contexts.is_empty()),
+            )
+            .is_some()
         {
             restored
                 .prompt_execution_modes
@@ -2148,6 +2344,8 @@ impl RestoredChain {
             prompt_execution_modes: BTreeMap::new(),
             inherited_prompts: HashSet::new(),
             host_notes: BTreeMap::new(),
+            loop_state_views: BTreeMap::new(),
+            later_provenance: BTreeMap::new(),
             message_compactions: BTreeMap::new(),
             message_usage: BTreeMap::new(),
             message_sources: BTreeMap::new(),
@@ -2203,6 +2401,9 @@ impl RestoredChain {
             if let Some(announced) = self.host_notes.get(&original) {
                 kept.host_notes.insert(index, announced.clone());
             }
+            if let Some(view) = self.loop_state_views.get(&original) {
+                kept.loop_state_views.insert(index, view.clone());
+            }
             if let Some(marker) = self.message_compactions.get(&original) {
                 kept.message_compactions.insert(index, marker.clone());
             }
@@ -2214,6 +2415,9 @@ impl RestoredChain {
             }
             if let Some(source) = self.message_sources.get(&original) {
                 kept.message_sources.insert(index, source.clone());
+            }
+            if let Some(later) = self.later_provenance.get(&original) {
+                kept.later_provenance.insert(index, later.clone());
             }
             for uuid in &self.links[original].uuids {
                 kept.message_of_entry.insert(*uuid, index);
@@ -2267,6 +2471,13 @@ fn recover_transcript(
                     .scheduled_tasks
                     .as_ref()
                     .and_then(|entry| entry.cwd.clone())
+            })
+            .or_else(|| {
+                loaded
+                    .metadata
+                    .acp_session
+                    .as_ref()
+                    .map(|entry| entry.origin.canonical_cwd.clone())
             }),
     };
     let mut snapshot = super::empty_snapshot(chat_id, folder, ModelConfig::unselected());
@@ -2429,6 +2640,18 @@ fn recover_transcript(
             .find_map(|entry| entry.compact_metadata.as_ref()?.display_leaf),
     );
     kept.fill_conversation(&mut snapshot, &mut bookkeeping);
+    if chat_id == source_chat_id {
+        bookkeeping.task_board_checkpoints = super::task_board_history::checkpoints_by_message(
+            &loaded.chain,
+            &kept.message_of_entry,
+            &loaded.task_board_checkpoints,
+            chat_id.into(),
+        );
+        bookkeeping.has_task_board_checkpoints = loaded
+            .task_board_checkpoints
+            .values()
+            .any(|checkpoint| checkpoint.chat_id == chat_id.uuid());
+    }
     let mut nested = std::collections::BTreeMap::new();
     for line in &loaded.lifecycle {
         if let Line::NestedCall(entry) = line
@@ -2461,6 +2684,7 @@ fn recover_transcript(
         kept.meta_messages.clone(),
         waits,
         family,
+        loaded.metadata.acp_session.is_none(),
     )
 }
 
@@ -2515,6 +2739,8 @@ impl RestoredChain {
         snapshot.message_models = self.message_models.clone();
         snapshot.message_compactions = self.message_compactions.clone();
         snapshot.host_notes = self.host_notes.clone();
+        bookkeeping.loop_state_views = self.loop_state_views.clone();
+        bookkeeping.later_provenance = self.later_provenance.clone();
         snapshot.announced_host_tools = snapshot.visible_announced_host_tools();
         bookkeeping.plan_slug = self.plan_slug.clone();
         self.replay_loop(snapshot);
@@ -2624,6 +2850,7 @@ fn recover_snapshot_for_resume(
     meta_messages: HashSet<usize>,
     waits: WaitHosting,
     family: Option<&super::family_load::FamilyRecords>,
+    append_bootstrap: bool,
 ) -> Result<RecoveredSnapshot, AgentError> {
     let rebuilt_runs = |snapshot: &ChatSnapshot| {
         super::suspension::rebuilt_waits(waits, &bookkeeping.lifecycle, snapshot)
@@ -2651,7 +2878,7 @@ fn recover_snapshot_for_resume(
         .find(|index| snapshot.messages[*index].role != Role::System)
         .and_then(|index| snapshot.message_runs.get(&index))
         .is_some_and(|run| rebuilt.contains(run));
-    if !ends_with_rebuilt_run {
+    if append_bootstrap && !ends_with_rebuilt_run {
         append_no_response_sentinel(&mut snapshot);
     }
     super::branch::validate_snapshot(&snapshot)?;
@@ -2770,6 +2997,105 @@ fn file_history_snapshots(loaded: &LoadedTranscript) -> Vec<FileHistorySnapshot>
 }
 
 impl Agent {
+    /// Publishes even an empty ACP session only after its origin and configuration are durable.
+    pub async fn record_new_acp_session(
+        &self,
+        chat_id: ChatId,
+        cwd: &Path,
+        config_root: &Path,
+    ) -> Result<(), AgentError> {
+        if !self.inner.tool_policy.is_managed() {
+            return Err(AgentError::Invalid(
+                "ACP metadata requires a managed Agent".into(),
+            ));
+        }
+        let recorder = self.inner.recorder.as_ref().ok_or(AgentError::NotFound)?;
+        let origin = AcpSessionOrigin::capture(cwd, config_root)
+            .map_err(|error| AgentError::Storage(error.to_string()))?;
+        let snapshot = self.snapshot(chat_id).await?;
+        if snapshot.delegation.is_some() || snapshot.folder.as_ref() != Some(&origin.canonical_cwd)
+        {
+            return Err(AgentError::Invalid(
+                "ACP session origin does not match its root Chat".into(),
+            ));
+        }
+        self.claim_acp_session(chat_id, cwd, config_root).await?;
+        let mut startup_permission_ceiling = snapshot.policy.clone();
+        startup_permission_ceiling.host_rules.clear();
+        startup_permission_ceiling
+            .rules
+            .retain(|rule| rule.decision != tickloop_harness_protocol::Decision::Allow);
+        let result = recorder
+            .record_new_acp_metadata(AcpSessionEntry {
+                chat_id: chat_id.into(),
+                origin,
+                startup_permission_ceiling,
+                execution_mode: snapshot.policy.mode,
+                model: snapshot.model.identity(),
+            })
+            .await;
+        if result.is_err() {
+            self.release_acp_session_claim(chat_id).await;
+        }
+        result
+    }
+
+    pub async fn flush_acp_session(&self, chat_id: ChatId) -> Result<(), AgentError> {
+        self.flush_transcripts().await;
+        let Some(recorder) = &self.inner.recorder else {
+            return Ok(());
+        };
+        let _appends = recorder.appends.lock().await;
+        recorder
+            .append_queued(chat_id, true)
+            .await
+            .map(|_| ())
+            .map_err(|error| AgentError::Storage(error.to_string()))
+    }
+
+    pub async fn read_acp_session(
+        &self,
+        chat_id: ChatId,
+    ) -> Result<Option<AcpSessionEntry>, AgentError> {
+        let recorder = self.inner.recorder.as_ref().ok_or(AgentError::NotFound)?;
+        recorder.acp_session(chat_id).await
+    }
+
+    /// Reattaches a stored ACP Chat without executing a prompt or restoring client MCP state.
+    /// The host starts this worker with the saved model identity selected from its own catalog.
+    pub async fn resume_acp_session(
+        &self,
+        chat_id: ChatId,
+        cwd: &Path,
+        config_root: &Path,
+    ) -> Result<ChatSnapshot, AgentError> {
+        if !self.inner.tool_policy.is_managed() {
+            return Err(AgentError::Invalid(
+                "ACP resume requires a managed Agent".into(),
+            ));
+        }
+        let entry = self
+            .read_acp_session(chat_id)
+            .await?
+            .ok_or_else(|| AgentError::Invalid("Chat was not created as an ACP session".into()))?;
+        if !entry
+            .origin
+            .matches_current(cwd, config_root)
+            .map_err(|error| AgentError::Invalid(error.to_string()))?
+        {
+            return Err(AgentError::Invalid(
+                "ACP session origin identity changed".into(),
+            ));
+        }
+        self.require_working_directory_trust(cwd)?;
+        self.claim_acp_session(chat_id, cwd, config_root).await?;
+        let result = self.resume_chat(chat_id).await;
+        if result.is_err() {
+            self.release_acp_session_claim(chat_id).await;
+        }
+        result
+    }
+
     pub(super) async fn adopt_upgrade_transcript(
         &self,
         snapshot: &ChatSnapshot,
@@ -3041,6 +3367,26 @@ impl Agent {
         recorder.outbox.enqueue(chat_id, vec![line], None);
         recorder.notify.notify_one();
         self.ensure_flush_loop(recorder);
+    }
+
+    /// Queues the checkpoint recorded at the end of message `index` and wakes the background
+    /// flush.
+    pub(super) fn record_task_board_line(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+        index: usize,
+    ) {
+        let Some(recorder) = &self.inner.recorder else {
+            return;
+        };
+        if !recorder.logs.lock().unwrap().contains_key(&snapshot.id) {
+            return;
+        }
+        if recorder.record_task_board_checkpoint(snapshot, bookkeeping, index) {
+            recorder.notify.notify_one();
+            self.ensure_flush_loop(recorder);
+        }
     }
 
     pub(super) fn record_delegation(
@@ -3699,7 +4045,53 @@ impl Agent {
         // Mutually exclusive with settings writes until the Chat joins this process, so persistent
         // rule changes written meanwhile do not miss this Chat.
         let _settings_gate = self.inner.settings_writes.lock().await;
-        let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
+        let (mut client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
+        if chat_id == source_chat_id
+            && self.inner.tool_policy.is_managed()
+            && let Some(entry) = loaded.metadata.acp_session.as_ref()
+        {
+            let mode_rank = |mode: ExecutionMode| match mode {
+                ExecutionMode::Plan => 0,
+                ExecutionMode::AcceptEdits => 1,
+                ExecutionMode::Auto => 2,
+                ExecutionMode::FullAccess => 3,
+            };
+            let config = tickloop_harness_model::cards::ModelCatalog::defaults()
+                .profiles()
+                .into_iter()
+                .find(|config| config.identity() == entry.model)
+                .ok_or_else(|| {
+                    AgentError::Invalid("saved ACP model is not in the current catalog".into())
+                })?;
+            client = self.inner.models.client(&config)?;
+            snapshot.model = config;
+            if mode_rank(entry.execution_mode) > mode_rank(entry.startup_permission_ceiling.mode)
+                || mode_rank(entry.execution_mode) > mode_rank(snapshot.policy.mode)
+            {
+                return Err(AgentError::Invalid(
+                    "saved ACP configuration exceeds this worker's model or permission ceiling"
+                        .into(),
+                ));
+            }
+            snapshot.policy.mode = entry.execution_mode;
+            snapshot
+                .policy
+                .project_constraints
+                .extend(entry.startup_permission_ceiling.project_constraints.clone());
+            snapshot
+                .policy
+                .managed_constraints
+                .extend(entry.startup_permission_ceiling.managed_constraints.clone());
+            snapshot.policy.managed_constraints.extend(
+                entry
+                    .startup_permission_ceiling
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.decision != tickloop_harness_protocol::Decision::Allow)
+                    .cloned(),
+            );
+            self.apply_host_rules(&mut snapshot.policy);
+        }
         if let Some(delegation) = &mut snapshot.delegation {
             self.apply_host_rules(&mut delegation.ceiling.policy);
             delegation.ceiling.policy.plan_without_auto = snapshot.policy.plan_without_auto;
@@ -3807,6 +4199,7 @@ impl Agent {
                 .stopped_runs
                 .insert(chat_id, stopped_runs.into_iter().map(Into::into).collect());
         }
+        let announced_loop_state = super::loop_state_notes::restored(&snapshot, &bookkeeping);
         self.inner.chats.lock().await.insert(
             chat_id,
             Chat {
@@ -3815,10 +4208,11 @@ impl Agent {
                 family_stopping: false,
                 task_checkpoint_pending: false,
                 family_finishing: HashSet::new(),
+                unsettled_runs: HashSet::new(),
                 snapshot: snapshot.clone(),
                 bookkeeping,
                 start_new_tool_result_message: false,
-                announced_loop_state: None,
+                announced_loop_state,
                 active: None,
                 active_run: None,
                 upgrade_wait: None,
@@ -3957,15 +4351,19 @@ impl StagedBranch {
         snapshot.provider_failures = previous.provider_failures.clone();
         snapshot.user_shells = previous.user_shells.clone();
         snapshot.pending_commands = previous.pending_commands.clone();
-        // Choosing another stored branch changes the conversation alone, as a rewind does.
+        // Choosing another stored branch changes the conversation alone, as a rewind does; the
+        // live task boards then follow it to where the branch recorded them.
         snapshot.scheduled_tasks = previous.scheduled_tasks.clone();
         snapshot.scheduled_task_revocations = previous.scheduled_task_revocations.clone();
+        snapshot.task_boards = previous.task_boards.clone();
         if snapshot.plans.iter().any(|plan| plan.approval_pending) {
             snapshot.policy.mode = ExecutionMode::Plan;
         }
         chat.replace_snapshot(snapshot);
         chat.bookkeeping = self.bookkeeping;
         chat.bookkeeping.citation_sources = current.bookkeeping.citation_sources.clone();
+        chat.bookkeeping.has_task_board_checkpoints |=
+            current.bookkeeping.has_task_board_checkpoints;
         chat.content_replacements = self.content_replacements;
         chat.file_history = self.file_history;
         chat.start_new_tool_result_message = false;

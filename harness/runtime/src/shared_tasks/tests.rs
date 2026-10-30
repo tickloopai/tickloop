@@ -657,3 +657,149 @@ fn task_references_resolve_in_either_form() {
         Err(tickloop_ids::not_found::<SharedTaskKind>("3"))
     );
 }
+
+/// The flat TaskUpdate schema offers every action's fields, and models fill the ones the action
+/// does not take, empty or with placeholder content; those are dropped before the call is
+/// prepared, so they neither fail it nor make a retry differ.
+#[tokio::test]
+async fn task_update_drops_fields_of_other_actions() {
+    use tickloop_harness_test_support::routed::tool_result;
+    let completion = Uuid::new_v4();
+    let model = Arc::new(RoutedModel::new(move |request| {
+        let Some(created) = tool_result(&request.messages, "create") else {
+            return call(
+                "create",
+                "TaskCreate",
+                json!({"mutation_id":Uuid::new_v4(),"title":"Inspect","description":"Inspect authorized work"}),
+            );
+        };
+        let task_id = created["task"]["id"].clone();
+        let update = |fields: Value| {
+            let mut input = json!({"task_id":task_id,"expected_revision":2});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            input
+        };
+        for (id, input) in [
+            (
+                "claim",
+                json!({"mutation_id":Uuid::new_v4(),"task_id":task_id,"expected_revision":1,"action":"claim","owner":"main","result":"started","title":"Inspect","description":"Inspect authorized work","dependencies":[]}),
+            ),
+            (
+                "complete",
+                update(
+                    json!({"mutation_id":completion,"action":"complete","result":"Verified","dependencies":[task_id],"title":"Inspect","owner":null}),
+                ),
+            ),
+            (
+                "retry",
+                update(json!({"mutation_id":completion,"action":"complete","result":"Verified"})),
+            ),
+        ] {
+            if !has_tool_result(request, id) {
+                return call(id, "TaskUpdate", input);
+            }
+        }
+        text("done")
+    }));
+    let core = Agent::new_embedded(config(), model);
+    let chat = core.create_chat(std::env::temp_dir()).await.unwrap();
+    core.set_execution_mode(chat, tickloop_harness_protocol::ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    core.set_task_tools_enabled(chat, true).await.unwrap();
+    let mut events = core.subscribe();
+    let receipt = core.submit(chat, "authorized work".into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.run_id == receipt.run_id {
+                match event.kind {
+                    EventKind::Completed { .. } => break,
+                    EventKind::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = core.snapshot(chat).await.unwrap();
+    core.shutdown().await;
+    let result = |id: &str| {
+        snapshot
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|content| match content {
+                Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == id => Some((content.text(), *is_error)),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let (claimed, is_error) = result("claim");
+    assert!(!is_error, "{claimed}");
+    let (completed, is_error) = result("complete");
+    assert!(!is_error, "{completed}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&completed).unwrap()["status"],
+        "applied"
+    );
+    let (retried, is_error) = result("retry");
+    assert!(!is_error, "{retried}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&retried).unwrap()["status"],
+        "already_applied"
+    );
+    let board = &snapshot.task_boards[&receipt.loop_id];
+    assert_eq!(board.tasks[0].status, Status::Completed);
+    assert_eq!(board.tasks[0].result.as_deref(), Some("Verified"));
+    assert_eq!(
+        board.mutations[&completion].input,
+        format!(
+            "TaskUpdate:{}",
+            json!({"task_id":tool_result(&snapshot.messages, "create").unwrap()["task"]["id"],"expected_revision":2,"mutation_id":completion,"action":"complete","result":"Verified"})
+        )
+    );
+}
+
+/// Fields of other actions are dropped whatever they hold; an action's own fields, keys outside
+/// the schema and input without a known action reach the strict parse as written.
+#[test]
+fn prepared_update_input_keeps_what_the_strict_parse_judges() {
+    for unchanged in [
+        json!({"action":"complete","result":""}),
+        json!({"action":"edit","title":"t","description":"d","dependencies":[]}),
+        json!({"action":"assign","owner":""}),
+        json!({"action":"claim","foo":""}),
+        json!({"action":"merge","dependencies":["x"]}),
+        json!({"result":"r","dependencies":[]}),
+        json!({"action":7,"dependencies":[]}),
+    ] {
+        assert_eq!(prepared_update_input(unchanged.clone()), unchanged);
+    }
+    assert_eq!(
+        prepared_update_input(
+            json!({"action":"edit","title":"t","description":"d","dependencies":[],"owner":null,"result":"r"})
+        ),
+        json!({"action":"edit","title":"t","description":"d","dependencies":[]})
+    );
+    assert_eq!(
+        prepared_update_input(
+            json!({"action":"assign","owner":"a","dependencies":["x"],"title":"t","result":""})
+        ),
+        json!({"action":"assign","owner":"a"})
+    );
+    assert_eq!(
+        prepared_update_input(
+            json!({"action":"claim","owner":"main","result":"started","title":"t","description":"d","dependencies":[]})
+        ),
+        json!({"action":"claim"})
+    );
+}

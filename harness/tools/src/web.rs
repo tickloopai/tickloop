@@ -76,6 +76,8 @@ pub(super) struct SearchInput {
     query: String,
     domains: DomainFilter,
     pub(super) prepared: Option<Arc<PreparedSearch>>,
+    /// Where the user configures search, which a failure names.
+    pub(super) settings: Option<String>,
 }
 
 /// Claude Code's `URL_CACHE`: the Markdown of pages fetched in the last 15 minutes by requested
@@ -257,7 +259,7 @@ CRITICAL REQUIREMENT - You MUST follow this:
 
 Usage notes:
   - Domain filtering is supported to include or block specific websites
-  - Search uses the source selected in /websearch; free search needs no account or API key
+  - Search uses the source the user selected; free search needs no account or API key
   - Do not request more results by passing limit or offset; refine the query and read source pages with WebFetch
 
 IMPORTANT - Use the correct year in search queries:
@@ -357,6 +359,7 @@ pub(super) fn prepare_search(input: &Value) -> Result<(String, Operation, Value)
             query: parsed.query,
             domains,
             prepared: None,
+            settings: None,
         }),
         normalized_input,
     ))
@@ -570,7 +573,10 @@ pub(super) async fn search(
     let response = match prepared.execute(&request, cancel).await {
         Ok(response) => response,
         Err(error) => {
-            if let Some(failure) = web_search::failure_details(prepared.kind, &request, &error) {
+            let settings = input.settings.as_deref();
+            if let Some(failure) =
+                web_search::failure_details(prepared.kind, &request, &error, settings)
+            {
                 return Ok(Ok(ToolResult {
                     content: serde_json::to_string(&failure).expect("search failure serializes"),
                     is_error: true,
@@ -580,9 +586,12 @@ pub(super) async fn search(
             }
             return Err(match error {
                 web_search::SearchError::Cancelled => ToolError::Cancelled,
-                other => {
-                    ToolError::Network(web_search::failure_message(prepared.kind, &request, &other))
-                }
+                other => ToolError::Network(web_search::failure_message(
+                    prepared.kind,
+                    &request,
+                    &other,
+                    settings,
+                )),
             });
         }
     };

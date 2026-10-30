@@ -29,11 +29,34 @@ const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_QUERY_BYTES: usize = 4096;
 const PERPLEXITY_MAX_DOMAIN_BYTES: usize = 253;
 pub const DEFAULT_RESULT_LIMIT: usize = 10;
-/// The result of a `WebSearch` call while the user has search turned off. The tool stays listed
-/// so turning search on or off never changes the prompt cache prefix; the call explains instead.
-pub const DISABLED_MESSAGE: &str = "Web search is turned off, so this call was not executed. If the user asks for web search, explain that it is off and that they can turn it on with /websearch. Do not turn it on yourself or use Bash, curl, a browser, a subagent, WebFetch on a search engine, or another tool to bypass this setting. WebFetch remains available for reading specific URLs; turning off search does not turn off web fetching.";
+/// Where the terminal's user changes web search settings, which a host names unless it supplies
+/// its own place or none.
+pub const DEFAULT_SEARCH_SETTINGS: &str = "/websearch";
 const DUCKDUCKGO_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 const DUCKDUCKGO_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
+
+/// The result of a `WebSearch` call while the user has search turned off, naming where the user
+/// turns it on when `settings` gives a place. The tool stays listed so turning search on or off
+/// never changes the prompt cache prefix; the call explains instead.
+pub fn disabled_message(settings: Option<&str>) -> String {
+    let how_to_enable = settings
+        .map(|settings| format!(" and that they can turn it on with {settings}"))
+        .unwrap_or_default();
+    format!(
+        "Web search is turned off, so this call was not executed. If the user asks for web search, explain that it is off{how_to_enable}. Do not turn it on yourself or use Bash, curl, a browser, a subagent, WebFetch on a search engine, or another tool to bypass this setting. WebFetch remains available for reading specific URLs; turning off search does not turn off web fetching."
+    )
+}
+
+/// What a search error says, naming where the user configures search when `settings` gives a
+/// place.
+pub fn error_text(error: &SearchError, settings: Option<&str>) -> String {
+    match (error, settings) {
+        (SearchError::MissingCredential, Some(settings)) => {
+            format!("{error}; configure the provider in {settings}")
+        }
+        _ => error.to_string(),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DomainFilter {
@@ -147,7 +170,7 @@ pub fn descriptor(kind: SearchProviderKind) -> SearchProviderDescriptor {
 pub enum SearchError {
     #[error("invalid search query: {0}")]
     InvalidQuery(&'static str),
-    #[error("search credentials are missing; configure the provider in /websearch")]
+    #[error("search credentials are missing")]
     MissingCredential,
     #[error("saved search credentials are unavailable or unsafe")]
     Credential,
@@ -272,6 +295,7 @@ impl PreparedSearch {
 pub async fn test_connection(
     config: &SearchConfig,
     credential_root: Option<&Path>,
+    settings: Option<&str>,
     cancel: CancellationToken,
 ) -> SearchTestResult {
     let request = SearchRequest {
@@ -293,15 +317,18 @@ pub async fn test_connection(
         },
         Err(error) => SearchTestResult {
             status: SearchTestStatus::Unavailable,
-            detail: failure_message(config.provider, &request, &error),
+            detail: failure_message(config.provider, &request, &error, settings),
         },
     }
 }
 
+/// What a search that ran into a verification challenge tells the model and the user, naming
+/// where another provider is chosen when `settings` gives a place.
 pub fn failure_details(
     kind: SearchProviderKind,
     request: &SearchRequest,
     error: &SearchError,
+    settings: Option<&str>,
 ) -> Option<WebSearchFailure> {
     if kind != SearchProviderKind::Free || !matches!(error, SearchError::Challenge) {
         return None;
@@ -310,15 +337,19 @@ pub fn failure_details(
     verification_url
         .query_pairs_mut()
         .append_pair("q", &request.query);
+    let verification = WebSearchSuggestion::OpenVerification {
+        url: verification_url.to_string(),
+        note: "Use the same proxy/network as Tickloop. Browser verification may not carry over to HTTP search.".into(),
+    };
     Some(WebSearchFailure {
         reason: format!("{}: {error}", kind.label()),
-        suggestions: vec![
-            WebSearchSuggestion::OpenVerification {
-                url: verification_url.to_string(),
-                note: "Use the same proxy/network as Tickloop. Browser verification may not carry over to HTTP search.".into(),
-            },
-            WebSearchSuggestion::ChangeProvider { command: "/websearch".into() },
-        ],
+        suggestions: std::iter::once(verification)
+            .chain(
+                settings.map(|settings| WebSearchSuggestion::ChangeProvider {
+                    command: settings.into(),
+                }),
+            )
+            .collect(),
     })
 }
 
@@ -326,9 +357,10 @@ pub fn failure_message(
     kind: SearchProviderKind,
     request: &SearchRequest,
     error: &SearchError,
+    settings: Option<&str>,
 ) -> String {
-    let Some(failure) = failure_details(kind, request, error) else {
-        return format!("{}: {error}", kind.label());
+    let Some(failure) = failure_details(kind, request, error, settings) else {
+        return format!("{}: {}", kind.label(), error_text(error, settings));
     };
     let mut message = failure.reason;
     message.push_str("\n\nNext steps:");

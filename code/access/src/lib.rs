@@ -29,3 +29,9 @@ pub use upgrade::{
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
+
+pub use access::{
+    ExecutionProfile, MANAGED_LEASE_SECONDS, ManagedConfiguration, ManagedConfigurationChange,
+    ManagedHistoryPage, ManagedModelInfo, ManagedSessionInfo, ManagedSessionPage, ManagedSkillInfo,
+    ManagedToken,
+};

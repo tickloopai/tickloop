@@ -1103,6 +1103,89 @@ async fn a_search_results_urls_may_be_fetched() {
     agent.shutdown().await;
 }
 
+/// WebSearch stays listed while search is off, and a call names where this host's user turns it
+/// on, or no place on a host that has none, rather than the terminal's command.
+#[tokio::test]
+async fn a_search_call_while_search_is_off_names_only_the_hosts_own_settings() {
+    for (settings, expected) in [
+        (
+            Some("the workspace search settings"),
+            "explain that it is off and that they can turn it on with the workspace search settings. Do not",
+        ),
+        (None, "explain that it is off. Do not"),
+    ] {
+        let model = Arc::new(RoutedModel::new(|request| {
+            if request.tools.is_empty() {
+                return text("Read.");
+            }
+            if !has_tool_result(request, "fetch-0") {
+                return call("fetch-0", "WebSearch", json!({"query": "delivery"}));
+            }
+            text("Done.")
+        }));
+        let agent = cloud_harness(
+            Arc::new(InMemoryTranscriptStore::new()),
+            model.clone(),
+            HarnessOptions {
+                tools: ToolPolicy {
+                    web_search: true,
+                    ..ToolPolicy::durable_chat()
+                },
+                web_search_settings: settings.map(str::to_owned),
+                ..cloud_options(durable_chat_host_rules())
+            },
+        );
+        let chat = agent.create_chat_without_folder().await.unwrap();
+        agent.set_search(chat, None).await.unwrap();
+        let results = run_fetches(&agent, chat, "Search for the delivery page.", 1).await;
+        assert_eq!(
+            results,
+            [(
+                tickloop_harness_tools::web_search::disabled_message(settings),
+                true
+            )]
+        );
+        assert!(results[0].0.contains(expected), "{}", results[0].0);
+        let requests = model.requests.lock().unwrap().clone();
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "WebSearch"),
+            "WebSearch stays listed"
+        );
+        assert!(!format!("{requests:?}").contains("/websearch"));
+        agent.shutdown().await;
+    }
+}
+
+/// Nobody is asked to approve a call on a host that denies whatever would prompt, and its system
+/// prompt says so.
+#[tokio::test]
+async fn the_cloud_compositions_prompt_says_calls_that_would_prompt_are_denied() {
+    let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+    let agent = cloud_harness(
+        Arc::new(InMemoryTranscriptStore::new()),
+        model.clone(),
+        cloud_options(durable_chat_host_rules()),
+    );
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    let request = prompt("Hello.");
+    agent.advance(chat, request.clone()).await.unwrap();
+    tokio::time::timeout(WAIT, agent.settled_input(chat, request.input_id))
+        .await
+        .unwrap()
+        .unwrap();
+    let requests = model.requests.lock().unwrap().clone();
+    let system = format!("{:?}", requests[0].messages[0]);
+    assert!(
+        system.contains("the call is denied without asking the user"),
+        "{system}"
+    );
+    assert!(!system.contains("will be prompted"), "{system}");
+    agent.shutdown().await;
+}
+
 const NAMED_ARTIFACT: &str = "quarterly-report";
 const UNSHARED_ARTIFACT: &str = "someone-elses-plan";
 
@@ -1481,4 +1564,376 @@ async fn a_task_deleted_in_its_own_run_never_runs_again() {
     );
     assert_eq!(agent.quiesce(root).await, Quiescence::Idle);
     agent.shutdown().await;
+}
+
+/// A host that loads the Chat on another replica for each turn: one Agent per turn over the same
+/// store, each shut down and synced before the next loads.
+async fn turn_on_a_fresh_replica(
+    store: &Arc<InMemoryTranscriptStore>,
+    model: &Arc<RoutedModel>,
+    chat: Option<ChatId>,
+    text: &str,
+    before: impl AsyncFnOnce(&Agent, ChatId),
+) -> (ChatId, tickloop_harness_protocol::ChatSnapshot) {
+    let agent = cloud_harness(
+        store.clone(),
+        model.clone(),
+        cloud_options(durable_chat_host_rules()),
+    );
+    let chat = match chat {
+        Some(chat) => {
+            agent.resume_chat(chat).await.unwrap();
+            chat
+        }
+        None => agent.create_chat_without_folder().await.unwrap(),
+    };
+    before(&agent, chat).await;
+    let request = prompt(text);
+    agent.advance(chat, request.clone()).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(WAIT, agent.settled_input(chat, request.input_id))
+            .await
+            .unwrap()
+            .unwrap(),
+        SettledOutcome::Completed { .. }
+    ));
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    agent.shutdown().await;
+    agent.sync().await.unwrap();
+    (chat, snapshot)
+}
+
+fn linked_artifact(id: &str, title: &str) -> tickloop_harness_protocol::ArtifactTick {
+    tickloop_harness_protocol::ArtifactTick {
+        artifact_id: id.into(),
+        origin: "https://docs.example".into(),
+        title: title.into(),
+        format: "markdown".into(),
+        url: format!("https://docs.example/a/{id}"),
+        access_role: "owner".into(),
+        added_at_ms: 1000,
+    }
+}
+
+/// The text of each Loop state note in the conversation, in order.
+fn loop_state_notes(snapshot: &tickloop_harness_protocol::ChatSnapshot) -> Vec<String> {
+    snapshot
+        .host_notes
+        .iter()
+        .filter(|(_, note)| **note == tickloop_harness_protocol::HostNote::LoopState)
+        .map(|(index, _)| format!("{:?}", snapshot.messages[*index].content))
+        .collect()
+}
+
+/// A Chat loaded for every turn tells the model its Loop state once, then only what changed:
+/// each note's entry records what the model knows, and a load restores it.
+#[tokio::test]
+async fn a_chat_reloaded_every_turn_is_told_its_loop_state_only_when_it_changes() {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+    let (chat, first) =
+        turn_on_a_fresh_replica(&store, &model, None, "One.", async |agent, chat| {
+            agent
+                .add_artifact_tick(chat, linked_artifact("plan", "Plan"))
+                .await
+                .unwrap();
+        })
+        .await;
+    assert_eq!(loop_state_notes(&first).len(), 1);
+    for text in ["Two.", "Three."] {
+        let (_, unchanged) =
+            turn_on_a_fresh_replica(&store, &model, Some(chat), text, async |_, _| {}).await;
+        assert_eq!(
+            loop_state_notes(&unchanged),
+            loop_state_notes(&first),
+            "a load with nothing changed adds no note"
+        );
+    }
+    let (_, linked) =
+        turn_on_a_fresh_replica(&store, &model, Some(chat), "Four.", async |agent, chat| {
+            agent
+                .add_artifact_tick(chat, linked_artifact("deck", "Deck"))
+                .await
+                .unwrap();
+        })
+        .await;
+    let notes = loop_state_notes(&linked);
+    assert_eq!(notes.len(), 2);
+    assert!(
+        notes[1].contains("- Linked: \\\"Deck\\\"") && !notes[1].contains("\\\"Plan\\\""),
+        "only the change is told: {}",
+        notes[1]
+    );
+    let (_, after) =
+        turn_on_a_fresh_replica(&store, &model, Some(chat), "Five.", async |_, _| {}).await;
+    assert_eq!(loop_state_notes(&after), notes);
+}
+
+/// A Chat whose notes an earlier version wrote, recording no state, is told its Loop state once
+/// more and then only what changes.
+#[tokio::test]
+async fn a_note_without_a_recorded_state_is_followed_by_one_full_note() {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+    let (chat, _) = turn_on_a_fresh_replica(&store, &model, None, "One.", async |agent, chat| {
+        agent
+            .add_artifact_tick(chat, linked_artifact("plan", "Plan"))
+            .await
+            .unwrap();
+    })
+    .await;
+    let earlier_version = store
+        .lines(chat)
+        .into_iter()
+        .map(|line| {
+            let mut value = serde_json::to_value(&line).unwrap();
+            value.as_object_mut().unwrap().remove("loopStateView");
+            serde_json::from_value::<Line>(value).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let store_of_earlier_version = Arc::new(InMemoryTranscriptStore::new());
+    store_of_earlier_version.seed(chat, earlier_version, store.position(chat).unwrap());
+    let (_, reloaded) = turn_on_a_fresh_replica(
+        &store_of_earlier_version,
+        &model,
+        Some(chat),
+        "Two.",
+        async |_, _| {},
+    )
+    .await;
+    let notes = loop_state_notes(&reloaded);
+    assert_eq!(notes.len(), 2);
+    assert_eq!(notes[1], notes[0]);
+    let (_, again) = turn_on_a_fresh_replica(
+        &store_of_earlier_version,
+        &model,
+        Some(chat),
+        "Three.",
+        async |_, _| {},
+    )
+    .await;
+    assert_eq!(loop_state_notes(&again), notes);
+}
+
+/// A guidance note of a kind a later version added leaves the Chat loadable: the note stays in the
+/// conversation the model reads, and announces nothing this version knows of.
+#[tokio::test]
+async fn a_chat_with_a_later_versions_guidance_kind_still_loads_and_continues() {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+    let (chat, _) = turn_on_a_fresh_replica(&store, &model, None, "One.", async |agent, chat| {
+        agent
+            .add_artifact_tick(chat, linked_artifact("plan", "Plan"))
+            .await
+            .unwrap();
+    })
+    .await;
+    // The Loop state note stands in for a note a later version wrote with a guidance kind this
+    // version does not know.
+    let later_version = store
+        .lines(chat)
+        .into_iter()
+        .map(|line| {
+            let mut value = serde_json::to_value(&line).unwrap();
+            let entry = value.as_object_mut().unwrap();
+            if entry.remove("loopStateNote").is_some() {
+                entry.remove("loopStateView");
+                entry.insert(
+                    "guidance".into(),
+                    json!({"kind": "later_kind", "servers": {"docs": "sha256:01"}}),
+                );
+            }
+            serde_json::from_value::<Line>(value).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(later_version.iter().any(|line| matches!(
+        line.chain_entry().and_then(|entry| entry.guidance.as_ref()),
+        Some(tickloop_harness_protocol::GuidanceNote::Later(later)) if later.tag() == "later_kind"
+    )));
+    let store_of_later_version = Arc::new(InMemoryTranscriptStore::new());
+    store_of_later_version.seed(chat, later_version, store.position(chat).unwrap());
+    let (_, reloaded) = turn_on_a_fresh_replica(
+        &store_of_later_version,
+        &model,
+        Some(chat),
+        "Two.",
+        async |_, _| {},
+    )
+    .await;
+    assert!(reloaded.host_notes.values().any(|note| matches!(
+        note,
+        tickloop_harness_protocol::HostNote::Guidance(
+            tickloop_harness_protocol::GuidanceNote::Later(_)
+        )
+    )));
+    assert!(reloaded.visible_guidance().mcp_servers.is_empty());
+    let last = model.requests.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        tickloop_harness_test_support::routed::history_text(&last)
+            .matches("Artifacts linked to this Chat:")
+            .count(),
+        2,
+        "the later version's note stays in the conversation, and this version tells its own"
+    );
+    let written = store_of_later_version.lines(chat);
+    assert!(written.iter().any(|line| {
+        line.chain_entry()
+            .and_then(|entry| entry.guidance.as_ref())
+            .is_some_and(|guidance| {
+                serde_json::to_value(guidance).unwrap()
+                    == json!({"kind": "later_kind", "servers": {"docs": "sha256:01"}})
+            })
+    }));
+}
+
+/// The Chat's Lines with `change` applied to the JSON of each chain entry, as a later version
+/// might have written them.
+fn as_written_later(
+    store: &InMemoryTranscriptStore,
+    chat: ChatId,
+    mut change: impl FnMut(&mut serde_json::Map<String, Value>),
+) -> Arc<InMemoryTranscriptStore> {
+    let lines = store
+        .lines(chat)
+        .into_iter()
+        .map(|line| {
+            let mut value = serde_json::to_value(&line).unwrap();
+            if line.chain_entry().is_some() {
+                change(value.as_object_mut().unwrap());
+            }
+            serde_json::from_value::<Line>(value).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let later = Arc::new(InMemoryTranscriptStore::new());
+    later.seed(chat, lines, store.position(chat).unwrap());
+    later
+}
+
+/// Content a later version wrote stays in the Transcript as written, and a request shows a
+/// placeholder in its place, keeping each call paired with its result.
+#[tokio::test]
+async fn later_content_reaches_the_model_as_a_placeholder_and_stays_in_the_transcript() {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+    let (chat, _) = turn_on_a_fresh_replica(&store, &model, None, "One.", async |_, _| {}).await;
+    let later_block = json!({"type": "later_block", "detail": {"x": 1}});
+    let later_result = json!({"type": "later_result_block"});
+    let later = as_written_later(&store, chat, |entry| {
+        let role = entry["message"]["role"].as_str().unwrap().to_owned();
+        let content = entry["message"]["content"].as_array_mut().unwrap();
+        if role == "user" && content.iter().any(|block| block["text"] == "One.") {
+            content.push(later_block.clone());
+        }
+        if role == "assistant" && content.iter().any(|block| block["text"] == "Done.") {
+            content.push(later_result.clone());
+        }
+    });
+    let (_, reloaded) =
+        turn_on_a_fresh_replica(&later, &model, Some(chat), "Two.", async |_, _| {}).await;
+    assert!(reloaded.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, Content::Later(_)))
+    }));
+    let last = model.requests.lock().unwrap().last().cloned().unwrap();
+    let history = format!("{:?}", last.messages);
+    assert_eq!(
+        history
+            .matches(tickloop_harness_protocol::LATER_CONTENT_TEXT)
+            .count(),
+        2,
+        "{history}"
+    );
+    assert!(!history.contains("later_block") && !history.contains("later_result_block"));
+    let written = later
+        .lines(chat)
+        .iter()
+        .map(|line| serde_json::to_value(line).unwrap().to_string())
+        .collect::<String>();
+    assert!(written.contains(&later_block.to_string()));
+    assert!(written.contains(&later_result.to_string()));
+}
+
+/// A Skill from a source only a later version knows stays recorded but never guides again, while
+/// one from a known source is restored as before.
+#[tokio::test]
+async fn a_skill_from_a_later_source_is_never_invoked_again() {
+    for (source, guides) in [
+        (
+            json!({"kind": "user", "path": "/skills/deploy/SKILL.md"}),
+            true,
+        ),
+        (
+            json!({"kind": "later_source", "registry": "skills.example"}),
+            false,
+        ),
+    ] {
+        let store = Arc::new(InMemoryTranscriptStore::new());
+        let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+        let (chat, _) =
+            turn_on_a_fresh_replica(&store, &model, None, "One.", async |_, _| {}).await;
+        let skill = json!([{"name": "deploy", "content": "DEPLOY SKILL STEPS", "source": source}]);
+        let later = as_written_later(&store, chat, |entry| {
+            entry.insert("invokedSkills".into(), skill.clone());
+        });
+        let (_, reloaded) =
+            turn_on_a_fresh_replica(&later, &model, Some(chat), "Two.", async |_, _| {}).await;
+        assert_eq!(reloaded.invoked_skills.len(), 1, "the record stays");
+        let last = model.requests.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            format!("{:?}", last.messages).contains("DEPLOY SKILL STEPS"),
+            guides,
+            "{source}"
+        );
+        let last_entry = later
+            .lines(chat)
+            .into_iter()
+            .rev()
+            .find_map(|line| line.chain_entry().cloned())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&last_entry.invoked_skills).unwrap(),
+            skill,
+            "written back as recorded"
+        );
+    }
+}
+
+/// An answer whose model or private history source a later version recorded with values this
+/// version does not know loads and continues, and its entry keeps them as written.
+#[tokio::test]
+async fn an_answer_with_a_later_model_provenance_loads_and_keeps_it() {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+    let (chat, _) = turn_on_a_fresh_replica(&store, &model, None, "One.", async |_, _| {}).await;
+    let later_model = json!({
+        "profile": "later", "protocol": "later_protocol", "requested_model": "m", "provider": "api",
+    });
+    let later_source = json!({
+        "provider_id": "p", "endpoint_fingerprint": "f", "adapter": "later_adapter",
+        "service_model_id": "m", "auth_source": "api_key_env", "credential_reference": "",
+    });
+    let later = as_written_later(&store, chat, |entry| {
+        if entry["message"]["role"] == "assistant" {
+            entry.insert("model".into(), later_model.clone());
+            entry.insert("privateSource".into(), later_source.clone());
+        }
+    });
+    let (_, reloaded) =
+        turn_on_a_fresh_replica(&later, &model, Some(chat), "Two.", async |_, _| {}).await;
+    let first_answer = reloaded
+        .messages
+        .iter()
+        .position(|message| message.role == Role::Assistant)
+        .unwrap();
+    assert!(!reloaded.message_models.contains_key(&first_answer));
+    assert!(!reloaded.message_sources.contains_key(&first_answer));
+    let written = later
+        .lines(chat)
+        .iter()
+        .map(|line| serde_json::to_value(line).unwrap())
+        .filter(|line| line["model"] == later_model && line["privateSource"] == later_source)
+        .count();
+    assert!(written >= 1);
 }

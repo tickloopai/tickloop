@@ -30,7 +30,9 @@
     "tickloop-harness-policy": "harness",
     "tickloop-tick-installer": "tick",
     "tickloop-code-access": "code",
-    "tickloop-code-local-environment": "code"
+    "tickloop-code-local-environment": "code",
+    "tickloop-code-acp": "code",
+    "tickloop-code-print": "code"
   },
   "allowed": {
     "harness": [

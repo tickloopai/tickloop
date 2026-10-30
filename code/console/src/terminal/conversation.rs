@@ -1,6 +1,6 @@
 use tickloop_harness::protocol::{
     ChatSnapshot, CommandSnapshot, Content, Event, EventKind, FamilyCompletion, FamilyInputRecord,
-    ModelRequestKind, Protocol, Role,
+    LATER_CONTENT_TEXT, ModelRequestKind, Protocol, Role,
 };
 use uuid::Uuid;
 
@@ -652,6 +652,16 @@ fn message_block(
             }
             ConversationBlockKind::Thinking { text, source }
         }
+        Content::Later(_) => match role {
+            Role::User => ConversationBlockKind::User {
+                text: LATER_CONTENT_TEXT.into(),
+            },
+            Role::Assistant => ConversationBlockKind::Assistant {
+                text: LATER_CONTENT_TEXT.into(),
+                state: AssistantState::Complete,
+            },
+            Role::System => return None,
+        },
         Content::Thinking { .. } | Content::ProtocolData { .. } | Content::Image { .. } => {
             return None;
         }

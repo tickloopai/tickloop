@@ -59,7 +59,9 @@ mod hook_trust;
 mod ingress;
 mod ipc;
 mod lifecycle;
+mod managed;
 mod mcp_configuration;
+pub mod mcp_supervisor;
 mod receipts;
 mod request_logging;
 #[cfg(test)]
@@ -156,6 +158,11 @@ impl ProcessWorkerFactory {
 
 #[async_trait]
 impl WorkerFactory for ProcessWorkerFactory {
+    async fn end_managed(&self, launch: &LaunchSpec, chat: Uuid) -> Result<(), AccessError> {
+        self.control
+            .end_managed(launch.config_root.as_deref(), chat)
+            .await
+    }
     async fn request_upgrade(&self, executable: &Path) -> Result<(), AccessError> {
         self.select_upgrade(executable).await
     }
@@ -358,6 +365,33 @@ impl WorkerFactory for ProcessWorkerFactory {
             self.control.revoke(worker).await;
         }
         exited
+    }
+    async fn retire(&self, worker: &Arc<dyn AgentAccess>) {
+        self.control.revoke(worker).await;
+        let retired = {
+            let mut workers = self.workers.lock().await;
+            workers
+                .iter()
+                .position(|managed| Arc::ptr_eq(&managed.access, worker))
+                .map(|index| workers.remove(index))
+        };
+        let Some(retired) = retired else {
+            return;
+        };
+        let process = retired.process.clone();
+        // Lifeline EOF is the Worker's ordinary shutdown; reap it off the caller's path.
+        drop(retired);
+        tokio::spawn(async move {
+            let mut process = process.lock().await;
+            if let Some(process) = process.as_mut()
+                && tokio::time::timeout(STARTUP_DEADLINE, process.wait())
+                    .await
+                    .is_err()
+            {
+                let _ = process.start_kill();
+                let _ = process.wait().await;
+            }
+        });
     }
 
     async fn other_tickhost(&self) -> Result<Option<OtherTickhost>, AccessError> {
@@ -706,6 +740,12 @@ pub async fn build_runtime_with_models(
     models: Arc<dyn ModelClients>,
     control: Option<tickloop_code_local_environment::hosted::worker_control::WorkerControlGrant>,
 ) -> Result<(Agent, LocalEnvironment), String> {
+    if !launch.session_mcp_servers.is_empty() {
+        if launch.profile != tickloop_code_access::ExecutionProfile::Acp {
+            return Err("session MCP servers require an ACP execution".into());
+        }
+        tickloop_harness::protocol::validate_session_mcp_servers(&launch.session_mcp_servers)?;
+    }
     let model = launch_model(launch.model.as_ref());
     let settings = launch
         .config_root
@@ -780,6 +820,15 @@ pub async fn build_runtime_with_models(
                 Arc::new(settings) as Arc<dyn tickloop_harness::policy::settings::SettingsStore>
             }),
             host: launch.host_options,
+            tools: match launch.profile {
+                tickloop_code_access::ExecutionProfile::Local => tickloop_harness::runtime::ToolPolicy::local(),
+                tickloop_code_access::ExecutionProfile::OneShot => tickloop_harness::runtime::ToolPolicy::one_shot(),
+                tickloop_code_access::ExecutionProfile::Acp => tickloop_harness::runtime::ToolPolicy::acp(),
+            },
+            system_prompt_addition: match launch.profile {
+                tickloop_code_access::ExecutionProfile::Local => None,
+                _ => Some("Managed execution contract (overrides generic Tickloop and Skill lifecycle guidance): This request is invocation-scoped. Delegation, new goals, subscriptions, questions and Plan mode are unavailable. Artifacts created here are not automatically associated with this Chat for later feedback. Background Shell completion does not start another model turn. Invocation-owned Shell tasks and hosted Ticks are cleaned up when this request settles or is released; do not promise continued observation or resources persisting after the request. An ACP Chat can accept a later prompt, but each prompt must finish its own work.".into()),
+            },
             ..HarnessOptions::local(model)
         },
     )
@@ -850,12 +899,26 @@ pub async fn build_runtime_with_models(
             connections,
             configuration,
         ));
-        tickloop_harness::runtime::host_tools::HostToolProvider::mcp_server_statuses(
-            provider.as_ref(),
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await;
+        if launch.profile != tickloop_code_access::ExecutionProfile::Acp {
+            tickloop_harness::runtime::host_tools::HostToolProvider::mcp_server_statuses(
+                provider.as_ref(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        }
         sources.push(provider);
+    }
+    // Last, so a configured server keeps a tool name both offer.
+    if !launch.session_mcp_servers.is_empty() {
+        sources.push(Arc::new(
+            tickloop_harness::runtime::session_mcp::SessionMcpProvider::new(
+                launch.session_mcp_servers.clone(),
+                // The supervisor is this Worker's own executable in its supervisor role.
+                Arc::new(mcp_supervisor::SupervisorMcpLauncher::new(
+                    std::env::current_exe().map_err(|error| error.to_string())?,
+                )),
+            )?,
+        ));
     }
     agent
         .install_host_tools(sources)
@@ -1033,3 +1096,14 @@ mod tests {
 
 mod access_error;
 mod records;
+
+fn execution_tool_policy(
+    profile: tickloop_code_access::ExecutionProfile,
+) -> tickloop_harness::runtime::ToolPolicy {
+    match profile {
+        tickloop_code_access::ExecutionProfile::Local => {
+            tickloop_harness::runtime::ToolPolicy::local()
+        }
+        _ => tickloop_harness::runtime::ToolPolicy::one_shot(),
+    }
+}

@@ -200,6 +200,87 @@ fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
 }
 
 #[test]
+fn saved_empty_prompt_text_is_omitted_only_from_the_model_projection() {
+    use serde_json::json;
+    use tickloop_harness_protocol::{ChatSnapshot, Content, Role};
+
+    let saved = json!({
+        "id": Uuid::from_u128(1),
+        "chat_loop": {"id": Uuid::from_u128(2), "state": "Idle"},
+        "messages": [{"role": "user", "content": [{"type": "text", "text": ""}]}],
+        "message_contexts": {"0": [
+            {"kind": "resource", "uri": "file:///not/read", "content": "client material"},
+            {"kind": "prompt_text", "text": ""},
+            {"kind": "prompt_text", "text": " \t "},
+            {"kind": "image", "origin": {"type": "attached", "id": 1, "uri": "client://pixel"},
+                "image": {"media_type": "image/png", "data": "AA==", "width": 1, "height": 1}},
+            {"kind": "prompt_text", "text": ""},
+            {"kind": "prompt_text", "text": "after"},
+            {"kind": "prompt_text", "text": ""}
+        ]}
+    });
+    let snapshot: ChatSnapshot = serde_json::from_value(saved.clone()).unwrap();
+    let recorded = serde_json::to_value(&snapshot).unwrap();
+    let messages = snapshot.conversation_messages().unwrap();
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, Role::User);
+    let content = &messages[0].content;
+    assert_eq!(content.len(), 5);
+    let Content::Text { text } = &content[0] else {
+        panic!("resource context stays untrusted text")
+    };
+    assert!(text.contains("untrusted data"));
+    assert!(text.contains("not a local file read or permission grant"));
+    assert!(text.contains("file:///not/read"));
+    assert!(text.contains("client material"));
+    assert_eq!(
+        content[1],
+        Content::Text {
+            text: " \t ".into()
+        }
+    );
+    assert_eq!(
+        content[2],
+        Content::Text {
+            text: "[Attached image #1] URI: \"client://pixel\"".into()
+        }
+    );
+    assert_eq!(
+        content[3],
+        serde_json::from_value::<Content>(json!({
+            "type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="},
+            "width": 1, "height": 1
+        }))
+        .unwrap()
+    );
+    assert_eq!(
+        content[4],
+        Content::Text {
+            text: "after".into()
+        }
+    );
+    assert_eq!(serde_json::to_value(&snapshot).unwrap(), recorded);
+    assert_eq!(recorded["message_contexts"], saved["message_contexts"]);
+
+    let mut continued = saved;
+    continued["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":[{"type":"text","text":"Reviewed."}]}),
+        json!({"role":"user","content":[{"type":"text","text":"Continue."}]}),
+    ]);
+    let continued: ChatSnapshot = serde_json::from_value(continued).unwrap();
+    let next_messages = continued.conversation_messages().unwrap();
+    assert_eq!(next_messages.len(), 3);
+    assert_eq!(next_messages[0], messages[0]);
+    assert!(next_messages.iter().all(|message| {
+        message
+            .content
+            .iter()
+            .all(|content| !matches!(content, Content::Text { text } if text.is_empty()))
+    }));
+}
+
+#[test]
 fn a_tick_subscription_saved_with_a_cadence_in_seconds_is_not_converted() {
     let subscription = |timing: (&str, serde_json::Value)| {
         let mut wire = serde_json::json!({

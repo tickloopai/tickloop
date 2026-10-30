@@ -1,3 +1,5 @@
+experimental = ["setup-scripts"]
+
 [profile.default]
 fail-fast = false
 slow-timeout = { period = "30s", terminate-after = 4 }
@@ -5,6 +7,14 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 # CI runners are slower and noisier than a workstation; PTY tests wait on rendered frames.
 [profile.ci]
 retries = 2
+
+# A fresh build makes the first launch of each workspace executable slow on macOS.
+[scripts.setup.warm-executables]
+command = { command-line = "scripts/warm-test-executables.sh", relative-to = "workspace-root" }
+
+[[profile.default.scripts]]
+filter = "all()"
+setup = "warm-executables"
 
 [test-groups]
 pty = { max-threads = 4 }

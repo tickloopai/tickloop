@@ -631,6 +631,8 @@ pub struct Tools {
     observed_urls: web_provenance::Observations,
     search_credential_root: Option<PathBuf>,
     search_provider_factory: Option<std::sync::Arc<dyn web_search::SearchProviderFactory>>,
+    /// Where the user changes search settings, which a call names when search cannot run.
+    search_settings: Option<String>,
     file_reads: FileReadState,
     /// The addresses `WebFetch` may reach.
     reach: Reach,
@@ -680,6 +682,7 @@ impl Tools {
             observed_urls: web_provenance::Observations::default(),
             search_credential_root: None,
             search_provider_factory: None,
+            search_settings: Some(web_search::DEFAULT_SEARCH_SETTINGS.into()),
             file_reads: FileReadState::default(),
             reach,
         }
@@ -737,6 +740,13 @@ impl Tools {
         factory: Option<std::sync::Arc<dyn web_search::SearchProviderFactory>>,
     ) -> Self {
         self.search_provider_factory = factory;
+        self
+    }
+
+    /// Names `settings` as where the user changes search settings when search cannot run; `None`
+    /// names no place.
+    pub fn with_search_settings(mut self, settings: Option<String>) -> Self {
+        self.search_settings = settings;
         self
     }
 
@@ -817,12 +827,11 @@ impl Tools {
     /// approval, with or without a Folder.
     async fn bind_search(&self, mut prepared: PreparedTool) -> Result<PreparedTool, ToolError> {
         if let Operation::WebSearch(search) = &mut prepared.operation {
-            let config = self
-                .search
-                .read()
-                .await
-                .clone()
-                .ok_or_else(|| ToolError::Network(web_search::DISABLED_MESSAGE.into()))?;
+            let config = self.search.read().await.clone().ok_or_else(|| {
+                ToolError::Network(web_search::disabled_message(
+                    self.search_settings.as_deref(),
+                ))
+            })?;
             let request = search.request();
             web_search::validate_request(&config, &request)
                 .map_err(|error| ToolError::Network(error.to_string()))?;
@@ -837,7 +846,12 @@ impl Tools {
                     web_search::prepare(&config, &request, self.search_credential_root.as_deref())
                 }
             }
-            .map_err(|error| ToolError::Network(error.to_string()))?;
+            .map_err(|error| {
+                ToolError::Network(web_search::error_text(
+                    &error,
+                    self.search_settings.as_deref(),
+                ))
+            })?;
             if plan.kind != config.provider {
                 return Err(ToolError::Network(
                     "search provider does not match configuration".into(),
@@ -847,6 +861,7 @@ impl Tools {
             prepared.input["endpoint"] = json!(plan.endpoints.first());
             prepared.input["endpoints"] = json!(plan.endpoints);
             search.prepared = Some(plan);
+            search.settings = self.search_settings.clone();
         }
         Ok(prepared)
     }

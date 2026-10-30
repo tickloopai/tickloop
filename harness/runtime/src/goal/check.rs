@@ -143,8 +143,10 @@ pub(crate) fn conversation_evidence(snapshot: &ChatSnapshot) -> Vec<EvidenceEntr
                     is_error: *is_error,
                     output: content.text().into_owned(),
                 }),
-                Content::Thinking { .. } | Content::ProtocolData { .. } | Content::Image { .. } => {
-                }
+                Content::Thinking { .. }
+                | Content::ProtocolData { .. }
+                | Content::Image { .. }
+                | Content::Later(_) => {}
             }
         }
     }

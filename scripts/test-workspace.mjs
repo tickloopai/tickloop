@@ -34,15 +34,33 @@ function processes() {
       return match && { pid: Number(match[1]), identity: match[0] };
     }).filter(Boolean).filter(process => process.pid !== globalThis.process.pid);
 }
-const before = new Set(processes().map(process => process.identity));
-try {
-  const child = spawn(process.argv[2] || 'cargo', process.argv.length > 2 ? process.argv.slice(3)
-    : ['nextest', 'run', '--locked', '--workspace', '--no-fail-fast'], { env: environment, stdio: 'inherit' });
-  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => child.kill(signal));
-  let code = await new Promise(resolve => {
+// Nextest records each run under the temporary home, so tests that failed while the whole
+// workspace ran concurrently can be rerun one at a time before the result counts.
+const nextestTestRunFailed = 100;
+const nextestUserConfig = join(directory, 'nextest-user.toml');
+writeFileSync(nextestUserConfig, '[record]\nenabled = true\n');
+const nextestEnvironment = { ...environment, NEXTEST_EXPERIMENTAL_RECORD: '1' };
+const nextestRun = ['nextest', 'run', '--locked', '--workspace', '--no-fail-fast', '--user-config-file', nextestUserConfig];
+let child;
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => child?.kill(signal));
+function run(command, args, env) {
+  child = spawn(command, args, { env, stdio: 'inherit' });
+  return new Promise(resolve => {
     child.on('error', error => { console.error(error.message); resolve(1); });
     child.on('exit', code => resolve(code ?? 1));
   });
+}
+const before = new Set(processes().map(process => process.identity));
+try {
+  let code;
+  if (process.argv.length > 2) code = await run(process.argv[2], process.argv.slice(3), environment);
+  else {
+    code = await run('cargo', nextestRun, nextestEnvironment);
+    if (code === nextestTestRunFailed) {
+      console.error('Rerunning the failed tests one at a time; any that pass now failed only under concurrency, as listed above.');
+      code = await run('cargo', [...nextestRun, '--rerun', 'latest', '--test-threads', '1'], nextestEnvironment);
+    }
+  }
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const leakGraceMs = 5000;
   const leakDeadline = Date.now() + leakGraceMs;

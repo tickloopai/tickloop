@@ -21,7 +21,7 @@ use tickloop_harness_protocol::{
     AgentHostOptions, ChatId, Content, Event, EventKind, ExecutionMode, RunId, TaskNotification,
 };
 use tickloop_harness_runtime::environment::memory::{MemoryCommandRun, MemoryEnvironment};
-use tickloop_harness_runtime::{Agent, HarnessOptions, HarnessSeams};
+use tickloop_harness_runtime::{Agent, HarnessOptions, HarnessSeams, ToolPolicy};
 use tickloop_harness_test_support::harness::ChosenModels;
 use tickloop_harness_test_support::{ScriptedModel, call, config, next_event, text};
 use tokio::sync::broadcast::Receiver;
@@ -144,6 +144,14 @@ struct Turn {
 
 impl Bench {
     async fn start(replies: Vec<Vec<Content>>, hooks: Vec<ConfiguredHook>) -> Self {
+        Self::start_with_policy(replies, hooks, ToolPolicy::local()).await
+    }
+
+    async fn start_with_policy(
+        replies: Vec<Vec<Content>>,
+        hooks: Vec<ConfiguredHook>,
+        tools: ToolPolicy,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let folder = directory.path().canonicalize().unwrap();
         let environment = Arc::new(MemoryEnvironment::new());
@@ -165,6 +173,7 @@ impl Bench {
                 models: ChosenModels::new(model.clone()),
             },
             HarnessOptions {
+                tools,
                 settings: Some(settings.clone()),
                 host: AgentHostOptions::embedded_defaults(),
                 ..HarnessOptions::local(config())
@@ -900,4 +909,126 @@ async fn a_background_session_end_hook_keeps_a_sensitive_value_out_of_its_record
     assert_eq!(end.system_message.as_deref(), Some("tidied [redacted]"));
     let recorded = format!("{history:?}");
     assert!(!recorded.contains(HOOK_SECRET_SENTINEL), "{recorded}");
+}
+
+#[tokio::test]
+async fn managed_settlement_cancels_each_background_hook_form_without_late_notices() {
+    for tools in [ToolPolicy::acp(), ToolPolicy::one_shot()] {
+        for (background, early_stdout) in [
+            (Some(HookBackground::Async), ""),
+            (rewake(None, None), ""),
+            (None, "{\"async\": true}\n"),
+        ] {
+            let bench = Bench::start_with_policy(
+                vec![text("first"), text("second")],
+                vec![background_hook(
+                    HookEvent::SessionStart,
+                    None,
+                    AUDIT,
+                    background,
+                )],
+                tools,
+            )
+            .await;
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let started = entered.clone();
+            bench.environment.define_command(AUDIT, move |_| {
+                started.notify_one();
+                MemoryCommandRun {
+                    early_stdout: early_stdout.as_bytes().to_vec(),
+                    ..exits(
+                        2,
+                        "{\"systemMessage\":\"late hook output\"}",
+                        "late rewake",
+                        Duration::from_secs(300),
+                    )
+                }
+            });
+            let mut events = bench.agent.subscribe();
+            let mut notices = bench.agent.subscribe_task_notifications();
+            bench.turn(&mut events, "First prompt.").await;
+            tokio::time::timeout(HOOK_END_WAIT, entered.notified())
+                .await
+                .unwrap();
+            // The reference environment reports cancellation after dispatch as OutcomeUnknown.
+            let error = bench
+                .agent
+                .settle_managed(bench.chat, false)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Hook command outcome unknown"),
+                "{error}"
+            );
+            let ended = hook_end(&bench, AUDIT).await;
+            assert_eq!(ended.outcome, HookRunOutcome::Cancelled);
+            assert!(notices.try_recv().is_err());
+            bench.turn(&mut events, "Second prompt.").await;
+            bench.agent.settle_managed(bench.chat, false).await.unwrap();
+            assert_eq!(bench.requests().len(), 2);
+            assert!(
+                !texts(&bench.requests()[1])
+                    .join("\n")
+                    .contains("late hook output")
+            );
+            assert!(notices.try_recv().is_err());
+            bench.agent.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn managed_settlement_leaves_another_chats_background_hook_running() {
+    let bench = Bench::start_with_policy(
+        vec![text("first"), text("second")],
+        vec![background_hook(
+            HookEvent::SessionStart,
+            None,
+            AUDIT,
+            Some(HookBackground::Async),
+        )],
+        ToolPolicy::acp(),
+    )
+    .await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let started = entered.clone();
+    bench.environment.define_command(AUDIT, move |_| {
+        started.notify_one();
+        exits(0, "", "", Duration::from_secs(300))
+    });
+    let mut events = bench.agent.subscribe();
+    bench.turn(&mut events, "First Chat.").await;
+    tokio::time::timeout(HOOK_END_WAIT, entered.notified())
+        .await
+        .unwrap();
+    let second = bench
+        .agent
+        .create_chat(bench._directory.path().to_owned())
+        .await
+        .unwrap();
+    let receipt = bench
+        .agent
+        .submit(second, "Second Chat.".into())
+        .await
+        .unwrap();
+    follow_turn(&mut events, receipt.run_id).await;
+    tokio::time::timeout(HOOK_END_WAIT, entered.notified())
+        .await
+        .unwrap();
+    assert!(bench.agent.settle_managed(bench.chat, false).await.is_err());
+    let history = bench.agent.approval_history_view(second).await.unwrap();
+    assert!(
+        history
+            .hook_runs
+            .iter()
+            .any(|record| record.background == Some(HookBackgroundPhase::Started))
+    );
+    assert!(
+        !history
+            .hook_runs
+            .iter()
+            .any(|record| record.background == Some(HookBackgroundPhase::Ended))
+    );
+    assert!(bench.agent.settle_managed(second, false).await.is_err());
+    bench.agent.shutdown().await;
 }

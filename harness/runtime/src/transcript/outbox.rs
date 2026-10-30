@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use tickloop_harness_protocol::ChatId;
 use tickloop_harness_transcript::{
-    AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, CustomTitleEntry, DelegationEntry,
-    FamilyCompletionsEntry, FamilyInputsEntry, FamilyMessageHoldEntry, LastPromptEntry, Line,
-    MonitorMembersEntry, ProvenanceEntry, SentAgentMessagesEntry, SubagentsEntry, TaskBoardsEntry,
+    AcpSessionEntry, AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, CustomTitleEntry,
+    DelegationEntry, FamilyCompletionsEntry, FamilyInputsEntry, FamilyMessageHoldEntry,
+    LastPromptEntry, Line, MonitorMembersEntry, ProvenanceEntry, SentAgentMessagesEntry,
+    SubagentsEntry, TaskBoardsEntry,
 };
 use uuid::Uuid;
 
@@ -39,6 +40,7 @@ pub(crate) struct CachedMetadata {
     pub last_prompt: Option<LastPromptEntry>,
     pub branch_origin: Option<BranchOriginEntry>,
     pub delegation: Option<DelegationEntry>,
+    pub acp_session: Option<AcpSessionEntry>,
 }
 
 impl CachedMetadata {
@@ -59,6 +61,7 @@ impl CachedMetadata {
             Line::LastPrompt(entry) => self.last_prompt = Some(entry.clone()),
             Line::BranchOrigin(entry) => self.branch_origin = Some(entry.clone()),
             Line::Delegation(entry) => self.delegation = Some(entry.clone()),
+            Line::AcpSession(entry) => self.acp_session = Some(entry.clone()),
             _ => {}
         }
     }
@@ -88,6 +91,7 @@ impl CachedMetadata {
             .chain(self.last_prompt.clone().map(Line::LastPrompt))
             .chain(self.branch_origin.clone().map(Line::BranchOrigin))
             .chain(self.delegation.clone().map(Line::Delegation))
+            .chain(self.acp_session.clone().map(Line::AcpSession))
             .chain(self.artifact_ticks.clone().map(Line::ArtifactTicks))
             .chain(self.monitor_members.clone().map(Line::MonitorMembers))
             .collect()
@@ -168,6 +172,14 @@ pub(crate) struct TranscriptOutbox {
 }
 
 impl TranscriptOutbox {
+    /// A non-retryable session transaction must not be published later by the background flush.
+    /// Its claim stays held until the host reconciles the possibly committed store state.
+    pub(crate) fn refuse_chat(&self, chat: ChatId, error: TranscriptError) {
+        if let Some(outbox) = self.chats.lock().unwrap().get_mut(&chat) {
+            outbox.refuse(error);
+        }
+    }
+
     pub(crate) fn register(&self, chat: ChatId, position: StorePosition) {
         self.insert(chat, ChatOutbox::new(position));
     }
@@ -280,6 +292,7 @@ impl TranscriptOutbox {
         if !outbox.materialized {
             if !accepted.iter().any(|line| {
                 line.is_conversation_message()
+                    || matches!(line, Line::AcpSession(_))
                     || matches!(line, Line::System(entry) if entry.loop_record.as_ref().is_some_and(|record| !record.event_sources.is_empty()))
                     || matches!(line, Line::ArtifactTicks(entry) if entry.cwd.is_some() && (!entry.artifact_ticks.is_empty() || !entry.removed_artifact_ticks.is_empty()))
                     || matches!(line, Line::MonitorMembers(entry) if entry.materializes_chat())

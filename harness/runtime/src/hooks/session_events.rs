@@ -352,14 +352,15 @@ impl Agent {
         chat: &mut Chat,
         receipt: &Receipt,
         notes: Vec<String>,
-    ) -> bool {
+    ) -> Result<bool, AgentError> {
         let Some(inputs) = chat
             .hook_state
             .session
             .preparing_inputs
             .get(&receipt.run_id)
+            .cloned()
         else {
-            return false;
+            return Ok(false);
         };
         let Some(first) = chat
             .snapshot
@@ -368,7 +369,7 @@ impl Agent {
             .find(|input| input.receipt.run_id == receipt.run_id)
             .cloned()
         else {
-            return false;
+            return Ok(false);
         };
         let merged = inputs
             .iter()
@@ -381,15 +382,12 @@ impl Agent {
                     .cloned()
             })
             .collect();
-        chat.snapshot
-            .pending_inputs
-            .retain(|input| !inputs.contains(&input.receipt.run_id));
+        self.commit_run_inputs(chat, first, merged, notes)?;
         chat.hook_state
             .session
             .preparing_inputs
             .remove(&receipt.run_id);
-        self.commit_run_inputs(chat, first, merged, notes);
-        true
+        Ok(true)
     }
 
     /// Keeps ordinary submissions atomic when neither input event has any configured hooks.
@@ -431,7 +429,7 @@ impl Agent {
                 return Ok(false);
             }
             chat.hook_state.session.session_start = None;
-            self.commit_preparing_prompt(chat, receipt, Vec::new())
+            self.commit_preparing_prompt(chat, receipt, Vec::new())?
         };
         if committed {
             self.let_prompt_through(receipt).await;
@@ -541,7 +539,7 @@ impl Agent {
                 .ok_or(AgentError::NotFound)?;
             if cancel.is_cancelled()
                 || chat.active_run != Some(receipt.run_id)
-                || !self.commit_preparing_prompt(chat, receipt, notes)
+                || !self.commit_preparing_prompt(chat, receipt, notes)?
             {
                 return Ok(PromptGate::End);
             }
@@ -600,11 +598,21 @@ impl Agent {
 
     /// The prompt of the Run `receipt` passed its hooks: the Chat's title may come from it.
     async fn let_prompt_through(&self, receipt: &Receipt) {
-        if let Some(chat) = self.inner.chats.lock().await.get_mut(&receipt.chat_id) {
-            chat.hook_state
-                .session
-                .unchecked_prompts
-                .remove(&receipt.run_id);
+        {
+            let mut chats = self.inner.chats.lock().await;
+            if let Some(chat) = chats.get_mut(&receipt.chat_id) {
+                chat.hook_state
+                    .session
+                    .unchecked_prompts
+                    .remove(&receipt.run_id);
+                let loop_id = chat.snapshot.chat_loop.id;
+                if chat.task_checkpoint_pending && chat.snapshot.task_boards.contains_key(&loop_id)
+                {
+                    self.publish_task_board(&mut chats, receipt.chat_id, loop_id);
+                    self.take_due_task_checkpoint(chats.get_mut(&receipt.chat_id).unwrap())
+                        .await;
+                }
+            }
         }
         self.start_title_generation(receipt.chat_id).await;
     }
@@ -796,7 +804,7 @@ impl Agent {
         if error.kind() == ModelFailureKind::Cancelled {
             return;
         }
-        let cancel = {
+        let (cancel, tracked) = {
             let mut chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get_mut(&receipt.chat_id) else {
                 return;
@@ -806,7 +814,10 @@ impl Agent {
             if run_cancel.is_cancelled() || self.inner.closed.load(Ordering::SeqCst) {
                 return;
             }
-            chat.hook_state.background_cancel(&self.inner.shutdown)
+            (
+                chat.hook_state.background_cancel(&self.inner.shutdown),
+                chat.hook_state.background_tasks.token(),
+            )
         };
         let kind = failure_name(error);
         let details = error.to_string();
@@ -817,6 +828,7 @@ impl Agent {
         let agent = self.clone();
         let receipt = receipt.clone();
         self.inner.tasks.spawn(async move {
+            let _tracked = tracked;
             agent
                 .run_hooks(
                     &receipt,

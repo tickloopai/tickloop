@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ExecutionRef;
 
-pub const RUNTIME_HANDOFF_VERSION: u16 = 1;
+pub const RUNTIME_HANDOFF_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RuntimeBinaryInfo {

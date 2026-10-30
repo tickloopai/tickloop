@@ -10406,6 +10406,10 @@ impl State {
                     self.paste_blocks
                         .restore_image(self.editor.draft(), *id, image.clone());
                 }
+                // Ordered client material must not be deduplicated like local mentions.
+                InputContext::Resource(_) | InputContext::PromptText { .. } => {
+                    self.restored_contexts.push(context.clone());
+                }
                 _ if self.restored_contexts.contains(context) => {}
                 _ => self.restored_contexts.push(context.clone()),
             }
@@ -20160,6 +20164,25 @@ mod tests {
             Some(InputEvent::Prompt { text, images, .. }) => (text, images),
             other => panic!("Enter should send the prompt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn restored_client_resources_preserve_repeated_blocks_and_image_provenance() {
+        let mut state = state_with_clipboard(None, false);
+        let reference = InputContext::Resource(tickloop_harness::protocol::ResourceContext {
+            uri: "file:///not-a-local-read.txt".into(),
+            mime_type: None,
+            name: Some("client reference".into()),
+            content: None,
+        });
+        let mut image = pasted_image(1);
+        image.origin = ImageOrigin::Attached {
+            id: 1,
+            uri: Some("custom://image".into()),
+        };
+        let contexts = vec![reference.clone(), InputContext::Image(image), reference];
+        state.restore_saved_contexts(&contexts);
+        assert_eq!(state.restored_contexts, contexts);
     }
 
     #[test]

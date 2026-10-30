@@ -5,7 +5,9 @@
 //! the end of the conversation tells the model only what changed without it, and after a
 //! compaction or a load, what the Loop holds and, as Claude Code's `task_status` reminder, what
 //! still runs. Whether the Loop receives needs no note: continuing the Chat or sending it an
-//! input, which every request the user starts follows, makes it receive again.
+//! input, which every request the user starts follows, makes it receive again. Each note's entry
+//! records the state the model knows once it reads the note, so a load that finds the latest note
+//! after the last compaction tells only what changed since.
 
 use std::collections::BTreeMap;
 
@@ -30,14 +32,14 @@ pub(super) struct AnnouncedLoopState {
     view: LoopStateView,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct LoopStateView {
     subscriptions: BTreeMap<Uuid, SubscriptionView>,
     /// Each linked artifact's Tick reference and how a line names it; a rename changes nothing.
     artifacts: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SubscriptionView {
     instance: InstanceRef,
     frequency: TickSubscriptionFrequency,
@@ -104,6 +106,11 @@ impl Agent {
         };
         if let Some(text) = text {
             crate::host_notes::append_note(&mut chat.snapshot, receipt, text, HostNote::LoopState);
+            if let Ok(view) = serde_json::to_value(&current) {
+                chat.bookkeeping
+                    .loop_state_views
+                    .insert(chat.snapshot.messages.len() - 1, view);
+            }
             self.save(&chat.snapshot);
         }
         chat.announced_loop_state = Some(AnnouncedLoopState {
@@ -113,6 +120,25 @@ impl Agent {
         });
         Ok(())
     }
+}
+
+/// What a loaded Chat's model was told of its Loop: the state its latest Loop state note since the
+/// last compaction recorded. A note without one, or none at all, leaves it untold.
+pub(super) fn restored(
+    snapshot: &ChatSnapshot,
+    bookkeeping: &crate::ChatBookkeeping,
+) -> Option<AnnouncedLoopState> {
+    let active_start = snapshot.active_start();
+    let (index, _) = snapshot
+        .host_notes
+        .range(active_start..)
+        .rfind(|(_, note)| **note == HostNote::LoopState)?;
+    let view = serde_json::from_value(bookkeeping.loop_state_views.get(index)?.clone()).ok()?;
+    Some(AnnouncedLoopState {
+        active_start,
+        history_len: index + 1,
+        view,
+    })
 }
 
 /// The model's own TickManage call changed the subscriptions and its tool result says how, so
@@ -219,7 +245,7 @@ fn change_text(
     let artifact_lines = linked.chain(unlinked).collect::<Vec<_>>();
     if !artifact_lines.is_empty() {
         lines.push(format!(
-            "Host notice: {ARTIFACTS_HEADING} changed; each @tickloop feedback request on a linked artifact arrives here:"
+            "Host notice: {ARTIFACTS_HEADING} changed; each @tickloop feedback request on a linked artifact may arrive here:"
         ));
         lines.extend(artifact_lines);
     }
@@ -347,7 +373,7 @@ mod tests {
         let after = with(&[("artifact:a", "Plan"), ("artifact:c", "Deck")]);
         assert_eq!(
             change_text(&before, &after, &ids).unwrap(),
-            "Host notice: Artifacts linked to this Chat changed; each @tickloop feedback request on a linked artifact arrives here:\n- Linked: \"Deck\" (https://docs.example/a), artifact:c\n- Unlinked: \"Notes\" (https://docs.example/a), artifact:b"
+            "Host notice: Artifacts linked to this Chat changed; each @tickloop feedback request on a linked artifact may arrive here:\n- Linked: \"Deck\" (https://docs.example/a), artifact:c\n- Unlinked: \"Notes\" (https://docs.example/a), artifact:b"
         );
     }
 

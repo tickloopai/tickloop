@@ -1250,6 +1250,7 @@ mod feedback_admission_tests {
                 scheduled_task_expiry: Some(crate::scheduled_tasks::TASK_LIFETIME),
                 scheduled_task_min_interval: None,
                 trust_model_scheduled_tasks: false,
+                web_search_settings: None,
             },
         )
         .unwrap();

@@ -512,7 +512,13 @@ async fn connection_tests_classify_real_adapter_responses_and_use_one_result() {
             endpoint: url.to_string(),
             api_key_env: Some("TEST_SEARCH_KEY".into()),
         };
-        let result = test_connection(&config, Some(&root), CancellationToken::new()).await;
+        let result = test_connection(
+            &config,
+            Some(&root),
+            Some(DEFAULT_SEARCH_SETTINGS),
+            CancellationToken::new(),
+        )
+        .await;
         assert_eq!(result.status, expected, "HTTP {status}");
         assert!(!result.detail.contains("private-fixture-key"));
         let wire = received.await.unwrap();
@@ -526,16 +532,26 @@ async fn connection_tests_classify_real_adapter_responses_and_use_one_result() {
         api_key_env: Some("TEST_SEARCH_KEY".into()),
     };
     assert_eq!(
-        test_connection(&config, Some(&root), CancellationToken::new())
-            .await
-            .status,
+        test_connection(
+            &config,
+            Some(&root),
+            Some(DEFAULT_SEARCH_SETTINGS),
+            CancellationToken::new()
+        )
+        .await
+        .status,
         SearchTestStatus::Unavailable
     );
     credentials::remove_api_key(&root, "TEST_SEARCH_KEY").unwrap();
     assert_eq!(
-        test_connection(&config, Some(&root), CancellationToken::new())
-            .await
-            .status,
+        test_connection(
+            &config,
+            Some(&root),
+            Some(DEFAULT_SEARCH_SETTINGS),
+            CancellationToken::new()
+        )
+        .await
+        .status,
         SearchTestStatus::Unavailable
     );
 }
@@ -546,8 +562,13 @@ fn duckduckgo_challenge_offers_manual_verification_and_provider_settings_without
         query: "故宫 预约 & official".into(),
         domains: DomainFilter::Any,
     };
-    let details =
-        failure_details(SearchProviderKind::Free, &request, &SearchError::Challenge).unwrap();
+    let details = failure_details(
+        SearchProviderKind::Free,
+        &request,
+        &SearchError::Challenge,
+        Some(DEFAULT_SEARCH_SETTINGS),
+    )
+    .unwrap();
     assert!(!details.reason.contains("/websearch"));
     assert_eq!(details.suggestions.len(), 2);
     assert!(matches!(
@@ -557,7 +578,12 @@ fn duckduckgo_challenge_offers_manual_verification_and_provider_settings_without
     assert!(
         matches!(&details.suggestions[1], WebSearchSuggestion::ChangeProvider { command } if command == "/websearch")
     );
-    let message = failure_message(SearchProviderKind::Free, &request, &SearchError::Challenge);
+    let message = failure_message(
+        SearchProviderKind::Free,
+        &request,
+        &SearchError::Challenge,
+        Some(DEFAULT_SEARCH_SETTINGS),
+    );
     assert!(message.contains("Open this search in your browser"));
     assert!(message.contains("same proxy/network"));
     assert!(message.contains("may not carry over"));
@@ -576,8 +602,64 @@ fn duckduckgo_challenge_offers_manual_verification_and_provider_settings_without
         SearchProviderKind::Tavily,
         &request,
         &SearchError::Authentication(401),
+        Some(DEFAULT_SEARCH_SETTINGS),
     );
     assert!(!denied.contains("Open this search"));
+}
+
+/// The terminal keeps its words; another host names its own place to change search settings, or
+/// none, wherever search cannot run.
+#[test]
+fn search_guidance_names_only_the_hosts_own_settings() {
+    assert_eq!(
+        disabled_message(Some(DEFAULT_SEARCH_SETTINGS)),
+        "Web search is turned off, so this call was not executed. If the user asks for web search, explain that it is off and that they can turn it on with /websearch. Do not turn it on yourself or use Bash, curl, a browser, a subagent, WebFetch on a search engine, or another tool to bypass this setting. WebFetch remains available for reading specific URLs; turning off search does not turn off web fetching."
+    );
+    assert_eq!(
+        error_text(
+            &SearchError::MissingCredential,
+            Some(DEFAULT_SEARCH_SETTINGS)
+        ),
+        "search credentials are missing; configure the provider in /websearch"
+    );
+    let request = SearchRequest {
+        query: "rust".into(),
+        domains: DomainFilter::Any,
+    };
+    for settings in [None, Some("the workspace search settings")] {
+        let named = |text: &str| settings.is_some_and(|settings| text.contains(settings));
+        assert!(!disabled_message(settings).contains("/websearch"));
+        assert_eq!(
+            disabled_message(settings).contains("turn it on with"),
+            settings.is_some()
+        );
+        let missing = failure_message(
+            SearchProviderKind::Tavily,
+            &request,
+            &SearchError::MissingCredential,
+            settings,
+        );
+        assert!(!missing.contains("/websearch"), "{missing}");
+        assert_eq!(named(&missing), settings.is_some(), "{missing}");
+        let challenge = failure_details(
+            SearchProviderKind::Free,
+            &request,
+            &SearchError::Challenge,
+            settings,
+        )
+        .unwrap();
+        assert_eq!(
+            challenge.suggestions.iter().any(|suggestion| matches!(
+                suggestion,
+                WebSearchSuggestion::ChangeProvider { command } if Some(command.as_str()) == settings
+            )),
+            settings.is_some()
+        );
+        assert_eq!(
+            challenge.suggestions.len(),
+            1 + usize::from(settings.is_some())
+        );
+    }
 }
 
 #[tokio::test]

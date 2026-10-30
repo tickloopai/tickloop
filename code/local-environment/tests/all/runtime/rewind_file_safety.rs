@@ -106,7 +106,12 @@ fn files_containing(directory: &Path, needle: &str) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let metadata = fs::symlink_metadata(&path).unwrap();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            // The active recorder atomically replaces private temporary files while we scan.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("inspect {}: {error}", path.display()),
+        };
         if metadata.is_dir() {
             found.extend(files_containing(&path, needle));
         } else if metadata.is_file()

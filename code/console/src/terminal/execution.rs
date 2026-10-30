@@ -2098,6 +2098,7 @@ impl ConsoleExecution {
             return Ok(tickloop_harness::tools::web_search::test_connection(
                 &config,
                 self.inner.launch.config_root.as_deref(),
+                Some(tickloop_harness::tools::web_search::DEFAULT_SEARCH_SETTINGS),
                 tokio_util::sync::CancellationToken::new(),
             )
             .await);

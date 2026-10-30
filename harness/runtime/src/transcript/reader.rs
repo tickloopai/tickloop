@@ -6,7 +6,7 @@ use tickloop_harness_base::timestamp::parse_timestamp_ms;
 use tickloop_harness_protocol::{Content, OriginalUserInput, Role, Usage};
 use tickloop_harness_transcript::{
     ChainEntry, ContentReplacementEntry, FileHistorySnapshotEntry, GoalEntry, Line,
-    ScheduledTasksEntry,
+    ScheduledTasksEntry, TaskBoardCheckpointEntry,
 };
 
 use super::outbox::CachedMetadata;
@@ -26,6 +26,9 @@ pub(crate) struct LoadedTranscript {
     /// Following Claude Code: file rollback snapshots keyed by entry `messageId`, the last entry
     /// winning for the same key.
     pub file_history_snapshots: HashMap<Uuid, FileHistorySnapshotEntry>,
+    /// The root Chat's task boards by the chain entry they stood at, the last record winning for
+    /// the same entry.
+    pub task_board_checkpoints: HashMap<Uuid, TaskBoardCheckpointEntry>,
     /// All content-replacement entries in file order; callers take them by chatId (Claude Code
     /// takes them by sessionId).
     pub content_replacements: Vec<ContentReplacementEntry>,
@@ -50,6 +53,7 @@ struct RetainedState {
     goal: Option<GoalEntry>,
     scheduled_tasks: Option<ScheduledTasksEntry>,
     file_history_snapshots: HashMap<Uuid, FileHistorySnapshotEntry>,
+    task_board_checkpoints: HashMap<Uuid, TaskBoardCheckpointEntry>,
     content_replacements: Vec<ContentReplacementEntry>,
     lifecycle: Vec<Line>,
 }
@@ -80,9 +84,14 @@ impl RetainedState {
             Line::LastPrompt(entry) => self.metadata.last_prompt = Some(entry.clone()),
             Line::BranchOrigin(entry) => self.metadata.branch_origin = Some(entry.clone()),
             Line::Delegation(entry) => self.metadata.delegation = Some(entry.clone()),
+            Line::AcpSession(entry) => self.metadata.acp_session = Some(entry.clone()),
             Line::FileHistorySnapshot(entry) => {
                 self.file_history_snapshots
                     .insert(entry.message_id, entry.clone());
+            }
+            Line::TaskBoardCheckpoint(entry) => {
+                self.task_board_checkpoints
+                    .insert(entry.leaf, entry.clone());
             }
             Line::ContentReplacement(entry) => self.content_replacements.push(entry.clone()),
             Line::Response(_) | Line::Input(_) | Line::Wait(_) | Line::NestedCall(_) => {
@@ -96,7 +105,8 @@ impl RetainedState {
                 }
             }
             // Goal events only feed the conversation's display.
-            Line::GoalEvent(_)
+            Line::RecordedEdit(_)
+            | Line::GoalEvent(_)
             | Line::User(_)
             | Line::Assistant(_)
             | Line::System(_)
@@ -143,7 +153,15 @@ pub(crate) fn load_original_user_inputs(
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        if text.is_empty() {
+        // Attachments carry material, not textual authority; preserve an empty original input.
+        if text.is_empty()
+            && !entry.contexts.as_ref().is_some_and(|contexts| {
+                serde_json::from_value::<Vec<tickloop_harness_protocol::InputContext>>(
+                    contexts.clone(),
+                )
+                .is_ok_and(|contexts| !contexts.is_empty())
+            })
+        {
             return None;
         }
         originals.push(OriginalUserInput {
@@ -231,6 +249,7 @@ pub(crate) fn assemble(
         goal,
         scheduled_tasks,
         file_history_snapshots,
+        task_board_checkpoints,
         content_replacements,
         lifecycle,
     } = state;
@@ -297,10 +316,11 @@ pub(crate) fn assemble(
             }),
     };
     let Some(leaf) = leaf else {
-        let has_chat_without_messages = metadata
-            .artifact_ticks
-            .as_ref()
-            .is_some_and(|entry| entry.cwd.is_some())
+        let has_chat_without_messages = metadata.acp_session.is_some()
+            || metadata
+                .artifact_ticks
+                .as_ref()
+                .is_some_and(|entry| entry.cwd.is_some())
             || metadata
                 .monitor_members
                 .as_ref()
@@ -317,6 +337,7 @@ pub(crate) fn assemble(
             goal,
             scheduled_tasks,
             file_history_snapshots,
+            task_board_checkpoints,
             content_replacements,
             warnings,
             position: stored.position,
@@ -364,6 +385,7 @@ pub(crate) fn assemble(
         goal,
         scheduled_tasks,
         file_history_snapshots,
+        task_board_checkpoints,
         content_replacements,
         warnings,
         position: stored.position,
@@ -658,6 +680,7 @@ mod tests {
             plan_mode_exit: false,
             execution_mode_note: None,
             loop_state_note: false,
+            loop_state_view: None,
             task_reminder: false,
             date_change: None,
             hook_note: None,

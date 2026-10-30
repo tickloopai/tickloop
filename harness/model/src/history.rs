@@ -39,6 +39,7 @@ pub fn project_request_with_origins(
     target: &ModelConfig,
     target_source: Option<&PrivateHistorySource>,
 ) -> (ModelRequest, Vec<usize>) {
+    tickloop_harness_protocol::without_later_content(&mut request.messages);
     let has_sources = request.history_sources.len() == request.messages.len();
     if !has_sources {
         let origins = (0..request.messages.len()).collect();

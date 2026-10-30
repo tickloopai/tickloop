@@ -52,6 +52,10 @@ pub trait WorkerFactory: Send + Sync {
             workers: Vec::new(),
         }
     }
+    /// Ends only this managed invocation's hosted ownership; never stops the daemon.
+    async fn end_managed(&self, _launch: &LaunchSpec, _chat: Uuid) -> Result<(), AccessError> {
+        Ok(())
+    }
     async fn start(
         &self,
         launch: &LaunchSpec,
@@ -60,6 +64,9 @@ pub trait WorkerFactory: Send + Sync {
     /// Whether the worker behind `worker` has positively exited. An unknown or still running
     /// worker is `false`, because a replacement must never run beside work that can still act.
     async fn exited(&self, worker: &Arc<dyn AgentAccess>) -> bool;
+    /// Lets a worker that runs nothing anymore exit and forgets it. The daemon already dropped
+    /// every route to it.
+    async fn retire(&self, _worker: &Arc<dyn AgentAccess>) {}
     /// The running Tickhost when it is another build than this daemon's and replacing it would
     /// end something. A daemon without a Tickhost of its own has none.
     async fn other_tickhost(&self) -> Result<Option<OtherTickhost>, AccessError> {
@@ -118,6 +125,7 @@ struct DaemonInner {
     records: Mutex<HashMap<TranscriptRef, ExecutionRef>>,
     record_gates: Mutex<HashMap<TranscriptRef, Arc<Mutex<()>>>>,
     receipts: ReceiptStore,
+    managed: super::managed::ManagedRegistry,
     views: ViewRegistry,
     sequence: AtomicU64,
     changes: broadcast::Sender<ObservationUpdate>,
@@ -133,6 +141,8 @@ pub(crate) struct DaemonCheckpoint {
     lost: HashSet<ExecutionRef>,
     records: Vec<(TranscriptRef, ExecutionRef)>,
     receipts: super::receipts::ReceiptCheckpoint,
+    #[serde(default)]
+    managed: Vec<super::managed::SavedManaged>,
     views: super::views::ViewCheckpoint,
     sequence: u64,
 }
@@ -173,6 +183,7 @@ impl DaemonServer {
                 records: Mutex::new(HashMap::new()),
                 record_gates: Mutex::new(HashMap::new()),
                 receipts: ReceiptStore::new(epoch),
+                managed: Default::default(),
                 views: ViewRegistry::default(),
                 sequence: AtomicU64::new(0),
                 changes: broadcast::channel(REPLAY_CAPACITY).0,
@@ -182,6 +193,7 @@ impl DaemonServer {
             }),
         };
         tokio::spawn(monitor_directory(Arc::downgrade(&daemon.inner)));
+        tokio::spawn(monitor_managed(Arc::downgrade(&daemon.inner)));
         daemon
     }
     pub fn daemon_epoch(&self) -> Uuid {
@@ -248,6 +260,7 @@ impl DaemonServer {
                 .map(|(record, execution)| (record.clone(), *execution))
                 .collect(),
             receipts: self.inner.receipts.checkpoint().await?,
+            managed: self.inner.managed.checkpoint().await,
             views: self.inner.views.checkpoint().await,
             sequence: self.inner.sequence.load(Ordering::SeqCst),
         })
@@ -285,6 +298,7 @@ impl DaemonServer {
         *self.inner.records.lock().await = checkpoint.records.into_iter().collect();
         *self.inner.lost.lock().await = checkpoint.lost;
         self.inner.receipts.restore(checkpoint.receipts).await?;
+        self.inner.managed.restore(checkpoint.managed).await;
         self.inner.views.restore(checkpoint.views).await;
         self.inner
             .sequence
@@ -480,6 +494,17 @@ impl DaemonServer {
                     ) =>
                 {
                     let mut lost = self.inner.lost.lock().await;
+                    // A Worker retired meanwhile was stopped on purpose; nothing of it is lost.
+                    if !self
+                        .inner
+                        .workers
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|known| Arc::ptr_eq(&known.access, &worker))
+                    {
+                        continue;
+                    }
                     for mut entry in previous {
                         lost.insert(entry.execution);
                         entry.availability = ExecutionAvailability::Lost;
@@ -495,17 +520,16 @@ impl DaemonServer {
                 Err(error) => return Err(error),
             };
             {
-                if let Some(known) = self
-                    .inner
-                    .workers
-                    .lock()
-                    .await
+                let lost = self.inner.lost.lock().await.clone();
+                let mut workers = self.inner.workers.lock().await;
+                // A Worker retired meanwhile must not get its routes or records back.
+                let Some(known) = workers
                     .iter_mut()
                     .find(|known| Arc::ptr_eq(&known.access, &worker))
-                {
-                    known.last_directory = entries.clone();
-                }
-                let lost = self.inner.lost.lock().await.clone();
+                else {
+                    continue;
+                };
+                known.last_directory = entries.clone();
                 let mut routes = self.inner.routes.lock().await;
                 let mut records = self.inner.records.lock().await;
                 for mut entry in entries {
@@ -562,6 +586,101 @@ impl DaemonServer {
             Some(worker) => self.inner.factory.exited(&worker).await,
             None => false,
         }
+    }
+    /// Stops a Worker started for one managed invocation and forgets every route, record and
+    /// fence naming it. `execution` is the only execution it may run; `None` accepts any, for a
+    /// Worker whose creation failed. A Worker started more than once or running anything else
+    /// is kept.
+    async fn retire_worker(
+        &self,
+        worker: &Arc<dyn AgentAccess>,
+        execution: Option<ExecutionRef>,
+    ) -> bool {
+        {
+            let mut lost = self.inner.lost.lock().await;
+            let mut workers = self.inner.workers.lock().await;
+            let mut routes = self.inner.routes.lock().await;
+            let dedicated = workers
+                .iter()
+                .filter(|known| Arc::ptr_eq(&known.access, worker))
+                .count()
+                == 1
+                && routes.iter().all(|(routed, access)| {
+                    !Arc::ptr_eq(access, worker) || execution.is_none_or(|only| *routed == only)
+                });
+            if !dedicated {
+                return false;
+            }
+            workers.retain(|known| !Arc::ptr_eq(&known.access, worker));
+            let mut forgotten = execution.into_iter().collect::<HashSet<_>>();
+            routes.retain(|routed, access| {
+                let retired = Arc::ptr_eq(access, worker);
+                if retired {
+                    forgotten.insert(*routed);
+                }
+                !retired
+            });
+            self.inner
+                .records
+                .lock()
+                .await
+                .retain(|_, routed| !forgotten.contains(routed));
+            lost.retain(|routed| !forgotten.contains(routed));
+        }
+        self.inner.factory.retire(worker).await;
+        true
+    }
+    /// A managed Worker runs exactly its invocation. Once that invocation's release fully
+    /// completed, stop the Worker and forget the execution, so neither the process nor its
+    /// proof, launch and session MCP descriptors outlive the invocation. Failed cleanup keeps
+    /// both for its bounded retries.
+    async fn retire_released(
+        &self,
+        execution: ExecutionRef,
+        entry: &Arc<super::managed::ManagedEntry>,
+    ) {
+        if !entry.released_cleanly().await || !self.inner.managed.is_current(execution, entry).await
+        {
+            return;
+        }
+        let worker = self.inner.routes.lock().await.get(&execution).cloned();
+        if let Some(worker) = worker
+            && self.retire_worker(&worker, Some(execution)).await
+        {
+            self.inner.managed.remove(execution, entry).await;
+        }
+    }
+    /// Ends the control and hosted ownership of an invocation whose Worker positively exited,
+    /// before another Worker loads the same Chat. Its late release or expiry then finds no
+    /// proof, so it can never end the Ticks of the invocation that replaced it.
+    async fn supersede_exited(&self, execution: ExecutionRef) -> Result<(), AccessError> {
+        if let Some(entry) = self.inner.managed.entry(execution).await {
+            let _gate =
+                tokio::time::timeout(Duration::from_secs(10), entry.gate.clone().lock_owned())
+                    .await
+                    .map_err(|_| {
+                        AccessError::new(
+                            AccessErrorCode::Busy,
+                            "the exited ACP invocation is still settling",
+                        )
+                    })?;
+            if self.inner.managed.is_current(execution, &entry).await {
+                entry.revoke().await;
+                let cleanup = self.cleanup_managed(execution, &entry).await;
+                // An exited Worker ended at least everything its release would have.
+                entry
+                    .cleanup_finished(true, cleanup.as_ref().err().map(|e| e.message.clone()))
+                    .await;
+                entry.settle().await;
+                cleanup?;
+                self.inner.managed.remove(execution, &entry).await;
+            }
+        }
+        let worker = self.inner.routes.lock().await.get(&execution).cloned();
+        if let Some(worker) = worker {
+            self.retire_worker(&worker, Some(execution)).await;
+        }
+        Ok(())
     }
     async fn register_result(&self, result: &CommandResult, worker: Arc<dyn AgentAccess>) {
         let (execution, snapshot) = match result {
@@ -739,6 +858,55 @@ impl DaemonServer {
         };
         Ok(self.worker(execution).await.ok())
     }
+    async fn cleanup_managed(
+        &self,
+        _execution: ExecutionRef,
+        entry: &super::managed::ManagedEntry,
+    ) -> Result<(), AccessError> {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.inner.factory.end_managed(&entry.launch, entry.chat),
+        )
+        .await
+        .map_err(|_| {
+            AccessError::new(
+                AccessErrorCode::OutcomeUnknown,
+                "managed hosted cleanup timed out; its outcome is unknown",
+            )
+        })?
+    }
+    async fn finalize_managed_release(
+        &self,
+        execution: ExecutionRef,
+        entry: &super::managed::ManagedEntry,
+    ) -> Result<(), AccessError> {
+        if entry.launch.profile != tickloop_code_access::ExecutionProfile::Acp {
+            return Ok(());
+        }
+        // This runs under upgrade admission: a wedged Worker must not hold it indefinitely.
+        tokio::time::timeout(Duration::from_secs(65), async {
+            let worker = self.worker(execution).await?;
+            let receipt = worker
+                .execute(CommandEnvelope {
+                    daemon_epoch: self.inner.epoch,
+                    command_id: tickloop_harness::ids::generate(),
+                    command: AgentCommand::ManagedFinalizeRelease {
+                        execution,
+                        token: entry.token.clone(),
+                    },
+                })
+                .await?;
+            receipt.into_result().map(|_| ())
+        })
+        .await
+        .map_err(|_| {
+            AccessError::new(
+                AccessErrorCode::OutcomeUnknown,
+                "managed release finalization timed out; its outcome is unknown",
+            )
+        })?
+    }
+
     async fn execute_worker(
         &self,
         worker: Arc<dyn AgentAccess>,
@@ -771,6 +939,236 @@ impl DaemonServer {
     ) -> Result<(CommandResult, PersistenceState), AccessError> {
         self.validate_origin(&envelope.command).await?;
         match &envelope.command {
+            AgentCommand::CreateManaged {
+                launch,
+                initial,
+                token,
+                ..
+            } => {
+                super::managed::validate_launch(launch)?;
+                if initial.is_some() {
+                    return Err(AccessError::invalid(
+                        "managed creation must not submit initial input",
+                    ));
+                }
+                let launch = super::managed::normalized_launch(launch.clone());
+                let mut command = envelope.clone();
+                if let AgentCommand::CreateManaged {
+                    launch: supplied, ..
+                } = &mut command.command
+                {
+                    *supplied = launch.clone();
+                }
+                let worker = self.start(&launch).await?;
+                let result = self.execute_worker(worker.clone(), &command).await;
+                if let Ok((
+                    CommandResult::Created {
+                        execution,
+                        snapshot,
+                        ..
+                    },
+                    _,
+                )) = &result
+                {
+                    self.inner
+                        .managed
+                        .install(
+                            *execution,
+                            snapshot.conversation.id.into(),
+                            launch,
+                            token.clone(),
+                        )
+                        .await;
+                } else {
+                    // The Worker was started for this invocation alone and has no control proof.
+                    self.retire_worker(&worker, None).await;
+                }
+                result
+            }
+            AgentCommand::ManagedFinalizeRelease { .. } => Err(AccessError::new(
+                AccessErrorCode::AccessDenied,
+                "release finalization is Worker-internal",
+            )),
+            AgentCommand::ManagedLoad {
+                session_uuid,
+                launch,
+                token,
+                ..
+            } => {
+                super::managed::validate_launch(launch)?;
+                if launch.profile != tickloop_code_access::ExecutionProfile::Acp
+                    || !launch.session_persistence
+                {
+                    return Err(AccessError::invalid("ACP load requires persistent scope"));
+                }
+                let mut launch = super::managed::normalized_launch(launch.clone());
+                let root = launch
+                    .config_root
+                    .as_ref()
+                    .ok_or_else(|| AccessError::invalid("ACP load requires a configuration root"))?
+                    .canonicalize()
+                    .map_err(|e| AccessError::invalid(e.to_string()))?;
+                launch.folder = launch
+                    .folder
+                    .canonicalize()
+                    .map_err(|e| AccessError::invalid(e.to_string()))?;
+                launch.config_root = Some(root.clone());
+                let record = TranscriptRef {
+                    store_root: root,
+                    chat_id: *session_uuid,
+                };
+                let gate = self
+                    .inner
+                    .record_gates
+                    .lock()
+                    .await
+                    .entry(record.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone();
+                let _guard = gate.lock().await;
+                let metadata = crate::records::acp_session(&record).await?.ok_or_else(|| {
+                    AccessError::new(AccessErrorCode::AccessDenied, "record has no ACP origin")
+                })?;
+                if !metadata
+                    .origin
+                    .matches_current(&launch.folder, &record.store_root)
+                    .map_err(|e| AccessError::invalid(e.to_string()))?
+                {
+                    return Err(AccessError::new(
+                        AccessErrorCode::AccessDenied,
+                        "ACP working directory identity changed",
+                    ));
+                }
+                launch.model = Some(
+                    tickloop_harness::model::cards::ModelCatalog::defaults()
+                        .profiles()
+                        .into_iter()
+                        .find(|config| config.identity() == metadata.model)
+                        .ok_or_else(|| {
+                            AccessError::invalid("saved ACP model is not in current catalog")
+                        })?,
+                );
+                let active = self.inner.records.lock().await.get(&record).copied();
+                if let Some(active) = active
+                    && !self.inner.managed.reacquirable(active).await
+                {
+                    if !self.worker_exited(active).await {
+                        return Err(AccessError::new(
+                            AccessErrorCode::Busy,
+                            "ACP session has a live or unresolved execution",
+                        ));
+                    }
+                    self.supersede_exited(active).await?;
+                }
+                // Any old invocation is revoked and fully cleaned. A fresh Worker gets only this
+                // caller's descriptors; no closed provider or environment leaks.
+                let worker = self.start(&launch).await?;
+                let mut command = envelope.clone();
+                if let AgentCommand::ManagedLoad {
+                    launch: supplied, ..
+                } = &mut command.command
+                {
+                    *supplied = launch.clone();
+                }
+                let result = self.execute_worker(worker.clone(), &command).await;
+                if let Ok((
+                    CommandResult::Loaded {
+                        execution,
+                        snapshot,
+                    },
+                    _,
+                )) = &result
+                {
+                    self.inner
+                        .managed
+                        .install(
+                            *execution,
+                            snapshot.conversation.id.into(),
+                            launch,
+                            token.clone(),
+                        )
+                        .await;
+                } else {
+                    // The Worker was started for this invocation alone and has no control proof.
+                    self.retire_worker(&worker, None).await;
+                }
+                result
+            }
+            AgentCommand::ManagedSettle { execution, .. }
+            | AgentCommand::ManagedRelease { execution, .. } => {
+                let entry = self
+                    .inner
+                    .managed
+                    .authorize(&envelope.command)
+                    .await?
+                    .ok_or_else(|| AccessError::invalid("managed execution missing"))?;
+                let release = matches!(&envelope.command, AgentCommand::ManagedRelease { .. });
+                if release {
+                    entry.revoke().await;
+                }
+                let result = match self.worker(*execution).await {
+                    Ok(worker) => tokio::time::timeout(
+                        Duration::from_secs(65),
+                        self.execute_worker(worker, envelope),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(AccessError::new(
+                            AccessErrorCode::OutcomeUnknown,
+                            "managed Worker settlement timed out",
+                        ))
+                    }),
+                    Err(error) => Err(error),
+                };
+                let mut cleanup = self.cleanup_managed(*execution, &entry).await;
+                if release && result.is_ok() && cleanup.is_ok() {
+                    cleanup = self.finalize_managed_release(*execution, &entry).await;
+                }
+                let failure = match (&result, &cleanup) {
+                    (Err(error), _) => Some(error.message.clone()),
+                    (_, Err(error)) => Some(error.message.clone()),
+                    _ => None,
+                };
+                if release {
+                    entry.cleanup_finished(result.is_ok(), failure).await;
+                } else {
+                    entry.round_finished(failure).await;
+                }
+                entry.settle().await;
+                if release {
+                    self.retire_released(*execution, &entry).await;
+                }
+                match (result, cleanup) {
+                    (Ok(result), Ok(())) => Ok(result),
+                    (Err(error), Ok(())) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                    (Err(mut error), Err(cleanup)) => {
+                        // A cleanup that may still have acted makes the whole outcome unknown.
+                        if cleanup.code == AccessErrorCode::OutcomeUnknown {
+                            error.code = AccessErrorCode::OutcomeUnknown;
+                        }
+                        error.message = format!(
+                            "{}; managed hosted cleanup failed: {}",
+                            error.message, cleanup.message
+                        );
+                        Err(error)
+                    }
+                }
+            }
+            AgentCommand::ManagedSubmit { .. } => {
+                let entry = self
+                    .inner
+                    .managed
+                    .authorize(&envelope.command)
+                    .await?
+                    .ok_or_else(|| AccessError::invalid("managed execution missing"))?;
+                entry.begin_submit().await?;
+                self.execute_worker(
+                    self.worker(envelope.command.execution().unwrap()).await?,
+                    envelope,
+                )
+                .await
+            }
             AgentCommand::UpgradeRuntime { executable } => {
                 self.inner.factory.request_upgrade(executable).await?;
                 Ok((CommandResult::Done, PersistenceState::NotApplicable))
@@ -784,6 +1182,12 @@ impl DaemonServer {
                 as_new,
                 launch,
             } => {
+                if crate::records::acp_session(record).await?.is_some() {
+                    return Err(AccessError::new(
+                        AccessErrorCode::AccessDenied,
+                        "ACP records require scoped ManagedLoad",
+                    ));
+                }
                 if launch
                     .as_ref()
                     .and_then(|launch| launch.config_root.as_ref())
@@ -803,6 +1207,14 @@ impl DaemonServer {
                     .clone();
                 let _guard = gate.lock().await;
                 let active = self.inner.records.lock().await.get(record).copied();
+                if let Some(execution) = active
+                    && self.inner.managed.contains(execution).await
+                {
+                    return Err(AccessError::new(
+                        AccessErrorCode::AccessDenied,
+                        "managed executions cannot be attached or loaded",
+                    ));
+                }
                 if !as_new && let Some(execution) = active {
                     let observed = match self.worker(execution).await {
                         Ok(worker) => {
@@ -906,7 +1318,22 @@ impl DaemonServer {
             AgentCommand::FlushTranscripts => {
                 let mut persistence = PersistenceState::FlushObserved;
                 for worker in self.workers().await {
-                    let (_, observed) = self.execute_worker(worker, envelope).await?;
+                    let observed = match self.execute_worker(worker.clone(), envelope).await {
+                        Ok((_, observed)) => observed,
+                        // A Worker retired meanwhile flushes its own records as it exits.
+                        Err(_)
+                            if !self
+                                .inner
+                                .workers
+                                .lock()
+                                .await
+                                .iter()
+                                .any(|known| Arc::ptr_eq(&known.access, &worker)) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if matches!(observed, PersistenceState::WriteFailed(_)) {
                         persistence = observed;
                     }
@@ -980,7 +1407,32 @@ impl AgentAccess for DaemonServer {
                 None,
             )),
             ObservationRequest::Agent { execution, .. } => {
-                self.worker(execution).await?.observe(query).await
+                if let ObservationRequest::Agent {
+                    detail:
+                        AgentDetailQuery::ManagedConfiguration { token }
+                        | AgentDetailQuery::ManagedHistory { token, .. },
+                    ..
+                } = &query
+                {
+                    self.inner
+                        .managed
+                        .authorize(&AgentCommand::ManagedHeartbeat {
+                            execution,
+                            token: token.clone(),
+                        })
+                        .await?
+                        .ok_or_else(|| AccessError::invalid("managed execution missing"))?;
+                }
+                let mut observation = self.worker(execution).await?.observe(query).await?;
+                if let Some(warning) = self.inner.managed.warning(execution).await {
+                    match &mut observation.initial {
+                        ObservationValue::Agent(snapshot) => snapshot.warnings.push(warning),
+                        ObservationValue::Status(status) => status.warnings.push(warning),
+                        ObservationValue::Warnings(warnings) => warnings.push(warning),
+                        _ => {}
+                    }
+                }
+                Ok(observation)
             }
             ObservationRequest::OtherTickhost => Ok(Observation::single(
                 ObservationValue::OtherTickhost(self.inner.factory.other_tickhost().await?),
@@ -1096,6 +1548,13 @@ impl AgentAccess for DaemonServer {
                     None,
                 ))
             }
+            ObservationRequest::ManagedSessions { launch, cursor } => Ok(Observation::single(
+                ObservationValue::ManagedSessions(
+                    crate::records::managed_sessions(*launch, cursor).await?,
+                ),
+                self.cursor(),
+                None,
+            )),
             ObservationRequest::SavedRecords {
                 store_root,
                 folder,
@@ -1132,10 +1591,62 @@ impl AgentAccess for DaemonServer {
     async fn execute(&self, envelope: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
         let _admission = self.inner.admission.read().await;
         self.ensure_active()?;
+        if matches!(&envelope.command, AgentCommand::Create { launch, .. } if launch.profile != tickloop_code_access::ExecutionProfile::Local)
+            || matches!(&envelope.command, AgentCommand::LoadRecord { launch: Some(launch), .. } if launch.profile != tickloop_code_access::ExecutionProfile::Local)
+        {
+            return Err(AccessError::invalid(
+                "managed profiles require CreateManaged, never history loading",
+            ));
+        }
+        if let AgentCommand::SendFamilyInput {
+            target_execution, ..
+        } = &envelope.command
+            && self.inner.managed.contains(*target_execution).await
+        {
+            return Err(AccessError::new(
+                AccessErrorCode::AccessDenied,
+                "managed executions do not accept family input",
+            ));
+        }
+        let managed = self.inner.managed.authorize(&envelope.command).await?;
+        if matches!(&envelope.command, AgentCommand::ManagedHeartbeat { .. }) {
+            // Renewal is idempotent and changes nothing observable. It neither waits for the
+            // settlement gate nor retains a receipt: one receipt per beat would let enough live
+            // leases fill receipt capacity and refuse every other command.
+            if envelope.daemon_epoch != self.inner.epoch {
+                return Err(AccessError::new(
+                    AccessErrorCode::EpochChanged,
+                    "command belongs to an earlier daemon",
+                ));
+            }
+            managed
+                .ok_or_else(|| AccessError::invalid("managed execution missing"))?
+                .renew()
+                .await?;
+            return Ok(CommandReceipt {
+                daemon_epoch: self.inner.epoch,
+                command_id: envelope.command_id,
+                target: envelope.command.execution(),
+                state: tickloop_code_access::ReceiptState::Completed,
+                result: Some(CommandResult::Done),
+                error: None,
+                persistence: PersistenceState::NotApplicable,
+            });
+        }
+        let _gate = if let Some(entry) = &managed {
+            Some(entry.gate.clone().lock_owned().await)
+        } else {
+            None
+        };
+        if managed.is_some() {
+            self.inner.managed.authorize(&envelope.command).await?;
+        }
         if let Some(receipt) = self.inner.receipts.begin(&envelope).await? {
             return Ok(receipt);
         }
-        let (result, persistence) = match self.dispatch(&envelope).await {
+        // Dispatch contains the large create/load paths; keep their future off the stack of
+        // every AgentAccess caller, including embedded hosts with the default thread stack.
+        let (result, persistence) = match Box::pin(self.dispatch(&envelope)).await {
             Ok((result, persistence)) => (Ok(result), persistence),
             Err(error) => (
                 Err(error),
@@ -1160,6 +1671,12 @@ impl AgentAccess for DaemonServer {
         let _admission = self.inner.admission.read().await;
         self.ensure_active()?;
         if let DisplayUpdate::Displayed { execution, .. } = &update {
+            if self.inner.managed.contains(*execution).await {
+                return Err(AccessError::new(
+                    AccessErrorCode::AccessDenied,
+                    "managed executions cannot be attached to a Console",
+                ));
+            }
             self.worker(*execution).await?;
         }
         if let DisplayUpdate::Displayed { host, .. } | DisplayUpdate::Scene { host, .. } = &update {
@@ -1171,9 +1688,10 @@ impl AgentAccess for DaemonServer {
     }
 }
 
-async fn monitor_directory(daemon: Weak<DaemonInner>) {
+// Lease revocation must not depend on querying any Worker's directory: a live but
+// unresponsive Worker must not retain resources owned by an unrelated invocation.
+async fn monitor_managed(daemon: Weak<DaemonInner>) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
-    let mut previous = Vec::new();
     loop {
         interval.tick().await;
         let Some(inner) = daemon.upgrade() else {
@@ -1181,7 +1699,92 @@ async fn monitor_directory(daemon: Weak<DaemonInner>) {
         };
         let daemon = DaemonServer { inner };
         let _admission = daemon.inner.admission.read().await;
-        if let Ok(directory) = daemon.directory().await
+        if daemon.ensure_active().is_err() {
+            continue;
+        }
+        for (execution, entry) in daemon.inner.managed.expired().await {
+            let daemon = daemon.clone();
+            let admission = daemon.inner.admission.clone().read_owned().await;
+            tokio::spawn(async move {
+                let _admission = admission;
+                // A lost mutation reply can hold this gate indefinitely. Revoke first,
+                // bound the wait, and still attempt hosted ownership cleanup on failure.
+                let gate =
+                    tokio::time::timeout(Duration::from_secs(10), entry.gate.clone().lock_owned())
+                        .await;
+                // A release that completed meanwhile, or a load that replaced an exited
+                // invocation, already owns this cleanup. Ending the Chat's hosted Ticks again
+                // could end those of the invocation running it now.
+                if !daemon.inner.managed.is_current(execution, &entry).await {
+                    return;
+                }
+                let worker_result = if gate.is_err() {
+                    Err(AccessError::new(
+                        AccessErrorCode::OutcomeUnknown,
+                        "managed expiry admission timed out; prior mutation remains unresolved",
+                    ))
+                } else if entry.worker_settled().await {
+                    Ok(())
+                } else {
+                    match daemon.worker(execution).await {
+                        Ok(worker) => tokio::time::timeout(
+                            Duration::from_secs(65),
+                            daemon.execute_worker(
+                                worker,
+                                &CommandEnvelope {
+                                    daemon_epoch: daemon.inner.epoch,
+                                    command_id: tickloop_harness::ids::generate(),
+                                    command: AgentCommand::ManagedRelease {
+                                        execution,
+                                        token: entry.token.clone(),
+                                    },
+                                },
+                            ),
+                        )
+                        .await
+                        .map_err(|_| {
+                            AccessError::new(
+                                AccessErrorCode::OutcomeUnknown,
+                                "managed expiry cancellation timed out",
+                            )
+                        })
+                        .and_then(|result| result.map(|_| ())),
+                        Err(error) => Err(error),
+                    }
+                };
+                // Hosted ownership cleanup still runs if the Worker is lost or settlement fails.
+                let mut hosted = daemon.cleanup_managed(execution, &entry).await;
+                if worker_result.is_ok() && hosted.is_ok() {
+                    hosted = daemon.finalize_managed_release(execution, &entry).await;
+                }
+                let error = worker_result
+                    .as_ref()
+                    .err()
+                    .or(hosted.as_ref().err())
+                    .map(|error| error.message.clone());
+                entry.cleanup_finished(worker_result.is_ok(), error).await;
+                entry.settle().await;
+                daemon.retire_released(execution, &entry).await;
+                daemon.changed();
+            });
+        }
+    }
+}
+
+async fn monitor_directory(daemon: Weak<DaemonInner>) {
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    let mut previous = Vec::new();
+    loop {
+        interval.tick().await;
+        let Some(inner) = daemon.upgrade() else { break };
+        let daemon = DaemonServer { inner };
+        let _admission = daemon.inner.admission.read().await;
+        if daemon.ensure_active().is_err() {
+            continue;
+        }
+        // Do not hold upgrade admission forever on a stalled directory observation.
+        if let Ok(Ok(directory)) =
+            tokio::time::timeout(Duration::from_secs(1), daemon.directory()).await
             && let Ok(current) = serde_json::to_vec(&directory)
             && previous != current
         {

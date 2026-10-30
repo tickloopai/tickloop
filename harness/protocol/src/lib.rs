@@ -22,6 +22,7 @@ mod ids;
 mod image;
 mod input;
 mod interaction;
+mod later;
 pub mod local_messages;
 mod loops;
 pub mod mcp;
@@ -130,6 +131,7 @@ pub use ids::{
 pub use image::{Image, ImageMediaType};
 pub use input::{ImageContext, ImageOrigin, InputContext, TextContext, render_input_context};
 pub use interaction::{Question, QuestionAnswer, QuestionOption, QuestionRequest};
+pub use later::{LaterVariant, TaggedRecord, names_later_variant};
 pub use local_messages::{
     FOLDED_TICK_REPLY_CHARACTERS, INTERRUPT_MESSAGE, INTERRUPT_MESSAGE_FOR_TOOL_USE, LocalMessage,
     ShellTaskEnd, SubagentReportMessage, TaskNotification, TaskNotificationStatus,
@@ -141,9 +143,9 @@ pub use loops::{
     TriggerIdentity, TriggerKind, TriggerSource,
 };
 pub use model::{
-    ApiKeyStatus, Content, ImageSource, InputModality, Message, ModelAuthSource, ModelConfig,
-    ModelIdentity, ModelProvider, PrivateHistorySource, Protocol, ReasoningEffort, Role,
-    ToolResultBlock, ToolResultContent, Usage,
+    ApiKeyStatus, Content, ImageSource, InputModality, LATER_CONTENT_TEXT, Message,
+    ModelAuthSource, ModelConfig, ModelIdentity, ModelProvider, PrivateHistorySource, Protocol,
+    ReasoningEffort, Role, ToolResultBlock, ToolResultContent, Usage, without_later_content,
 };
 pub use model_availability::{AccountModelDirectory, DirectorySemantics, ModelAvailability};
 pub use model_card::{
@@ -204,4 +206,10 @@ mod tasks;
 pub use tasks::*;
 
 mod isolation;
+pub use file_change::RecordedFileChangeReview;
+pub use input::ResourceContext;
 pub use isolation::{ExecutionIsolation, NetworkIsolation, WriteIsolation};
+pub use mcp::{
+    MAX_SESSION_MCP_DESCRIPTOR_BYTES, MAX_SESSION_MCP_SERVERS, SessionMcpServer,
+    valid_session_mcp_env_key, validate_session_mcp_servers,
+};
