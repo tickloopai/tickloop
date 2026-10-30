@@ -56,7 +56,8 @@ test: test-workspace
 	cargo test --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher
 
 ## Workspace tests without the Cargo launcher, whose build downloads the matching release; CI runs
-## these and the release workflow verifies the launcher. NEXTEST_PROFILE=ci retries flaky PTY tests.
+## these and the release workflow verifies the launcher. Failed tests rerun one at a time after the run;
+## NEXTEST_PROFILE=ci also retries flaky PTY tests at once.
 test-workspace:
 	@cargo nextest --version >/dev/null 2>&1 || { echo 'make test requires cargo-nextest; install it with: cargo install --locked cargo-nextest' >&2; exit 1; }
 	node --test scripts/test-workspace.test.mjs scripts/dev-agent.test.mjs scripts/check-boundaries.test.mjs scripts/check-public-api.test.mjs scripts/plugin-compat-report.test.mjs
