@@ -36,7 +36,7 @@ const REVIEW_OPTIONS: [ReviewChoice; 3] = [
     ReviewChoice::TrustAll,
     ReviewChoice::Continue,
 ];
-const PLUGIN_COVERAGE: &str = "Trust covers this declaration, the files recorded at installation, and the inventory itself. With an inventory, files created later do not affect trust. Without a readable inventory, trust covers the whole plugin directory. Changed covered content asks again; reinstalling identical content does not.";
+const PLUGIN_COVERAGE: &str = "Trust covers this declaration, the files recorded at installation, and the inventory itself. Recorded links also cover their targets' contents, including new files in linked directories. Other files created later do not affect trust. Without a readable inventory, trust covers the whole plugin directory. Changed covered content asks again; reinstalling identical content does not.";
 const REPOSITORY_COVERAGE: &str = "Trust covers this declaration and the Folder's .claude/hooks/ directory. Files the command runs from anywhere else are not covered: changing them does not ask again.";
 const USER_COVERAGE: &str = "Your own settings.json hook: it runs without trust. Disabling it turns it off in every folder.";
 
@@ -1203,6 +1203,8 @@ mod tests {
         for part in [
             "files recorded at installation",
             "and the inventory itself",
+            "Recorded links also cover their targets' contents",
+            "including new files in linked directories",
             "files created later do not affect trust",
             "Without a readable inventory, trust covers the whole plugin directory",
             "Changed covered content asks again",

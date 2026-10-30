@@ -365,7 +365,7 @@ Hooks run shell commands at fixed points of the agent's work: before and after a
 
 Your own hooks run without asking. A plugin's or a repository's hook runs only after you trust it, and the trust is bound to its content:
 
-- A plugin hook's trust covers its declaration and recorded shipped files. Updates, reinstalls or edits that change that content require review again; reinstalling identical content alone does not invalidate trust. Files generated after installation are outside that inventory; older installations without a readable inventory cover the whole plugin directory.
+- A plugin hook's trust covers its declaration and recorded shipped files. Updates, reinstalls or edits that change that content require review again; reinstalling identical content alone does not invalidate trust. Files generated after installation are outside that inventory, but recorded links cover their targets' contents, including new files in linked directories; older installations without a readable inventory cover the whole plugin directory.
 - A repository hook's trust covers its declaration and the folder's `.claude/hooks/` directory: a `git pull` that changes either asks again. Files the command runs from anywhere else are not covered, and changing them does not ask again.
 
 Full relative paths are part of the fingerprint, so moving a script asks again. Upgrading to v3 fingerprints requires trusting older fingerprints again; a read or fingerprinting failure skips the hook with a warning.
