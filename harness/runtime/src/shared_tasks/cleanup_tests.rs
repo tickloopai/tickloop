@@ -257,3 +257,44 @@ async fn failed_cleanup_checkpoint_returns_error_and_preserves_the_persistence_b
     assert!(core.inner.chats.lock().await[&root.chat_id].task_checkpoint_pending);
     core.shutdown().await;
 }
+
+async fn queue_boards_as_an_answer_starts(core: &Agent, chat_id: ChatId) {
+    let mut chats = core.inner.chats.lock().await;
+    core.queue_latest_task_boards(chats.get_mut(&chat_id).unwrap());
+}
+
+#[tokio::test]
+async fn looking_for_the_next_run_takes_the_checkpoint_queued_boards_wait_for() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("store");
+    let (core, receipts) = family(Some(store.clone())).await;
+    let root = &receipts[0];
+    create(&core, root, vec![]).await;
+    queue_boards_as_an_answer_starts(&core, root.chat_id).await;
+    assert!(binding_for_tool(&*core.inner.chats.lock().await, root, "Write").is_err());
+    core.next_run(root.chat_id).await.unwrap();
+    {
+        let chats = core.inner.chats.lock().await;
+        assert!(!chats[&root.chat_id].task_checkpoint_pending);
+        assert!(binding_for_tool(&chats, root, "Write").is_ok());
+    }
+
+    std::fs::remove_file(tickloop_harness_test_support::transcript_file(
+        &store,
+        root.chat_id.into(),
+    ))
+    .unwrap();
+    queue_boards_as_an_answer_starts(&core, root.chat_id).await;
+    core.next_run(root.chat_id).await.unwrap();
+    {
+        let chats = core.inner.chats.lock().await;
+        assert!(chats[&root.chat_id].task_checkpoint_pending);
+        assert!(
+            binding_for_tool(&chats, root, "Write")
+                .unwrap_err()
+                .contains("task persistence is unresolved")
+        );
+        assert!(binding_for_tool(&chats, root, "Read").is_ok());
+    }
+    core.shutdown().await;
+}

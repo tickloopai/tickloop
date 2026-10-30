@@ -960,10 +960,25 @@ impl Agent {
 
     pub(super) async fn persist_task_boards(&self, root: &mut Chat) -> Result<(), String> {
         self.queue_task_boards(root);
+        self.checkpoint_task_boards(root).await
+    }
+
+    /// Takes the Transcript checkpoint that `root`'s queued boards wait for. A failed write
+    /// keeps the reservation.
+    async fn checkpoint_task_boards(&self, root: &mut Chat) -> Result<(), String> {
         self.checkpoint_transcript(&root.snapshot, &root.bookkeeping).await
             .map_err(|error| format!("task persistence outcome unknown; reservation retained; retry the identical mutation or TaskList: {error}"))?;
         root.task_checkpoint_pending = false;
         Ok(())
+    }
+
+    /// Takes the checkpoint that boards queued as the conversation moved, or as an answer
+    /// started, wait for, so the Run that follows can work. Without it, task work and an
+    /// upgrade would wait for a checkpoint no one takes; a failed write keeps them waiting.
+    pub(super) async fn take_due_task_checkpoint(&self, chat: &mut Chat) {
+        if chat.task_checkpoint_pending {
+            let _ = self.checkpoint_task_boards(chat).await;
+        }
     }
 
     /// Queues `root`'s boards as [`Self::queue_latest_task_boards`] does. A change while the
@@ -977,7 +992,8 @@ impl Agent {
     }
 
     /// Records `root`'s boards for the next Transcript checkpoint; task work waits for that
-    /// checkpoint before it changes them again.
+    /// checkpoint before it changes them again, and the Chat takes it as it looks for its next
+    /// Run.
     pub(super) fn queue_latest_task_boards(&self, root: &mut Chat) {
         self.record_chat_metadata(
             root.snapshot.id,

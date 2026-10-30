@@ -64,3 +64,32 @@ test('workspace runner reports and cleans only its leaked process and runtime wi
   assert.ok(!existsSync(readFileSync(runtimeFile, 'utf8')));
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
 });
+
+test('workspace runner reruns failed tests one at a time and keeps the rerun result', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'workspace-rerun-test-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const bin = join(directory, 'bin');
+  mkdirSync(bin);
+  const calls = join(directory, 'calls');
+  writeFileSync(join(bin, 'cargo'), `#!${process.execPath}
+    const fs = require('node:fs');
+    const args = process.argv.slice(2);
+    fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify([args, process.env.NEXTEST_EXPERIMENTAL_RECORD ?? null]) + '\\n');
+    if (!args.includes('--rerun')) process.exit(Number(process.env.FIRST_EXIT));
+    process.exit(Number(process.env.RERUN_EXIT));
+  `, { mode: 0o755 });
+  for (const [firstExit, rerunExit, reruns, status] of [[0, 1, false, 0], [101, 0, false, 101], [100, 0, true, 0], [100, 100, true, 100]]) {
+    rmSync(calls, { force: true });
+    const result = spawnSync(process.execPath, [resolve('scripts/test-workspace.mjs')], { encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIRST_EXIT: String(firstExit), RERUN_EXIT: String(rerunExit) } });
+    const runs = readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(result.status, status, result.stderr);
+    assert.equal(runs.length, reruns ? 2 : 1, result.stderr);
+    assert.ok(runs.every(([args, record]) => record === '1' && args.includes('--user-config-file')));
+    if (reruns) {
+      const rerun = runs[1][0].join(' ');
+      assert.match(rerun, /--no-fail-fast .*--rerun latest --test-threads 1$/);
+      assert.match(result.stderr, /Rerunning the failed tests one at a time/);
+    }
+  }
+});
