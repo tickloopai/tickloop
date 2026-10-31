@@ -8,14 +8,14 @@
 //! and an answer under its Run's prompt or the parent its lifecycle record names. Loops and
 //! task boards and scheduled tasks have separate projections, without adding conversation nodes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use tickloop_harness_protocol::{
     AgentColor, AgentMessageSource, Authority, ChatId, Content, GoalSnapshot, ImageContext,
-    InputContext, LocalMessage, LoopId, LoopState, Protocol, Question, Receiving, ResourceContext,
-    Role, ScheduledTask, SharedTask, SubagentRegistration, TaskBoard, TickSubscription,
-    TriggerIdentity,
+    InputContext, LocalMessage, LoopId, LoopState, OperationRecord, Protocol, Question, Receiving,
+    ResourceContext, Role, ScheduledTask, SharedTask, SubagentRegistration, TaskBoard,
+    TickSubscription, TriggerIdentity,
 };
 use uuid::Uuid;
 
@@ -27,6 +27,11 @@ use crate::entry::{
 /// The longest tool result text a tool card carries.
 pub const DISPLAY_TOOL_RESULT_CHARS: usize = 4096;
 const SUBAGENT_COMPLETION_CALL_ID: &str = "subagent-completion";
+/// The tools that find, describe and batch other tools. An answer shows the calls a batch made,
+/// each as a call of its own, and none of these.
+const SEARCH_TOOLS: &str = "SearchTools";
+const DESCRIBE_TOOLS: &str = "DescribeTools";
+const EXECUTE_TOOLS: &str = "ExecuteTools";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DisplayNode {
@@ -113,6 +118,17 @@ pub enum DisplayBlock {
         questions: Vec<Question>,
         reply: Option<DisplayToolResult>,
     },
+    /// The approval a person was asked for under Durable Approval, after the tool call it is for.
+    /// The answer waits for it while its status waits for `request_id`; the call's own result
+    /// tells how it ended.
+    Permission {
+        request_id: Uuid,
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp_server: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_reason: Option<String>,
+    },
     /// A prompt that joined the answer at a tool boundary.
     FollowUp {
         prompt_id: Uuid,
@@ -171,6 +187,11 @@ pub struct DisplayProjector {
     inputs: HashMap<Uuid, InputEntry>,
     prompt_candidates: HashMap<Uuid, ChainEntry>,
     prompts_by_run: HashMap<Uuid, Uuid>,
+    /// The calls each `ExecuteTools` batch made, by Run and batch call, in batch order.
+    nested_calls: HashMap<(Uuid, String), BTreeMap<usize, OperationRecord>>,
+    /// Each node as shown: an answer shows the calls its batches made in place of the tools that
+    /// find, describe and batch them.
+    shown: HashMap<Uuid, DisplayNode>,
 }
 
 /// The display nodes of `lines`, in the order they first appeared.
@@ -367,11 +388,11 @@ impl DisplayProjector {
     }
 
     pub fn node(&self, id: Uuid) -> Option<&DisplayNode> {
-        self.nodes.get(&id)
+        self.shown.get(&id).or_else(|| self.nodes.get(&id))
     }
 
     pub fn nodes(&self) -> impl Iterator<Item = &DisplayNode> {
-        self.order.iter().filter_map(|id| self.nodes.get(id))
+        self.order.iter().filter_map(|id| self.node(*id))
     }
 
     /// The display node a physical chain entry is part of or, for an internal entry, follows.
@@ -422,6 +443,24 @@ impl DisplayProjector {
             Line::Subagents(entry) => {
                 self.subagents = entry.subagents.clone();
                 self.order.clone()
+            }
+            Line::NestedCall(entry) => {
+                let operation = &entry.operation;
+                match (&operation.parent_call_id, operation.parent_call_index) {
+                    (Some(parent), Some(index)) => {
+                        let run = operation.run_id.uuid();
+                        self.nested_calls
+                            .entry((run, parent.clone()))
+                            .or_default()
+                            .insert(index, operation.clone());
+                        self.responses
+                            .values()
+                            .filter(|response| response.run_id == run)
+                            .map(|response| response.response_id)
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                }
             }
             Line::Input(input) if input.op != InputOp::Answer => {
                 self.inputs.insert(input.run_id, input.clone());
@@ -481,12 +520,84 @@ impl DisplayProjector {
         changed.retain(|id| seen.insert(*id));
         for id in &changed {
             self.refresh_answer(*id);
+            self.show(*id);
         }
         changed
             .into_iter()
-            .filter_map(|id| self.nodes.get(&id).cloned())
+            .filter_map(|id| self.shown.get(&id).cloned())
             .map(DisplayChange::Upsert)
             .collect()
+    }
+
+    /// Shows the node `id` as it is now.
+    fn show(&mut self, id: Uuid) {
+        let Some(node) = self.nodes.get(&id) else {
+            return;
+        };
+        let run = self.responses.get(&id).map(|response| response.run_id);
+        let blocks = node
+            .blocks
+            .iter()
+            .flat_map(|block| self.shown_blocks(id, run, block))
+            .collect();
+        let shown = DisplayNode {
+            blocks,
+            ..node.clone()
+        };
+        self.shown.insert(id, shown);
+    }
+
+    /// What the answer `id` of `run` shows for its block `block`: a batch shows the calls it
+    /// made, each with the approval a person was asked for, and the tools that find and describe
+    /// tools show nothing. An answer whose Run is unknown shows its batches as they are.
+    fn shown_blocks(&self, id: Uuid, run: Option<Uuid>, block: &DisplayBlock) -> Vec<DisplayBlock> {
+        let DisplayBlock::ToolCall { call_id, name, .. } = block else {
+            return vec![block.clone()];
+        };
+        match (name.as_str(), run) {
+            (SEARCH_TOOLS | DESCRIBE_TOOLS, _) => Vec::new(),
+            (EXECUTE_TOOLS, Some(run)) => self
+                .nested_calls
+                .get(&(run, call_id.clone()))
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .flat_map(|operation| {
+                    let call = DisplayBlock::ToolCall {
+                        call_id: operation.call_id.clone(),
+                        name: operation.name.clone(),
+                        input: operation.input.clone(),
+                        result: operation
+                            .result
+                            .as_ref()
+                            .map(|result| display_result(&result.content, result.is_error)),
+                        recorded_review: self
+                            .recorded_edits
+                            .get(&(run, operation.call_id.clone()))
+                            .cloned(),
+                        member: None,
+                    };
+                    let permissions = self
+                        .waits
+                        .iter()
+                        .filter(|wait| wait.response_id == id)
+                        .filter_map(|wait| match &wait.kind {
+                            WaitKind::Permission { request, .. }
+                                if request.execution.call_key() == operation.call_id =>
+                            {
+                                Some(DisplayBlock::Permission {
+                                    request_id: request.id,
+                                    call_id: operation.call_id.clone(),
+                                    mcp_server: request.mcp_server.clone(),
+                                    approval_reason: request.approval_reason.clone(),
+                                })
+                            }
+                            _ => None,
+                        });
+                    std::iter::once(call).chain(permissions)
+                })
+                .collect(),
+            _ => vec![block.clone()],
+        }
     }
 
     fn refresh_answer(&mut self, id: Uuid) {
@@ -536,6 +647,9 @@ impl DisplayProjector {
             {
                 let waiting = match &wait.kind {
                     WaitKind::Question { request, .. } => Some(DisplayWait::Person {
+                        request: request.id,
+                    }),
+                    WaitKind::Permission { request, .. } => Some(DisplayWait::Person {
                         request: request.id,
                     }),
                     WaitKind::Subagent { child_chat, .. } => {
@@ -615,6 +729,28 @@ impl DisplayProjector {
             }
         }
         for wait in self.waits.iter().filter(|wait| wait.response_id == id) {
+            // A call made inside a batch has no block here: the batch's shown blocks hold it and
+            // its approval.
+            if let WaitKind::Permission { request, .. } = &wait.kind
+                && !node.blocks.iter().any(|block| {
+                    matches!(block,
+                    DisplayBlock::Permission { request_id, .. } if *request_id == request.id)
+                })
+                && let Some(call_index) = node.blocks.iter().position(|block| {
+                    matches!(block,
+                    DisplayBlock::ToolCall { call_id, .. } if *call_id == request.execution.call_key())
+                })
+            {
+                node.blocks.insert(
+                    call_index + 1,
+                    DisplayBlock::Permission {
+                        request_id: request.id,
+                        call_id: request.execution.call_key(),
+                        mcp_server: request.mcp_server.clone(),
+                        approval_reason: request.approval_reason.clone(),
+                    },
+                );
+            }
             let WaitKind::Question { request, .. } = &wait.kind else {
                 continue;
             };

@@ -240,6 +240,24 @@ impl fmt::Debug for CallbackPaste {
     }
 }
 
+/// Reads the authorization response from `callback_url`, the address the authorization server
+/// sent the browser to, for a host that receives it at its own `redirect_uri`. The address must
+/// be `redirect_uri` carrying `state`.
+pub fn read_authorization_response(
+    callback_url: &str,
+    redirect_uri: &str,
+    state: &str,
+) -> Result<AuthorizationResponse, CallbackError> {
+    let redirect = Url::parse(redirect_uri).map_err(|_| CallbackError::InvalidCallback)?;
+    parse_callback(
+        callback_url,
+        &ExpectedCallback {
+            redirect,
+            state: state.to_owned(),
+        },
+    )
+}
+
 fn parse_callback(pasted_redirect_url: &str, expected: &ExpectedCallback) -> Completion {
     let callback =
         Url::parse(pasted_redirect_url.trim()).map_err(|_| CallbackError::InvalidCallback)?;

@@ -19,6 +19,11 @@ pub struct ConnectorCredential {
     /// Absent after logout, when the registration is kept for the next login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<OAuthToken>,
+    /// Names the login the token came from: new with each login, kept while the token is
+    /// renewed, so it tells a renewed token of the same login from another login, which may be
+    /// another account. `None` in a credential saved before logins were named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
 }
 
 /// The client Tickloop is at the authorization server, registered dynamically or configured.

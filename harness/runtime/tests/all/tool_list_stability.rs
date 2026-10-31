@@ -101,6 +101,7 @@ impl HostToolProvider for NamedHostTools {
 
 fn server_config(name: &str, server: &McpService, exposure: ToolExposure) -> McpServerConfig {
     McpServerConfig {
+        unruled: Default::default(),
         name: name.into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -1053,6 +1054,7 @@ async fn a_users_exposure_change_reaches_the_next_request_of_the_same_run() {
             let (connections, configs, alpha_url, beta_url) = changes.clone();
             Box::pin(async move {
                 let config = |name: &str, url: &str, exposure| McpServerConfig {
+                    unruled: Default::default(),
                     transport: McpTransport::Http {
                         url: url.into(),
                         headers: BTreeMap::new(),
@@ -1196,6 +1198,7 @@ async fn a_hidden_servers_tools_are_neither_found_nor_executed_from_the_next_req
 
 fn server_config_named(name: &str) -> McpServerConfig {
     McpServerConfig {
+        unruled: Default::default(),
         name: name.into(),
         source: "global".into(),
         transport: McpTransport::Unsupported {

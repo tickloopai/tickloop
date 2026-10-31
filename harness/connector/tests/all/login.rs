@@ -24,6 +24,7 @@ async fn login_through_the_loopback_callback_registers_tickloop_and_saves_a_usab
     assert_eq!(registration["client_name"], json!("Tickloop"));
     assert_eq!(registration["redirect_uris"], json!([redirect_uri]));
     assert_eq!(registration["token_endpoint_auth_method"], json!("none"));
+    assert_eq!(registration["application_type"], json!("native"));
 
     let redirect = fixture.approve(&login).await;
     let browser = http_client().get(&redirect).send().await.unwrap();

@@ -2659,6 +2659,26 @@ fn recover_transcript(
             && super::nested_calls::parent_on_chain(&snapshot, &entry.operation)
         {
             let mut operation = entry.operation.clone();
+            // A batch that has not returned goes on without making the calls that ended again.
+            if let (Some(status), Some(parent), Some(index)) = (
+                entry.status,
+                operation.parent_call_id.clone(),
+                operation.parent_call_index,
+            ) && let Some(result) = operation.result.clone()
+                && !super::tool_batch::has_result_on_chain(&snapshot, operation.run_id, &parent)
+            {
+                bookkeeping.nested_outcomes.insert(
+                    (operation.run_id, parent, index),
+                    super::nested_calls::NestedOutcome {
+                        call_id: operation.call_id.clone(),
+                        name: operation.name.clone(),
+                        status,
+                        result,
+                        images: entry.images.clone(),
+                        sources: entry.sources.clone(),
+                    },
+                );
+            }
             if matches!(
                 operation.state,
                 tickloop_harness_protocol::OperationState::Proposed
@@ -4219,6 +4239,7 @@ impl Agent {
                 parked: HashMap::new(),
                 releases: HashMap::new(),
                 ready_runs: VecDeque::new(),
+                permission_grants: HashMap::new(),
                 client,
                 pending_client: None,
                 pending_model_thinking: None,

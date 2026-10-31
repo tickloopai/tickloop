@@ -594,6 +594,7 @@ impl ResolvedServers {
             _ => {}
         }
         self.servers.push(McpServerConfig {
+            unruled: Default::default(),
             name,
             source,
             transport,

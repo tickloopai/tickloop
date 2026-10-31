@@ -29,8 +29,8 @@ use task_board_history::ConversationChange;
 pub use task_board_history::{TaskBoardQueryError, task_boards_at};
 
 pub use harness::{
-    CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, PersonWait, PersonWaitKind,
-    Quiescence, SearchDefaults, SubagentLaunch, ToolPolicy, WaitHosting, Waits,
+    AutoReviewModel, CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, PersonWait,
+    PersonWaitKind, Quiescence, SearchDefaults, SubagentLaunch, ToolPolicy, WaitHosting, Waits,
     durable_chat_host_rules,
 };
 mod hook_transcript;
@@ -131,8 +131,8 @@ pub use wakeup::{TestSourceState, trigger_pauses};
 mod web_provenance;
 pub use event_sources::ExternalDelivery;
 pub use turn::{
-    Delivery, MessageId, ParentSelection, QuestionReply, SkillInvocation, Turn, TurnOp,
-    TurnOutcome, TurnRequest, TurnWait, UserMessage,
+    Delivery, MessageId, ParentSelection, PermissionReply, QuestionReply, SkillInvocation, Turn,
+    TurnOp, TurnOutcome, TurnRequest, TurnWait, UserMessage,
 };
 mod user_shell;
 #[cfg(test)]
@@ -190,6 +190,9 @@ const MAX_RESPONSE_CONTINUATIONS: usize = 3;
 const OUTPUT_LIMIT_CONTINUATION_PROMPT: &str = "Output token limit hit. Continue directly from the unfinished response without repeating or summarizing it. Break the remaining work into smaller pieces.";
 const STREAM_INTERRUPTION_CONTINUATION_PROMPT: &str = "The response stream was interrupted. Continue directly from the unfinished response without repeating or summarizing it.";
 const SHELL_STATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+/// A Session grant lives only in the process that records it, so a durable wait refuses one.
+const DURABLE_PERMISSION_SCOPES: &str =
+    "a permission a Run waits on durably is allowed once or persistently";
 
 pub use agent_messages::LIST_SUBAGENTS_TOOL_NAME;
 pub use delegation::MAX_SUBAGENT_HANDLE_CHARACTERS;
@@ -400,6 +403,7 @@ struct Inner {
     environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
     tool_policy: ToolPolicy,
     citation_style: CitationStyle,
+    auto_review_model: AutoReviewModel,
     host_rules: Vec<PermissionRule>,
     /// The host's own section of every conversation's system prompt.
     system_prompt_addition: Option<String>,
@@ -463,6 +467,10 @@ struct ChatBookkeeping {
     /// recorded with values this version does not know, kept as written for its entry.
     #[serde(default)]
     later_provenance: BTreeMap<usize, persistence::LaterProvenance>,
+    /// What each call of a batch that has not returned ended with, which a load restores from
+    /// the Transcript: the batch goes on after its Run waited without making them again.
+    #[serde(skip)]
+    nested_outcomes: nested_calls::RecordedNestedCalls,
     /// Project partition (normalized working directory) owning each persistent rule in the rule
     /// set; deletions and modifications are written back to that partition.
     persistent_rule_projects: BTreeMap<Uuid, PathBuf>,
@@ -533,6 +541,9 @@ struct Chat {
     /// Run leaves this instance without writing anything; it goes on wherever the Chat loads next.
     releases: HashMap<RunId, CancellationToken>,
     ready_runs: VecDeque<RunId>,
+    /// The calls a person allowed while their rebuilt Run waited durably, by Run and call: the
+    /// Run prepares each again where it waited, and the same call runs without asking again.
+    permission_grants: HashMap<(RunId, String), suspension::PermissionGrant>,
     client: Arc<dyn ModelClient>,
     pending_client: Option<Arc<dyn ModelClient>>,
     pending_model_thinking: Option<PendingModelThinking>,
@@ -833,12 +844,18 @@ struct PermissionPrompt {
     source: PermissionApprovalSource,
     reason: Option<String>,
     mcp_server: Option<String>,
+    /// What the call reaches, which an approval given for it is bound to.
+    target: Option<String>,
+    /// What the call's `PreToolUse` hooks decided, which its wait keeps.
+    hooks: Option<tickloop_harness_transcript::HookPreparation>,
 }
 
 struct PendingApproval {
     sender: oneshot::Sender<PermissionAnswer>,
     owner: PermissionOwner,
-    operation: SessionPermissionOperation,
+    /// What a Session grant covers; `None` for a permission a rebuilt Run waits on, whose call is
+    /// prepared again only once the person allowed it.
+    operation: Option<SessionPermissionOperation>,
 }
 
 #[derive(Clone, Debug)]
@@ -1422,6 +1439,7 @@ impl Agent {
                     receipt,
                     assistant_message_id,
                     operation.call_id.clone(),
+                    false,
                     &cancel,
                 )
                 .await?;
@@ -1436,11 +1454,14 @@ impl Agent {
                         command_skills::shell_input(&expanded.name, &shell.command),
                         child.clone(),
                     )
-                    .await;
+                    .await
+                    .map_err(|error| error.message)?;
                 let result = self
                     .skill_shell_output(receipt, &outcome.call_id, &outcome.result)
                     .await;
-                if outcome.status != nested_calls::NestedStatus::Completed || result.is_err() {
+                if outcome.status != tickloop_harness_transcript::NestedCallStatus::Completed
+                    || result.is_err()
+                {
                     child.cancel();
                     failure = Some(
                         result
@@ -1630,10 +1651,13 @@ impl Agent {
         prepared_facts: Option<tickloop_harness_protocol::PreparedApprovalFacts>,
         cancel: CancellationToken,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
-        self.review_operation(receipt, operation, prepared_facts, cancel, true)
+        self.review_operation(receipt, operation, prepared_facts, cancel, true, false)
             .await
     }
 
+    /// Reviews `operation` in the Chat's Folder, or, for a `remote` call, without one when the
+    /// Chat has none: the context then names no working directory, and Auto policy entries
+    /// scoped to a directory do not apply.
     async fn review_operation(
         &self,
         receipt: &Receipt,
@@ -1641,6 +1665,7 @@ impl Agent {
         prepared_facts: Option<tickloop_harness_protocol::PreparedApprovalFacts>,
         cancel: CancellationToken,
         emit_permission: bool,
+        remote: bool,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
         let (snapshot, bookkeeping, chat_client, boundary_id, root_goal) = {
             let chats = self.inner.chats.lock().await;
@@ -1721,7 +1746,8 @@ impl Agent {
                 ));
             }
         };
-        let Some(folder) = snapshot.folder.clone() else {
+        let folder = snapshot.folder.clone();
+        if folder.is_none() && !remote {
             let reason =
                 "This Chat has no Folder to review this action in; review it manually.".to_owned();
             if emit_permission {
@@ -1736,7 +1762,7 @@ impl Agent {
                     failure: ApprovalFailureKind::Configuration,
                 },
             ));
-        };
+        }
         let ids = self.chat_ids(snapshot.id).await;
         let context = approval_context::capture(
             &ids,
@@ -1745,8 +1771,11 @@ impl Agent {
             operation,
             root_goal.as_ref(),
             legacy,
-            &folder,
-            auto_settings.policy_for_directory(&folder),
+            folder.as_deref(),
+            match &folder {
+                Some(folder) => auto_settings.policy_for_directory(folder),
+                None => auto_settings.policy(),
+            },
         );
         let mut context = match context {
             Ok(context) => context,
@@ -1818,7 +1847,12 @@ impl Agent {
             facts
         });
         let preferred = auto_settings.reviewer;
-        let configured_reviewer = self.inner.auto_reviewer.lock().await.clone();
+        // The Chat's own model reviews in place of any other when the host chose it, with the
+        // client this review captured from the Chat: whatever model the Chat uses now.
+        let configured_reviewer = match self.inner.auto_review_model {
+            AutoReviewModel::Configured => self.inner.auto_reviewer.lock().await.clone(),
+            AutoReviewModel::ChatModel => Some(chat_client.clone()),
+        };
         let has_isolated_reviewer = configured_reviewer.is_some();
         let has_judgment_adapter = self.inner.judgment.lock().await.is_some();
         let llm_client = if let Some(client) = configured_reviewer {
@@ -1846,8 +1880,11 @@ impl Agent {
                 crate::context::context_window(&snapshot),
             )
         };
-        let use_jev = preferred == tickloop_harness_protocol::AutoReviewerPreference::Jev
-            || (has_judgment_adapter && !has_isolated_reviewer);
+        // The Chat's own model is the only reviewer the host chose: Jev is neither bound, asked
+        // nor fallen back from.
+        let use_jev = self.inner.auto_review_model == AutoReviewModel::Configured
+            && (preferred == tickloop_harness_protocol::AutoReviewerPreference::Jev
+                || (has_judgment_adapter && !has_isolated_reviewer));
         let assess = |run: auto_approval::ReviewerRun,
                       fallback_from: Option<ApprovalReviewerKind>,
                       fallback_failure: Option<ApprovalFailureKind>,
@@ -2263,6 +2300,7 @@ impl Agent {
             waits,
             system_prompt_addition,
             citation_style,
+            auto_review_model,
             request_gates,
             time_zone,
             scheduled_task_expiry,
@@ -2332,6 +2370,7 @@ impl Agent {
                 environment,
                 tool_policy,
                 citation_style,
+                auto_review_model,
                 host_rules,
                 system_prompt_addition,
                 web_search_settings,
@@ -2398,28 +2437,51 @@ impl Agent {
         })
     }
 
-    fn apply_prompt_policy(&self, decision: Decision) -> Decision {
-        match (self.inner.host_options.prompt_policy, decision) {
+    /// The prompt policy a model tool call's approval is decided under. A call an `ExecuteTools`
+    /// batch makes waits durably as any call does: the batch makes its calls one at a time, so
+    /// one that waits suspends the whole Run at its place in the batch. Any other call made
+    /// inside another call, or while a user's command prepares its input, has no place in a
+    /// tool batch to go on from, so it cannot wait durably: its approval is denied as on a host
+    /// that denies whatever would prompt.
+    fn tool_prompt_policy(&self) -> PromptPolicy {
+        let has_no_batch_place = nested_calls::is_nested() && !nested_calls::waits_durably()
+            || command_skills::input_message_id().is_some();
+        match self.inner.host_options.prompt_policy {
+            PromptPolicy::DurableApproval if has_no_batch_place => PromptPolicy::DenyOnPrompt,
+            policy => policy,
+        }
+    }
+
+    /// The prompt policy of every prompt other than a model tool call's approval.
+    fn other_prompt_policy(&self) -> PromptPolicy {
+        self.inner
+            .host_options
+            .prompt_policy
+            .without_durable_approval()
+    }
+
+    fn apply_prompt_policy(policy: PromptPolicy, decision: Decision) -> Decision {
+        match (policy, decision) {
             (PromptPolicy::DenyOnPrompt, Decision::Ask) => Decision::Deny,
             (PromptPolicy::Unrestricted, Decision::Ask | Decision::Check) => Decision::Allow,
             _ => decision,
         }
     }
 
-    /// `apply_prompt_policy`, except that an Unrestricted host cannot waive a person or a reviewer
-    /// that an explicit Ask rule or the tool's own permission class requires.
+    /// `apply_prompt_policy` under `policy`, except that an Unrestricted host cannot waive a person
+    /// or a reviewer that an explicit Ask rule or the tool's own permission class requires.
     fn apply_prompt_policy_keeping_required_approval(
-        &self,
+        policy: PromptPolicy,
         decision: Decision,
         is_approval_required: bool,
     ) -> Decision {
         if is_approval_required
             && matches!(decision, Decision::Ask | Decision::Check)
-            && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted
+            && policy == PromptPolicy::Unrestricted
         {
             decision
         } else {
-            self.apply_prompt_policy(decision)
+            Self::apply_prompt_policy(policy, decision)
         }
     }
 
@@ -2427,7 +2489,7 @@ impl Agent {
     /// host that cannot ask. Review runs under an Unrestricted host only for calls that host
     /// cannot waive, so their escalation still reaches a person.
     fn review_escalation(&self) -> Decision {
-        if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt {
+        if self.tool_prompt_policy() == PromptPolicy::DenyOnPrompt {
             Decision::Deny
         } else {
             Decision::Ask
@@ -5117,6 +5179,21 @@ impl Agent {
         prompt: PermissionPrompt,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
+        if let Some(revision) = self
+            .take_permission_grant(
+                receipt,
+                operation,
+                prompt.mcp_server.as_deref(),
+                prompt.target.as_deref(),
+            )
+            .await
+        {
+            return Ok(PermissionAnswer {
+                allow: true,
+                revision,
+                comment: None,
+            });
+        }
         let request = PermissionRequest {
             parent_call: nested_calls::parent_call().await,
             mcp_server: prompt.mcp_server,
@@ -5133,30 +5210,46 @@ impl Agent {
             approval_source: prompt.source,
         };
         nested_calls::register_permission(request.id);
-        self.wait_for_permission(receipt.chat_id, request, session_operation, cancel)
-            .await
+        self.wait_for_permission(
+            receipt.chat_id,
+            request,
+            session_operation,
+            prompt.target,
+            prompt.hooks,
+            cancel,
+        )
+        .await
     }
 
+    /// Waits for a person to answer `request`; a wait it records under Durable Approval binds
+    /// the answer to `target`, what the call reaches.
     async fn wait_for_permission(
         &self,
         chat_id: ChatId,
         request: PermissionRequest,
         session_operation: SessionPermissionOperation,
+        target: Option<String>,
+        hooks: Option<tickloop_harness_transcript::HookPreparation>,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
-        let nested = nested_calls::is_nested();
-        if !nested {
-            tool_batch::serialize_permission_prompt(&cancel).await?;
-        }
         let model_receipt = request.execution.run_id().map(|run_id| Receipt {
             chat_id,
             loop_id: request.loop_id,
             run_id,
         });
+        let waits_durably = model_receipt.is_some()
+            && self.tool_prompt_policy() == PromptPolicy::DurableApproval
+            && matches!(request.execution, PermissionExecution::ToolCall { .. });
+        // A call inside a batch waits alone, unless it waits durably: its Run then waits for it
+        // as for one of its own calls.
+        let waits_alone = nested_calls::is_nested() && !waits_durably;
+        if !waits_alone {
+            tool_batch::serialize_permission_prompt(&cancel).await?;
+        }
         let (sender, receiver) = oneshot::channel();
         let owner = PermissionOwner::new(chat_id.into(), request.loop_id.into())
             .map_err(|error| error.to_string())?;
-        {
+        let release = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats
                 .get_mut(&chat_id)
@@ -5172,7 +5265,7 @@ impl Agent {
                     .run_cancel(receipt.run_id)
                     .cloned()
                     .ok_or("permission Run is unavailable")?;
-                if !nested {
+                if !waits_alone {
                     self.park_run(chat, receipt, run_cancel)
                         .map_err(|error| error.to_string())?;
                 }
@@ -5185,12 +5278,21 @@ impl Agent {
             }
             chat.denial_window.remember_human_prompt(&request);
             chat.snapshot.permissions.push(request.clone());
+            let release = match &model_receipt {
+                Some(receipt) if waits_durably => {
+                    let release =
+                        self.suspend_for_permission(chat, receipt, &request, target, hooks);
+                    self.save_now(&chat.snapshot);
+                    release
+                }
+                _ => CancellationToken::new(),
+            };
             self.inner.approvals.lock().await.insert(
                 request.id,
                 PendingApproval {
                     sender,
                     owner,
-                    operation: session_operation,
+                    operation: Some(session_operation),
                 },
             );
             let receipt = model_receipt.clone().unwrap_or(Receipt {
@@ -5205,8 +5307,9 @@ impl Agent {
                     request: request.clone(),
                 },
             );
-        }
-        if !nested
+            release
+        };
+        if !waits_alone
             && model_receipt.is_some()
             && let Some(next) = self
                 .next_run(chat_id)
@@ -5215,10 +5318,10 @@ impl Agent {
         {
             self.run_task(next);
         }
-        let answer = tokio::select! {biased; _ = nested_calls::stopped() => Err("Nested execution stopped after Auto rejection; call not dispatched".into()), _ = cancel.cancelled() => Err("permission request cancelled".into()), answer = receiver => answer.map_err(|_| "permission request expired".to_owned())};
+        let answer = tokio::select! {biased; _ = release.cancelled() => return Err(suspension::RUN_RELEASED.into()), _ = nested_calls::stopped() => Err("Nested execution stopped after Auto rejection; call not dispatched".into()), _ = cancel.cancelled() => Err("permission request cancelled".into()), answer = receiver => answer.map_err(|_| "permission request expired".to_owned())};
         let resumed = if answer.is_ok() {
             if let Some(receipt) = &model_receipt
-                && !nested
+                && !waits_alone
             {
                 self.resume_parked_run(receipt, cancel.clone()).await
             } else {
@@ -5228,6 +5331,11 @@ impl Agent {
             Ok(())
         };
         let mut chats = self.inner.chats.lock().await;
+        // A Run released meanwhile leaves its wait, allowed or not, to the next host.
+        if release.is_cancelled() {
+            return Err(suspension::RUN_RELEASED.into());
+        }
+        let mut is_wait_ended = false;
         if let Some(chat) = chats.get_mut(&chat_id) {
             if answer.is_err() || resumed.is_err() {
                 chat.denial_window.human_prompts.retain(|(run, call, _)| {
@@ -5238,15 +5346,23 @@ impl Agent {
             chat.snapshot
                 .permissions
                 .retain(|permission| permission.id != request.id);
-            if nested
+            if waits_alone
                 && chat.snapshot.permissions.is_empty()
                 && chat.active_run == model_receipt.as_ref().map(|receipt| receipt.run_id)
             {
                 chat.snapshot.chat_loop.set_state(LoopState::Running);
             }
+            // An allowed call's durable wait ends before the call runs, so no host runs it again.
+            if resumed.is_ok() && answer.as_ref().is_ok_and(|answer| answer.allow) {
+                is_wait_ended = chat.bookkeeping.lifecycle.end_wait(request.id);
+            }
             self.save(&chat.snapshot);
         }
+        drop(chats);
         self.inner.approvals.lock().await.remove(&request.id);
+        if is_wait_ended {
+            self.commit_allowed_call(chat_id).await?;
+        }
         resumed?;
         answer
     }
@@ -5490,8 +5606,10 @@ impl Agent {
             PermissionScope::Persistent,
             None,
             Some(specifier),
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     pub async fn answer_permission_with_comment(
@@ -5502,10 +5620,16 @@ impl Agent {
         scope: PermissionScope,
         comment: Option<String>,
     ) -> Result<(), AgentError> {
-        self.answer_permission_scoped(chat_id, request_id, allow, scope, comment, None)
+        self.answer_permission_scoped(chat_id, request_id, allow, scope, comment, None, None)
             .await
+            .map(|_| ())
     }
 
+    /// Answers the permission `request_id`. A Run waiting on it durably has its wait end in the
+    /// Transcript first: allowed, so the Run runs the call, or resolved with the denial the model
+    /// reads; `ledger` is the input the answer came as, merged into that Run. Gives the answer's
+    /// receipt.
+    #[allow(clippy::too_many_arguments)]
     async fn answer_permission_scoped(
         &self,
         chat_id: ChatId,
@@ -5514,7 +5638,30 @@ impl Agent {
         scope: PermissionScope,
         comment: Option<String>,
         persistent_specifier: Option<String>,
-    ) -> Result<(), AgentError> {
+        ledger: Option<lifecycle::LedgerInput>,
+    ) -> Result<Receipt, AgentError> {
+        if let Some(input) = &ledger
+            && let Some(replayed) = self
+                .inner
+                .chats
+                .lock()
+                .await
+                .get(&chat_id)
+                .and_then(|chat| chat.bookkeeping.lifecycle.replay(chat_id, input))
+        {
+            return replayed;
+        }
+        if scope == PermissionScope::Session
+            && self
+                .inner
+                .chats
+                .lock()
+                .await
+                .get(&chat_id)
+                .is_some_and(|chat| suspension::open_permission_wait(chat, request_id).is_some())
+        {
+            return Err(AgentError::Invalid(DURABLE_PERMISSION_SCOPES.into()));
+        }
         if allow {
             let chats = self.inner.chats.lock().await;
             if chats.get(&chat_id).is_some_and(|chat| {
@@ -5577,15 +5724,40 @@ impl Agent {
         };
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        answerable_permission_request(chat, request_id, allow)?;
+        // A repeated answer, even one racing the first, finds it in the ledger under this lock.
+        if let Some(replayed) = ledger
+            .as_ref()
+            .and_then(|input| chat.bookkeeping.lifecycle.replay(chat_id, input))
+        {
+            return replayed;
+        }
+        let request = answerable_permission_request(chat, request_id, allow)?;
         let mut approvals = self.inner.approvals.lock().await;
-        let (permission_owner, session_operation) = approvals
+        let (permission_owner, session_operation, is_closed) = approvals
             .get(&request_id)
-            .map(|pending| (pending.owner, pending.operation.clone()))
+            .map(|pending| {
+                (
+                    pending.owner,
+                    pending.operation.clone(),
+                    pending.sender.is_closed(),
+                )
+            })
             .ok_or_else(|| AgentError::Invalid("permission was already answered".into()))?;
+        let run = request.execution.run_id();
+        if ledger.is_some() && run.is_none() {
+            return Err(AgentError::Invalid(
+                "only a Run's permission is answered as an input".into(),
+            ));
+        }
+        // Nothing is recorded for a Run that no longer waits here, such as one just released.
+        if is_closed || run.is_some_and(|run| Self::release_of(chat, run).is_cancelled()) {
+            return Err(AgentError::Invalid("permission request expired".into()));
+        }
         let mut session_context = None;
         let mut session_candidate = None;
         if scope == PermissionScope::Session {
+            let session_operation = session_operation
+                .ok_or_else(|| AgentError::Invalid(DURABLE_PERMISSION_SCOPES.into()))?;
             let context = self.inner.session_permissions.lock().await;
             let mut candidate = context.clone();
             candidate
@@ -5601,6 +5773,33 @@ impl Agent {
                 .map_err(|error| AgentError::Invalid(error.to_string()))?;
             session_context = Some(context);
             session_candidate = Some(candidate);
+        }
+        let receipt = Receipt {
+            chat_id,
+            loop_id: request.loop_id,
+            run_id: tickloop_ids::generate().into(),
+        };
+        let by_input = ledger.as_ref().map(|input| input.id.into());
+        let lifecycle = &mut chat.bookkeeping.lifecycle;
+        if allow {
+            lifecycle.allow_wait(request_id, by_input);
+        } else {
+            lifecycle.resolve_wait(
+                request_id,
+                suspension::denied_permission_result(comment.as_deref()),
+                by_input,
+            );
+        }
+        if let Some(input) = &ledger
+            && let Some(run) = run
+        {
+            lifecycle.record_settled(
+                input,
+                &receipt,
+                SettledOutcome::Merged { into: run.into() },
+                None,
+            );
+            self.inner.ledger_changes.send_replace(());
         }
         let mut snapshot = chat.snapshot.clone();
         snapshot
@@ -5650,7 +5849,28 @@ impl Agent {
                 revision: answer_revision,
                 comment,
             })
-            .map_err(|_| AgentError::Invalid("permission request expired".into()))
+            .map_err(|_| AgentError::Invalid("permission request expired".into()))?;
+        Ok(receipt)
+    }
+
+    /// Answers the permission `request_id` a Run waits on under Durable Approval, as the user's
+    /// reply `reply`, recorded with the ledger input `ledger` it came as. Gives its receipt.
+    pub(crate) async fn reply_to_permission(
+        &self,
+        chat_id: ChatId,
+        request_id: Uuid,
+        reply: PermissionReply,
+        ledger: Option<lifecycle::LedgerInput>,
+    ) -> Result<Receipt, AgentError> {
+        let (allow, scope, comment, rule) = match reply {
+            PermissionReply::AllowOnce => (true, PermissionScope::Once, None, None),
+            PermissionReply::AllowAlways { rule } => {
+                (true, PermissionScope::Persistent, None, rule)
+            }
+            PermissionReply::Deny { comment } => (false, PermissionScope::Once, comment, None),
+        };
+        self.answer_permission_scoped(chat_id, request_id, allow, scope, comment, rule, ledger)
+            .await
     }
 
     pub async fn answer_permission(
@@ -6284,6 +6504,7 @@ impl NewChat {
             parked: HashMap::new(),
             releases: HashMap::new(),
             ready_runs: VecDeque::new(),
+            permission_grants: HashMap::new(),
             client,
             pending_client: None,
             pending_model_thinking: None,

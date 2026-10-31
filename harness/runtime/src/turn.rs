@@ -75,6 +75,12 @@ pub enum TurnOp {
     },
     /// The user's reply to the question `request` a Run waits on; it joins that Run.
     Answer { request: Uuid, reply: QuestionReply },
+    /// The user's answer to the permission `request` a Run waits on under Durable Approval; it
+    /// joins that Run.
+    AnswerPermission {
+        request: Uuid,
+        reply: PermissionReply,
+    },
     /// An @tickloop request delivered to the Chat's Loop, under the input id its delivery names.
     /// It queues behind the Loop's work, whatever the delivery mode.
     Deliver { delivery: ExternalDelivery },
@@ -88,6 +94,21 @@ pub enum QuestionReply {
     Answered(Vec<QuestionAnswer>),
     /// The question is declined, as Esc does in its dialog; the waiting Run ends there.
     Declined,
+}
+
+/// How the user answers a permission a Run waits on under Durable Approval.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionReply {
+    /// The call runs, this once.
+    AllowOnce,
+    /// The call runs, and a persistent Allow rule is saved in the user's settings for `rule`:
+    /// the tool's name or, for an MCP tool, `mcp__<server>`; without one, for this call's input.
+    /// Those settings are kept per working directory, so a Chat without a Folder refuses it.
+    AllowAlways { rule: Option<String> },
+    /// The call does not run: the model reads the denial, with `comment` when given. Without a
+    /// comment the Run ends there, as after any bare denial.
+    Deny { comment: Option<String> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -385,7 +406,7 @@ impl TurnOp {
             Self::ReplacePrompt { .. } => InputOp::ReplacePrompt,
             Self::RegenerateAnswer { .. } => InputOp::RegenerateAnswer,
             Self::Skill { .. } => InputOp::Skill,
-            Self::Answer { .. } => InputOp::Answer,
+            Self::Answer { .. } | Self::AnswerPermission { .. } => InputOp::Answer,
             Self::Deliver { .. } => InputOp::Feedback,
         }
     }
@@ -465,6 +486,11 @@ impl Agent {
                     .reply_to_question(chat_id, request, reply, Some(ledger))
                     .await;
             }
+            TurnOp::AnswerPermission { request, reply } => {
+                return self
+                    .reply_to_permission(chat_id, request, reply, Some(ledger))
+                    .await;
+            }
             TurnOp::Deliver { delivery } => {
                 return self.take_delivery(chat_id, delivery, ledger).await;
             }
@@ -492,7 +518,10 @@ impl Agent {
                 self.submit_skill(chat_id, skill, host_context, ledger, turn)
                     .await
             }
-            TurnOp::RegenerateAnswer { .. } | TurnOp::Answer { .. } | TurnOp::Deliver { .. } => {
+            TurnOp::RegenerateAnswer { .. }
+            | TurnOp::Answer { .. }
+            | TurnOp::AnswerPermission { .. }
+            | TurnOp::Deliver { .. } => {
                 unreachable!("regenerated, answered or delivered above")
             }
         };
@@ -1426,6 +1455,7 @@ fn waiting_member(chats: &HashMap<ChatId, Chat>, chat: &Chat, run: RunId) -> Opt
             })
             .collect(),
         tickloop_harness_transcript::WaitKind::Question { .. }
+        | tickloop_harness_transcript::WaitKind::Permission { .. }
         | tickloop_harness_transcript::WaitKind::Handover => Vec::new(),
     };
     runs.into_iter().find_map(|(member, run)| {

@@ -70,8 +70,17 @@ impl Redactor {
         {
             return None;
         }
+        #[cfg(feature = "test-support")]
+        super::test_pauses::wait(
+            super::test_pauses::PausePoint::RedactorBuild,
+            &entry.config.name,
+        );
         let matcher = SecretRedactor::new(&secrets);
         Some(Self { secrets, matcher })
+    }
+    /// Whether the redactor redacts `secret`.
+    pub(super) fn covers(&self, secret: &str) -> bool {
+        self.secrets.contains(secret)
     }
     pub(super) fn redact(&self, content: String) -> String {
         self.matcher.redact(content)

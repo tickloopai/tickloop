@@ -1244,6 +1244,7 @@ mod feedback_admission_tests {
                 task_tools: None,
                 waits: WaitHosting::Durable,
                 citation_style: Default::default(),
+                auto_review_model: Default::default(),
                 system_prompt_addition: None,
                 request_gates: Vec::new(),
                 time_zone: None,

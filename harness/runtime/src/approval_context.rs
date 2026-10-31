@@ -495,7 +495,9 @@ pub(super) struct ApprovalSnapshot {
     pub review_template_version: &'static str,
     pub operation: ApprovalOperation,
     pub original_user_inputs: Vec<OriginalUserInput>,
-    pub working_directory: PathBuf,
+    /// The Folder the call is reviewed in; a remote call in a Chat without one names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<PathBuf>,
     pub additional_directories: Vec<PathBuf>,
     /// Other linked worktrees of the working directory's repository, verified from its git
     /// metadata: checkouts of the same repository, not other repositories.
@@ -764,7 +766,7 @@ pub(super) fn capture(
     operation: &OperationRecord,
     root_goal: Option<&GoalSnapshot>,
     legacy: Option<Vec<OriginalUserInput>>,
-    folder: &std::path::Path,
+    folder: Option<&std::path::Path>,
     auto_policy: AutoPolicy,
 ) -> Result<ApprovalSnapshot, ApprovalContextError> {
     let originals = originals_for_active_chain_with_legacy(
@@ -838,20 +840,22 @@ pub(super) fn capture(
                 })
             })
             .collect(),
-        dependency_files: bookkeeping.dependency_baseline.as_ref().map(|baseline| {
-            let current = dependency_fingerprints(folder);
-            baseline
-                .keys()
-                .chain(current.keys())
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .map(|path| DependencyEvidence {
-                    path: path.clone(),
-                    unchanged_since_loop_start: baseline.get(path).is_some()
-                        && baseline.get(path) == current.get(path),
-                })
-                .collect()
-        }),
+        dependency_files: folder.zip(bookkeeping.dependency_baseline.as_ref()).map(
+            |(folder, baseline)| {
+                let current = dependency_fingerprints(folder);
+                baseline
+                    .keys()
+                    .chain(current.keys())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .map(|path| DependencyEvidence {
+                        path: path.clone(),
+                        unchanged_since_loop_start: baseline.get(path).is_some()
+                            && baseline.get(path) == current.get(path),
+                    })
+                    .collect()
+            },
+        ),
         prepared_facts: None,
         creation_receipt: None,
         scheduled_task,
@@ -867,9 +871,9 @@ pub(super) fn capture(
                 .unwrap_or(Value::Null),
         },
         original_user_inputs,
-        working_directory: folder.to_path_buf(),
+        working_directory: folder.map(std::path::Path::to_path_buf),
         additional_directories: snapshot.additional_directories.clone(),
-        same_repository_worktrees: sibling_linked_worktrees(folder),
+        same_repository_worktrees: folder.map(sibling_linked_worktrees).unwrap_or_default(),
         permission_policy_revision: snapshot.policy.revision,
         auto_policy,
     })

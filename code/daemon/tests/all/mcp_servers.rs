@@ -739,6 +739,7 @@ async fn worker_picks_up_a_login_saved_after_startup() {
     let held = credentials.lock().await.unwrap();
     credentials
         .save(&ConnectorCredential {
+            login: None,
             server_url: server.url(),
             resource: None,
             registration: ClientRegistration {

@@ -6,8 +6,12 @@ mod process;
 mod provider;
 mod redaction;
 mod snapshot;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_pauses;
 use crate::{host_tools::HostCallResult, mcp_http::McpHttpClient};
 use base64::Engine;
+pub use catalog::tool_names as mcp_tool_names;
 use connection::{
     Attempt, Served, authentication_rejected, connect, reconnect_delay, serve, tool_list_key,
 };
@@ -15,6 +19,7 @@ pub use provider::{McpConfiguration, McpToolProvider};
 use rmcp::{RoleClient, model::CallToolRequestParams};
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -23,6 +28,7 @@ use std::{
     },
     time::Duration,
 };
+use tickloop_harness_base::network::Reach;
 use tickloop_harness_protocol::{
     ToolDefinition, ToolResult,
     mcp::{McpServerConfig, McpTransport},
@@ -32,9 +38,51 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Copy, Default)]
 pub struct HostCapabilities {
     pub local_processes: bool,
+    /// Which addresses remote servers may be reached at; the default reaches anywhere. With
+    /// [`Reach::PublicAddresses`] the Harness logs in to no server itself, since a login's
+    /// authorization server is not checked against it: such a server uses a [`HostBearer`] or a
+    /// configured Authorization header.
+    pub reach: Reach,
 }
 
-use tickloop_harness_connector::{AccessToken, Connector, OAuthSettings, TokenError};
+/// A host's login to one remote MCP Server, kept outside the Harness: the Harness asks for the
+/// current access token before each request, and never holds a refresh token or renews the
+/// login itself. Shaped like the Artifacts credential source.
+#[async_trait::async_trait]
+pub trait HostBearer: Send + Sync {
+    /// Who the tokens act for, as the host knows it: the same while tokens renew, different for
+    /// another account. It never contains a token.
+    fn account(&self) -> String;
+
+    /// The current access token; `None` when the user has to log in again.
+    async fn bearer(&self) -> Result<Option<String>, BearerUnavailable>;
+
+    /// Rejects this specific token, so a delayed 401 cannot evict a newer token.
+    async fn invalidate(&self, _rejected_token: &str) -> Result<(), BearerUnavailable> {
+        Ok(())
+    }
+}
+
+/// The host could not answer for its login right now; a later attempt may succeed.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("MCP credential unavailable")]
+pub struct BearerUnavailable;
+
+/// A server's [`HostBearer`] with what its entry keeps about it.
+struct Bearer {
+    source: Arc<dyn HostBearer>,
+    account: String,
+    /// The token the server refused last, kept so that the host offering it again does not
+    /// connect the server again.
+    rejected: Arc<RwLock<Option<Arc<str>>>>,
+}
+impl Bearer {
+    fn was_rejected(&self, token: &str) -> bool {
+        self.rejected.read().unwrap().as_deref() == Some(token)
+    }
+}
+
+use tickloop_harness_connector::{AccessToken, Connector, OAuthSettings, SavedToken, TokenError};
 pub use tickloop_harness_connector::{
     ConnectorCredential, ConnectorCredentials, InMemoryCredentials,
 };
@@ -65,6 +113,11 @@ const MAX_SERVER_TEXT_CHARACTERS: usize = 2048;
 const RESOURCES_UNAVAILABLE: &str = "MCP resources unavailable";
 const CONNECTION_CLOSED: &str = "MCP connection closed";
 const CONNECTION_TIMED_OUT: &str = "MCP connection timed out";
+/// Why a call is not sent: its server said its tools changed, and they could not be listed again.
+const TOOLS_UNLISTED: &str =
+    "MCP tool directory changed and could not be listed again; call not dispatched";
+/// Why an admitted call was not sent: its tool's declaration changed after it was decided.
+const DECLARATION_CHANGED: &str = "the MCP tool's declaration changed before dispatch, so the call was not sent; call the tool again to have it decided under its new declaration";
 const CONNECTION_UNAVAILABLE: &str = "MCP connection is unavailable";
 const TOOLS_RELIST_FAILED: &str =
     "MCP tools could not be listed again; the last listed tools remain";
@@ -78,6 +131,10 @@ struct Connection {
     /// `None` when the server does not provide resources.
     resources: Option<ResourceDirectory>,
     warnings: RwLock<Vec<String>>,
+    /// The server said its tools changed and they could not be listed again: the tools it
+    /// listed before are shown still, but no call of them is sent until a listing succeeds or
+    /// the server connects again.
+    is_unlisted: AtomicBool,
     /// Cancelled when a call finds the connection unusable, so that it is opened again.
     lost: CancellationToken,
 }
@@ -134,6 +191,10 @@ struct Entry {
     catalog_micros: Arc<AtomicU64>,
     redactor_builds: Arc<AtomicU64>,
     config: McpServerConfig,
+    /// Who admits a call no rule decides under Durable Approval: the configuration's at first,
+    /// then the host's latest choice, which takes effect from the next call without
+    /// reconnecting.
+    unruled: RwLock<tickloop_harness_protocol::mcp::McpUnruled>,
     /// How the tools reach the model: the configuration's at first, then the user's latest
     /// choice, which takes effect without reconnecting.
     exposure: RwLock<snapshot::Exposure>,
@@ -141,6 +202,16 @@ struct Entry {
     credential: RwLock<Option<ConnectorCredential>>,
     credentials: Option<Arc<dyn ConnectorCredentials>>,
     connector: Option<Connector>,
+    bearer: Option<Bearer>,
+    /// Held while the entry takes up a token with its login, from the check that it may to the
+    /// token on the connection: a renewal begun under one login never reaches a connection a
+    /// new connection's other login has meanwhile replaced.
+    login_switch: std::sync::Mutex<()>,
+    /// Stands for the account behind a saved login that does not name its login: unique to
+    /// this entry and drawn again when it takes up another such login, so an approval bound to
+    /// it never outlives the process or the login.
+    unnamed_login: RwLock<String>,
+    reach: Reach,
     environment_secrets: Vec<String>,
     credential_secrets: RwLock<Vec<String>>,
     tool_schemas: RwLock<BTreeMap<String, Value>>,
@@ -186,15 +257,101 @@ impl Entry {
     }
 
     /// Whether a changed saved login can replace the token on the open connection instead of
-    /// connecting again: the same account at the same address, still logged in.
+    /// connecting again: the same login at the same address, still logged in.
     fn renews_in_place(&self, credential: Option<&ConnectorCredential>) -> bool {
-        let current = self.credential.read().unwrap();
         *self.state.read().unwrap() == McpServerState::Connected
             && self.connector.is_some()
-            && matches!((current.as_ref(), credential), (Some(current), Some(next))
-                if current.server_url == next.server_url
+            && credential.is_some_and(|next| next.token.is_some() && self.takes_up(next))
+    }
+
+    /// Whether this entry may take up `next`, the saved login a token was read with: the login
+    /// it holds, as the login's name shows, or, for a login without a name, exactly as it holds
+    /// it. Any other login, perhaps of another account, needs an entry of its own, so that
+    /// nothing prepared under this one goes out under it.
+    fn takes_up(&self, next: &ConnectorCredential) -> bool {
+        self.credential
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|current| {
+                current.server_url == next.server_url
                     && current.registration == next.registration
-                    && next.token.is_some())
+                    && match (&current.login, &next.login) {
+                        (Some(current_login), Some(next_login)) => current_login == next_login,
+                        _ => current == next,
+                    }
+            })
+    }
+
+    /// Takes up `saved`, a token with the login it was read with, when this entry may: the
+    /// login and the token together, and the token on `started_on`, the connection the renewal
+    /// began on, while it is still the entry's. `false` leaves everything as it was.
+    fn take_up_token(&self, saved: SavedToken, started_on: Option<&Connection>) -> bool {
+        let _switch = self.login_switch.lock().unwrap();
+        if !self.takes_up(&saved.credential) {
+            return false;
+        }
+        let secret = saved.token.secret().to_owned();
+        self.remember_credential(Some(saved.credential));
+        self.remember_token(saved.token);
+        if let Some(started_on) = started_on
+            && self
+                .connection
+                .read()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|current| std::ptr::eq(current, started_on))
+            && let Some(http) = &started_on.http
+        {
+            http.set_token(&secret);
+        }
+        true
+    }
+
+    /// The connection `started_on` lost its login: the server waits for a new one, unless the
+    /// entry connected again meanwhile, perhaps with another login, which a stale failure must
+    /// not undo. Decided under the login switch, as a new connection publishes itself under it.
+    /// `false` when the entry has moved on.
+    fn needs_login_on(&self, started_on: &Connection) -> bool {
+        let _switch = self.login_switch.lock().unwrap();
+        let is_current = self
+            .connection
+            .read()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|current| std::ptr::eq(current, started_on));
+        if is_current {
+            *self.state.write().unwrap() = McpServerState::NeedsLogin;
+        }
+        is_current
+    }
+
+    /// Takes up the saved login `credential` without a token to send, such as one renewed
+    /// elsewhere or with its token deleted, when it is still the entry's own login. The check
+    /// is made again under the login switch, so a login a new connection took up meanwhile is
+    /// never set back to an older one. `false` leaves the entry as it was.
+    fn take_up_credential(&self, credential: ConnectorCredential) -> bool {
+        let _switch = self.login_switch.lock().unwrap();
+        if !self.takes_up(&credential) {
+            return false;
+        }
+        if self.credential.read().unwrap().as_ref() != Some(&credential) {
+            self.remember_credential(Some(credential));
+        }
+        true
+    }
+
+    /// Takes up `saved` for a new connection, whatever login it belongs to: another login than
+    /// the entry's changes what every call reaches ([`Self::call_target`]), so nothing prepared
+    /// or allowed under the old one goes out under it, as a login that does not name itself
+    /// cannot show it is the same one.
+    fn adopt_token(&self, saved: SavedToken) {
+        let _switch = self.login_switch.lock().unwrap();
+        if !self.takes_up(&saved.credential) && saved.credential.login.is_none() {
+            *self.unnamed_login.write().unwrap() = tickloop_ids::generate().to_string();
+        }
+        self.remember_credential(Some(saved.credential));
+        self.remember_token(saved.token);
     }
 
     fn token_expires_soon(&self) -> bool {
@@ -210,8 +367,44 @@ impl Entry {
             })
     }
 
+    /// What a call of `tool` reaches, without any token: the server's configuration, the
+    /// account behind its login and the tool as the server listed it. Renewing or rotating a
+    /// token keeps it; another address, account or tool definition changes it. The host's login
+    /// counts by its account, a saved login by the login it names; a saved login that names
+    /// none cannot show it is the same account, so its target holds in this entry alone.
+    fn call_target(&self, tool: &snapshot::Tool) -> String {
+        let mut hash = Sha256::new();
+        hash.update(serde_json::to_vec(&server_identity(&self.config)).unwrap_or_default());
+        hash.update([0]);
+        if let Some(bearer) = &self.bearer {
+            hash.update(b"host:");
+            hash.update(bearer.account.as_bytes());
+        } else if let Some(credential) = self
+            .credential
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|credential| credential.token.is_some())
+        {
+            hash.update(b"login:");
+            match &credential.login {
+                Some(login) => hash.update(login.as_bytes()),
+                None => hash.update(self.unnamed_login.read().unwrap().as_bytes()),
+            }
+        }
+        hash.update([0]);
+        hash.update(tool.fingerprint);
+        format!("{:x}", hash.finalize())
+    }
+
     fn offers_tools(&self) -> bool {
         self.exposure().offers_tools()
+    }
+
+    /// Whether a login stands behind its token, the Harness's own or the host's, so that a
+    /// rejected token waits for a login instead of connecting again.
+    fn logs_in(&self) -> bool {
+        self.connector.is_some() || self.bearer.is_some()
     }
 
     fn restore_tool_schemas(
@@ -281,6 +474,27 @@ impl Entry {
         self.refresh_redactor();
     }
 
+    /// Redacts a token of the host's from now on: it returns only once the installed redactor
+    /// covers the token, so that a request sending it never meets an echo the redactor misses,
+    /// even while another request is still installing the redactor for the same token.
+    fn remember_host_token(&self, token: &str) {
+        if self
+            .redactor
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|redactor| redactor.covers(token))
+        {
+            return;
+        }
+        let mut secrets = self.credential_secrets.write().unwrap();
+        if !secrets.iter().any(|secret| secret == token) {
+            secrets.push(token.to_owned());
+        }
+        drop(secrets);
+        self.refresh_redactor();
+    }
+
     fn refresh_redactor(&self) {
         let changed = {
             let _publication = self.publication.lock().unwrap();
@@ -305,9 +519,9 @@ impl Entry {
 }
 struct PreparedMcpCall {
     entry: Arc<Entry>,
-    connection: Arc<Connection>,
+    /// What the call reached when it was prepared, as [`Entry::call_target`] names it.
+    target: String,
     tool: Arc<snapshot::Tool>,
-    generation: u64,
     input: Value,
 }
 /// Which unchanged servers a reconcile connects again.
@@ -326,6 +540,7 @@ struct Inner {
     redactor_builds: Arc<AtomicU64>,
     capabilities: HostCapabilities,
     credentials: RwLock<BTreeMap<String, Arc<dyn ConnectorCredentials>>>,
+    bearers: RwLock<BTreeMap<String, Arc<dyn HostBearer>>>,
     environment: BTreeMap<String, String>,
     stderr_directory: Option<tickloop_harness_base::private_fs::PrivateDirectory>,
     entries: RwLock<BTreeMap<String, Arc<Entry>>>,
@@ -357,6 +572,7 @@ impl McpConnections {
                 redactor_builds: Arc::new(AtomicU64::new(0)),
                 capabilities,
                 credentials: RwLock::new(credentials),
+                bearers: RwLock::default(),
                 environment,
                 stderr_directory: None,
                 entries: RwLock::new(BTreeMap::new()),
@@ -469,34 +685,29 @@ impl McpConnections {
             let Some(connector) = &entry.connector else {
                 return;
             };
+            let started_on = entry.connection.read().unwrap().clone();
             let token = tokio::select! {
                 _ = entry.cancel.cancelled() => return,
-                token = connector.access_token(&entry.cancel) => token,
+                token = connector.saved_access_token(&entry.cancel) => token,
             };
-            if let Some(credentials) = &entry.credentials
-                && let Ok(credential) = credentials.load().await
-            {
-                entry.remember_credential(credential);
-            }
             match token {
-                Ok(token) => {
-                    if let Some(http) = entry
-                        .connection
-                        .read()
-                        .unwrap()
-                        .as_ref()
-                        .and_then(|connection| connection.http.as_ref())
-                    {
-                        http.set_token(token.secret());
-                    }
-                    entry.remember_token(token);
+                // Another login waits for the next reconcile to give it an entry of its own.
+                Ok(saved) => {
+                    #[cfg(feature = "test-support")]
+                    test_pauses::wait(test_pauses::PausePoint::Renewal, &entry.config.name);
+                    entry.take_up_token(saved, started_on.as_deref());
                 }
                 Err(TokenError::NeedsLogin) => {
-                    *entry.state.write().unwrap() = McpServerState::NeedsLogin;
-                    state_changed.notify_waiters();
+                    connection::remember_invalidation(&entry).await;
+                    if started_on
+                        .as_deref()
+                        .is_some_and(|started_on| entry.needs_login_on(started_on))
+                    {
+                        state_changed.notify_waiters();
+                    }
                 }
                 // A later request tries again; the server rejects an expired token meanwhile.
-                Err(_) => {}
+                Err(_) => connection::remember_invalidation(&entry).await,
             }
             entry.renewing.store(false, Ordering::SeqCst);
         });
@@ -514,6 +725,14 @@ impl McpConnections {
     /// Replaces the host's credential adapters before reconciling a fresh configuration.
     pub fn set_credentials(&self, credentials: BTreeMap<String, Arc<dyn ConnectorCredentials>>) {
         *self.inner.credentials.write().unwrap() = credentials;
+    }
+
+    /// Replaces the host's logins, by server name, before reconciling a fresh configuration. A
+    /// remote server without a configured Authorization header uses its host login instead of
+    /// a Connector login of the Harness. Its connection stays open while the host renews the
+    /// token; a different login object for the server connects it again.
+    pub fn set_bearers(&self, bearers: BTreeMap<String, Arc<dyn HostBearer>>) {
+        *self.inner.bearers.write().unwrap() = bearers;
     }
 
     /// Takes up `configs`, connecting the servers that changed. Failed servers stay failed until
@@ -553,12 +772,23 @@ impl McpConnections {
                         .into(),
                 };
             }
+            let accepts_login = matches!(&config.transport, McpTransport::Http { headers, .. }
+                if !headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("authorization")));
+            let bearer = self
+                .inner
+                .bearers
+                .read()
+                .unwrap()
+                .get(&config.name)
+                .filter(|_| accepts_login)
+                .cloned();
+            let harness_logs_in = accepts_login
+                && bearer.is_none()
+                && self.inner.capabilities.reach == Reach::Anywhere;
             let (connector, credentials, credential, credential_failure) = match &config.transport {
-                McpTransport::Http { url, headers }
-                    if !headers
-                        .keys()
-                        .any(|key| key.eq_ignore_ascii_case("authorization")) =>
-                {
+                McpTransport::Http { url, .. } if harness_logs_in => {
                     let credentials = self
                         .inner
                         .credentials
@@ -613,16 +843,52 @@ impl McpConnections {
                 .filter(|entry| connects_alike(&entry.config, &config))
                 .map(|entry| entry.legacy.clone())
                 .unwrap_or_default();
+            let previous_bearer = existing
+                .as_ref()
+                .and_then(|entry| entry.bearer.as_ref())
+                .filter(|previous| {
+                    bearer
+                        .as_ref()
+                        .is_some_and(|bearer| Arc::ptr_eq(&previous.source, bearer))
+                });
+            let host_logged_in_again = match previous_bearer {
+                Some(previous)
+                    if existing.as_ref().is_some_and(|entry| {
+                        *entry.state.read().unwrap() == McpServerState::NeedsLogin
+                    }) =>
+                {
+                    matches!(previous.source.bearer().await,
+                        Ok(Some(token)) if !previous.was_rejected(&token))
+                }
+                _ => false,
+            };
+            let rejected_bearer = previous_bearer
+                .map(|previous| previous.rejected.read().unwrap().clone())
+                .unwrap_or_default();
+            let same_bearer = previous_bearer.is_some()
+                || bearer.is_none()
+                    && existing
+                        .as_ref()
+                        .is_some_and(|entry| entry.bearer.is_none());
             let entry = if let Some(entry) = existing.filter(|entry| {
                 restart != Restart::Server(config.name.as_str())
                     && connects_alike(&entry.config, &config)
+                    && same_bearer
+                    && !host_logged_in_again
                     && (*entry.credential.read().unwrap() == credential
                         || entry.renews_in_place(credential.as_ref()))
             }) {
-                if *entry.credential.read().unwrap() != credential {
-                    entry.remember_credential(credential);
-                    self.renew_in_place(entry.clone()).await;
+                if *entry.credential.read().unwrap() != credential
+                    && let Some(credential) = credential
+                {
+                    #[cfg(feature = "test-support")]
+                    test_pauses::wait(test_pauses::PausePoint::Reconcile, &entry.config.name);
+                    // A login a new connection took up meanwhile is kept, not set back.
+                    if entry.take_up_credential(credential) {
+                        self.renew_in_place(entry.clone()).await;
+                    }
                 }
+                *entry.unruled.write().unwrap() = config.unruled;
                 if entry.change_exposure(snapshot::Exposure::of(&config)) {
                     *self
                         .inner
@@ -659,7 +925,12 @@ impl McpConnections {
                     })
                     .map(|(_, value)| value.clone())
                     .collect();
-                let tool_list_key = tool_list_key(&config, credential.as_ref());
+                let bearer = bearer.map(|source| Bearer {
+                    account: source.account(),
+                    source,
+                    rejected: Arc::new(RwLock::new(rejected_bearer)),
+                });
+                let tool_list_key = tool_list_key(&config, credential.as_ref(), bearer.as_ref());
                 let cached = self
                     .inner
                     .tool_lists
@@ -686,6 +957,7 @@ impl McpConnections {
                     catalog_micros: self.inner.catalog_micros.clone(),
                     redactor_builds: self.inner.redactor_builds.clone(),
                     exposure: RwLock::new(snapshot::Exposure::of(&config)),
+                    unruled: RwLock::new(config.unruled),
                     config,
                     token: RwLock::new(None),
                     credential: RwLock::new(None),
@@ -693,6 +965,10 @@ impl McpConnections {
                     tool_schemas: RwLock::new(BTreeMap::new()),
                     credentials,
                     connector,
+                    bearer,
+                    login_switch: std::sync::Mutex::new(()),
+                    unnamed_login: RwLock::new(tickloop_ids::generate().to_string()),
+                    reach: self.inner.capabilities.reach,
                     environment_secrets,
                     state: RwLock::new(state),
                     connection: RwLock::new(None),
@@ -816,6 +1092,48 @@ impl McpConnections {
             .filter(|(server, _, _)| server == name)
             .map(|(_, event, at)| (*event, *at))
             .collect()
+    }
+    /// Drops the server `name`'s open connection, as a network failure would; it connects again
+    /// on its own.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn drop_connection_of(&self, name: &str) {
+        let entry = self.inner.entries.read().unwrap().get(name).cloned();
+        if let Some(connection) = entry.and_then(|entry| entry.connection.read().unwrap().clone()) {
+            connection.lost.cancel();
+        }
+    }
+    /// The saved login the server `name`'s entry holds.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn saved_login_of(&self, name: &str) -> Option<ConnectorCredential> {
+        let entry = self.inner.entries.read().unwrap().get(name).cloned()?;
+        entry.credential.read().unwrap().clone()
+    }
+    /// Remembers the server `name`'s saved login as after its token could not be used.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn remember_invalidation_of(&self, name: &str) {
+        let entry = self.inner.entries.read().unwrap().get(name).cloned();
+        if let Some(entry) = entry {
+            connection::remember_invalidation(&entry).await;
+        }
+    }
+    /// Takes up the host's token `token` for the server `name` as a request about to send it
+    /// does.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn send_host_token(&self, name: &str, token: &str) {
+        if let Some(entry) = self.inner.entries.read().unwrap().get(name).cloned() {
+            entry.remember_host_token(token);
+        }
+    }
+    /// `text` as the server `name`'s redactor leaves it now.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn redact_for(&self, name: &str, text: &str) -> String {
+        let entry = self.inner.entries.read().unwrap().get(name).cloned();
+        entry.map_or_else(String::new, |entry| redact(&entry, text.to_owned()))
     }
     #[cfg(feature = "test-support")]
     pub fn performance_counts(&self) -> (u64, u64) {
@@ -955,7 +1273,7 @@ impl McpConnections {
                 let state = entry.state.read().unwrap().clone();
                 let (transport, oauth) = match &entry.config.transport {
                     McpTransport::Stdio { .. } => ("stdio".to_owned(), false),
-                    McpTransport::Http { .. } => ("http".to_owned(), entry.connector.is_some()),
+                    McpTransport::Http { .. } => ("http".to_owned(), entry.logs_in()),
                     McpTransport::Unsupported { kind } => (kind.clone(), false),
                     McpTransport::NeedsConfiguration | McpTransport::Failed { .. } => {
                         (String::new(), false)
@@ -981,7 +1299,11 @@ impl McpConnections {
                         .collect(),
                     failure,
                     oauth,
-                    logged_in: oauth && entry.has_saved_token(),
+                    logged_in: if entry.bearer.is_some() {
+                        state != McpServerState::NeedsLogin
+                    } else {
+                        oauth && entry.has_saved_token()
+                    },
                     state,
                 }
             })
@@ -1018,7 +1340,8 @@ impl McpConnections {
             .collect()
     }
     /// Resolves a call against the current tools. While the tool's server connects or connects
-    /// again, the call waits for it, at most for the connection timeout and until cancelled.
+    /// again, or lists its tools again after it said they changed, the call waits for it, at most
+    /// for the connection timeout and until cancelled.
     async fn prepare_ready(
         &self,
         name: &str,
@@ -1048,12 +1371,26 @@ impl McpConnections {
                 .unwrap()
                 .clone()
                 .filter(|connection| !connection.lost.is_cancelled());
+            // A call is prepared against the tools as the server last said they are: a list
+            // change being listed again is waited for, so the call is decided under it.
+            let is_listing = connection.as_ref().is_some_and(|connection| {
+                connection.revision.load(Ordering::SeqCst)
+                    != connection.catalog_revision.load(Ordering::SeqCst)
+            });
+            // No call is prepared against tools the server said changed and that could not be
+            // listed again.
+            if !is_listing
+                && connection
+                    .as_ref()
+                    .is_some_and(|connection| connection.is_unlisted.load(Ordering::SeqCst))
+            {
+                return Err(TOOLS_UNLISTED.into());
+            }
             match (state, connection) {
-                (McpServerState::Connected, Some(connection)) => {
+                (McpServerState::Connected, Some(_)) if !is_listing => {
                     return Ok(PreparedMcpCall {
-                        generation: tool.generation,
+                        target: entry.call_target(&tool),
                         entry,
-                        connection,
                         tool,
                         input,
                     });
@@ -1069,7 +1406,15 @@ impl McpConnections {
             }
         }
     }
-    fn revalidate(&self, call: &PreparedMcpCall) -> Result<(), String> {
+    /// Checks a prepared call again just before it is sent, and gives the connection to send it
+    /// on. Only what decides what the call does counts: the server's entry, which stands for its
+    /// configuration and the account it reaches, and the tool as the call was prepared against.
+    /// A renewed or rotated token, which republishes the catalog, or a connection made again to
+    /// the same server, leaves a call prepared before it valid, as a call may wait long for its
+    /// approval.
+    fn revalidate(&self, call: &PreparedMcpCall) -> Result<Arc<Connection>, String> {
+        #[cfg(feature = "test-support")]
+        test_pauses::wait(test_pauses::PausePoint::Revalidate, &call.entry.config.name);
         if call.entry.cancel.is_cancelled()
             || !self
                 .inner
@@ -1081,33 +1426,42 @@ impl McpConnections {
         {
             return Err("MCP configuration changed before dispatch".into());
         }
-        if call.connection.lost.is_cancelled()
-            || !call
-                .entry
-                .connection
-                .read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|connection| Arc::ptr_eq(connection, &call.connection))
-        {
-            return Err("MCP connection changed before dispatch".into());
-        }
-        if call.connection.revision.load(Ordering::SeqCst)
-            != call.connection.catalog_revision.load(Ordering::SeqCst)
+        let connection = call
+            .entry
+            .connection
+            .read()
+            .unwrap()
+            .clone()
+            .filter(|connection| {
+                !connection.lost.is_cancelled()
+                    && *call.entry.state.read().unwrap() == McpServerState::Connected
+            })
+            .ok_or("MCP connection changed before dispatch")?;
+        if connection.revision.load(Ordering::SeqCst)
+            != connection.catalog_revision.load(Ordering::SeqCst)
         {
             return Err("MCP tool directory changed before dispatch".into());
         }
-        let current = call.entry.snapshot.read().unwrap().clone();
-        if current.generation != call.generation
-            || current.secret_generation != call.entry.secret_generation.load(Ordering::SeqCst)
-            || !current
-                .tools
-                .get(&call.tool.definition.name)
-                .is_some_and(|tool| tool.fingerprint == call.tool.fingerprint)
-        {
-            return Err("MCP tool changed before dispatch".into());
+        if connection.is_unlisted.load(Ordering::SeqCst) {
+            return Err(TOOLS_UNLISTED.into());
         }
-        Ok(())
+        let current = call.entry.snapshot.read().unwrap().clone();
+        if !current
+            .tools
+            .get(&call.tool.definition.name)
+            .is_some_and(|tool| {
+                call.entry.call_target(tool) == call.target
+                    && tool.exposure != tickloop_harness_protocol::mcp::ToolExposure::Hidden
+            })
+        {
+            // The same login reaches a tool whose declaration changed: the call was decided under
+            // the old one, so it is decided again when the model calls the tool again.
+            if call.entry.call_target(&call.tool) == call.target {
+                return Err(DECLARATION_CHANGED.into());
+            }
+            return Err("MCP tool or login changed before dispatch".into());
+        }
+        Ok(connection)
     }
     pub async fn call(
         &self,
@@ -1121,15 +1475,12 @@ impl McpConnections {
         }
     }
     async fn dispatch(&self, call: PreparedMcpCall, cancel: CancellationToken) -> HostCallResult {
-        if let Err(error) = self.revalidate(&call) {
-            return HostCallResult::NotDispatched(error);
-        }
+        let connection = match self.revalidate(&call) {
+            Ok(connection) => connection,
+            Err(error) => return HostCallResult::NotDispatched(error),
+        };
         let PreparedMcpCall {
-            entry,
-            connection,
-            tool,
-            input,
-            generation: _,
+            entry, tool, input, ..
         } = call;
         if cancel.is_cancelled() || entry.cancel.is_cancelled() {
             return HostCallResult::NotDispatched("MCP call cancelled before dispatch".into());
@@ -1342,7 +1693,16 @@ fn connects_alike(current: &McpServerConfig, next: &McpServerConfig) -> bool {
     let mut next = next.clone();
     next.exposure = current.exposure;
     next.tool_exposure.clone_from(&current.tool_exposure);
+    next.unruled = current.unruled;
     *current == next
+}
+
+/// `config` as it names what the server is: who admits its unruled calls is no part of it.
+pub(super) fn server_identity(config: &McpServerConfig) -> McpServerConfig {
+    McpServerConfig {
+        unruled: Default::default(),
+        ..config.clone()
+    }
 }
 
 fn redacted_resources(entry: &Entry, mut resources: Vec<Value>) -> Vec<Value> {

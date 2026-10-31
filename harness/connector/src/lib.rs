@@ -1,14 +1,17 @@
 //! The Connector of a remote MCP Server that requires OAuth: logging in (discovery from the
 //! server's 401 challenge or a configured metadata address, dynamic registration of a public
-//! client or a configured client id, authorization code with S256 PKCE received on this machine
-//! or pasted back), handing out and renewing the access token, and logging out.
+//! client or a configured client id, authorization code with S256 PKCE received on this machine,
+//! pasted back, or received by the host at its own redirect address), handing out and renewing
+//! the access token, and logging out.
 //!
-//! The host supplies where the credential lives through [`ConnectorCredentials`]. Tokens never
-//! appear in errors or `Debug` output.
+//! The host supplies where the credential lives through [`ConnectorCredentials`], and may limit
+//! every request to public addresses with [`Connector::with_reach`]. Tokens never appear in
+//! errors or `Debug` output.
 
 mod credentials;
 mod http;
 mod login;
+mod server_login;
 mod tokens;
 
 use std::fmt;
@@ -16,6 +19,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use reqwest::Url;
+pub use tickloop_harness_base::network::Reach;
 use tickloop_harness_base::network::is_loopback;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument::WithSubscriber;
@@ -25,9 +29,10 @@ pub use credentials::{
     InMemoryCredentials,
 };
 pub use login::{LoginError, PendingLogin};
+pub use server_login::PendingServerLogin;
 pub use tick_oauth::OAuthToken;
 pub use tickloop_harness_base::oauth_callback::{CallbackError, CallbackPaste};
-pub use tokens::{Logout, TokenError};
+pub use tokens::{Logout, SavedToken, TokenError};
 
 /// The `oauth` settings of a remote server entry.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -48,6 +53,10 @@ pub enum ConfigurationError {
     MetadataAddress,
     #[error("the OAuth client id must not be empty")]
     ClientId,
+    #[error("the MCP server address must be a public https address")]
+    PublicServerAddress,
+    #[error("the authorization server metadata address must be a public https address")]
+    PublicMetadataAddress,
 }
 
 /// An access token for the server's `Authorization: Bearer` header.
@@ -104,9 +113,7 @@ impl Connector {
         {
             return Err(ConfigurationError::ClientId);
         }
-        let configured_on_this_machine =
-            is_loopback(&server_url) || metadata_url.as_ref().is_some_and(is_loopback);
-        let http = http::PolicyClient::new(server_url.clone(), configured_on_this_machine);
+        let http = policy_client(&server_url, metadata_url.as_ref(), Reach::Anywhere);
         Ok(Self {
             server_url,
             settings,
@@ -115,6 +122,35 @@ impl Connector {
             http,
         })
     }
+
+    /// Limits the addresses that discovery, registration, the code exchange, renewal and
+    /// revocation may reach; [`Reach::Anywhere`] is the default. With
+    /// [`Reach::PublicAddresses`] the configured addresses must be public https addresses, and
+    /// every request goes only to a public address, including each address a name resolves to,
+    /// without proxies or redirects.
+    pub fn with_reach(mut self, reach: Reach) -> Result<Self, ConfigurationError> {
+        if reach == Reach::PublicAddresses {
+            if !http::is_public_address(&self.server_url) {
+                return Err(ConfigurationError::PublicServerAddress);
+            }
+            if self
+                .metadata_url
+                .as_ref()
+                .is_some_and(|url| !http::is_public_address(url))
+            {
+                return Err(ConfigurationError::PublicMetadataAddress);
+            }
+        }
+        self.http = policy_client(&self.server_url, self.metadata_url.as_ref(), reach);
+        Ok(self)
+    }
+}
+
+/// This machine is reachable only when a configured address is on it.
+fn policy_client(server_url: &Url, metadata_url: Option<&Url>, reach: Reach) -> http::PolicyClient {
+    let configured_on_this_machine =
+        is_loopback(server_url) || metadata_url.is_some_and(is_loopback);
+    http::PolicyClient::new(server_url.clone(), configured_on_this_machine, reach)
 }
 
 /// The operation stopped because its cancellation token fired.

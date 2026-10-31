@@ -557,7 +557,7 @@ mod tests {
             &operation,
             None,
             None,
-            snapshot.folder.as_deref().unwrap(),
+            snapshot.folder.as_deref(),
             tickloop_harness_policy::AutoSettings::default().policy(),
         )
         .unwrap();

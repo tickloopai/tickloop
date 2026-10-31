@@ -17,6 +17,9 @@ mod durable_queue;
 #[path = "all/durable_waits.rs"]
 mod durable_waits;
 
+#[path = "all/durable_approval.rs"]
+mod durable_approval;
+
 #[path = "all/model_ids.rs"]
 mod model_ids;
 #[path = "all/retained_budget.rs"]
@@ -95,6 +98,9 @@ mod native_task_auto;
 
 #[path = "all/mcp_servers.rs"]
 mod mcp_servers;
+
+#[path = "all/mcp_host_logins.rs"]
+mod mcp_host_logins;
 
 #[path = "all/third_party_approval.rs"]
 mod third_party_approval;

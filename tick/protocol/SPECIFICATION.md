@@ -453,7 +453,7 @@ The host uses `mutates` to decide whether approval is needed before a call and w
 
 A client may show a Tick's terminal in a card beside its conversation, as the Monitor does for extension Ticks, or full screen, taking the whole terminal, as it does for a program it runs on a terminal without the protocol. `screen.min_rows` and `screen.max_rows` apply only to cards; a full-screen view gives the Tick the whole terminal but the last row, which lists the view's keys. Such a card is exactly `screen.min_rows` rows tall when it has room, and 40 columns wide unless the user narrows it. A Tick that declares `screen.max_rows` may get more rows, up to `screen.max_rows`, when the client has height to spare; a client never takes rows from another card's `min_rows` to grow one. For Ticks shown this way:
 
-- A Tick **MAY** use Esc, but **MUST NOT** require a double Esc: while a card has the keyboard, a second Esc within 300 ms of the first leaves the card and is not delivered to the Tick; in a full-screen view a second Esc within 1 second hides the view the same way. The first Esc is delivered at once.
+- A Tick **SHOULD NOT** use Esc: its back key is Backspace instead of Esc. A Tick that uses Esc anyway **MUST NOT** require a double Esc: while a card has the keyboard, a second Esc within 300 ms of the first leaves the card and is not delivered to the Tick; in a full-screen view a second Esc within 1 second hides the view the same way. The first Esc is delivered at once.
 - A Tick **SHOULD** declare key bubbling and bubble the keys listed in [Section 5.8](#s5-8) that it does not use, so the person can move to other Ticks with them.
 - A Tick **MUST** stay usable at 30 columns.
 - A Tick **MUST** redraw its whole screen after `SIGWINCH`, and **SHOULD NOT** repaint when nothing changed.
@@ -754,6 +754,6 @@ for line in sys.stdin:
 - [ ] Do not emit updates for presentation changes such as cursor movement, scrolling, or repaints.
 - [ ] Keep state within a few KiB, expose large content through query tools, and declare time series in `state.series`.
 - [ ] Stay usable at 30 columns and `screen.min_rows` rows, declare `screen.max_rows` if more rows help, and redraw the whole screen after `SIGWINCH`.
-- [ ] Never require a double Esc; declare `bubble=on` and bubble `esc`, `up`, `down`, `left`, `right`, `tab` and `backtab` whenever the Tick does not use them.
+- [ ] Use Backspace instead of Esc as the back key, and never require a double Esc; declare `bubble=on` and bubble `esc`, `up`, `down`, `left`, `right`, `tab` and `backtab` whenever the Tick does not use them.
 - [ ] Run operations longer than 60 seconds in the background and report results through updates.
 - [ ] Exit promptly on `SIGTERM` or standard-input EOF, without relying on shutdown cleanup.

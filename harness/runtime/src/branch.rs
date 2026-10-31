@@ -279,6 +279,7 @@ impl Agent {
                 parked: Default::default(),
                 releases: Default::default(),
                 ready_runs: Default::default(),
+                permission_grants: Default::default(),
                 client,
                 pending_client: None,
                 pending_model_thinking: None,

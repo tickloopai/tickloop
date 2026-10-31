@@ -874,6 +874,9 @@ fn command_input_records_follow_original_identity_through_retained_snapshots() {
             "call_id":"prepare", "name":"Bash", "input":{"command":"printf prepared"}, "state":"Completed",
             "result":{"content":"prepared","is_error":false}
         })).unwrap(),
+        status: None,
+        images: Vec::new(),
+        sources: Vec::new(),
     });
     let mut fold = RetainedFold::default();
     fold.apply(&input);

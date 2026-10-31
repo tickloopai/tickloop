@@ -1097,7 +1097,7 @@ impl Agent {
         operation: &OperationRecord,
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
-        if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt {
+        if self.other_prompt_policy() == PromptPolicy::DenyOnPrompt {
             return Err(
                 "ExitPlanMode requires user approval, but user prompts are unavailable.".into(),
             );
@@ -1127,6 +1127,8 @@ impl Agent {
                     source: PermissionApprovalSource::ExplicitAsk,
                     reason: Some("Exit plan mode without a plan".into()),
                     mcp_server: None,
+                    target: None,
+                    hooks: None,
                 },
                 cancel.clone(),
             )
@@ -1165,7 +1167,7 @@ impl Agent {
         operation: &OperationRecord,
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
-        if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt {
+        if self.other_prompt_policy() == PromptPolicy::DenyOnPrompt {
             return Err(
                 "ExitPlanMode requires user approval, but user prompts are unavailable.".into(),
             );
@@ -1222,6 +1224,8 @@ impl Agent {
                     source: PermissionApprovalSource::ExplicitAsk,
                     reason: Some("Approve the reviewed plan and choose an execution mode".into()),
                     mcp_server: None,
+                    target: None,
+                    hooks: None,
                 },
                 cancel.clone(),
             )

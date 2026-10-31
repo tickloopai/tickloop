@@ -276,8 +276,8 @@ impl RetainedFold {
                 ),
                 Line::RecordedEdit(entry) => self.chain.keeps_tool_result(&entry.call_id),
                 Line::Wait(entry) => {
-                    matches!(entry.state, WaitState::Open | WaitState::Resolved { .. })
-                        || (matches!(entry.kind, tickloop_harness_transcript::WaitKind::Question { .. })
+                    matches!(entry.state, WaitState::Open | WaitState::Resolved { .. } | WaitState::Allowed { .. })
+                        || (matches!(entry.kind, tickloop_harness_transcript::WaitKind::Question { .. } | tickloop_harness_transcript::WaitKind::Permission { .. })
                             && self.chain.responses.contains(&entry.response_id))
                 }
                 _ => false,

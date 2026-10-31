@@ -16,6 +16,7 @@ pub struct McpConfiguration {
 pub struct McpToolProvider {
     connections: McpConnections,
     configuration: Arc<dyn Fn() -> Option<McpConfiguration> + Send + Sync>,
+    guidance: crate::tool_exposure::McpGuidance,
     refresh_lock: tokio::sync::Mutex<()>,
     #[cfg(feature = "test-support")]
     configuration_parses: AtomicU64,
@@ -51,12 +52,32 @@ impl McpToolProvider {
         Self {
             connections,
             configuration,
+            guidance: crate::tool_exposure::McpGuidance::default(),
             refresh_lock: tokio::sync::Mutex::new(()),
             #[cfg(feature = "test-support")]
             configuration_parses: AtomicU64::new(0),
             current: RwLock::new(Vec::new()),
             warnings: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Replaces what the model is told to ask of the user when a server needs a login; the
+    /// guidance gets the server's name. By default the user logs in from /mcp or with
+    /// `tickloop mcp login`.
+    pub fn with_login_guidance(
+        mut self,
+        guidance: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.guidance.login = Arc::new(guidance);
+        self
+    }
+
+    /// Replaces everything the model is told of where the user manages MCP servers: the login
+    /// guidance, the place named for failed, unsupported and unconfigured servers and for a
+    /// server's exposure, and the system prompt's sentence on managing servers.
+    pub fn with_guidance(mut self, guidance: crate::tool_exposure::McpGuidance) -> Self {
+        self.guidance = guidance;
+        self
     }
 
     async fn update_configuration(&self, restart: Restart<'_>) -> Result<(), String> {
@@ -87,8 +108,12 @@ impl McpToolProvider {
     }
     fn authority(entry: &Entry) -> HostToolAuthority {
         let mut hash = Sha256::new();
-        hash.update(serde_json::to_vec(&entry.config).unwrap_or_default());
-        if let Some(token) = entry.token.read().unwrap().as_ref() {
+        hash.update(serde_json::to_vec(&server_identity(&entry.config)).unwrap_or_default());
+        // A host's login counts by its account, so that renewing its token changes nothing.
+        if let Some(bearer) = &entry.bearer {
+            hash.update([0]);
+            hash.update(bearer.account.as_bytes());
+        } else if let Some(token) = entry.token.read().unwrap().as_ref() {
             hash.update(token.secret());
         }
         HostToolAuthority::Mcp {
@@ -136,6 +161,9 @@ impl HostToolProvider for McpToolProvider {
 
     fn has_tool_search(&self) -> bool {
         true
+    }
+    fn mcp_guidance(&self) -> Option<crate::tool_exposure::McpGuidance> {
+        Some(self.guidance.clone())
     }
     fn discovery_tools(&self) -> Vec<crate::tool_exposure::ExposureTool> {
         self.connections
@@ -241,6 +269,7 @@ impl HostToolProvider for McpToolProvider {
                         entry.exposure().server,
                         &entry.description.read().unwrap(),
                         !instructions.is_empty(),
+                        &self.guidance,
                     ),
                     text: instructions,
                     server: McpResourceServer {
@@ -308,6 +337,20 @@ impl HostToolProvider for McpToolProvider {
             .connections
             .prepare_ready(name, input.clone(), &cancel)
             .await?;
+        let unruled = *call.entry.unruled.read().unwrap();
+        // The declaration this call was prepared against; its target binds the call to it.
+        let is_declared_read_only = call.tool.annotations["readOnlyHint"] == true;
+        // The reviewer learns which server and tool the call reaches, never what the server
+        // writes of its tool: a description or annotation could argue for its own approval.
+        let facts = tickloop_harness_protocol::PreparedApprovalFacts {
+            normalized_input: input.clone(),
+            external_declaration: Some(serde_json::json!({
+                "mcp_server": call.entry.config.name,
+                "tool": call.tool.definition.name,
+            })),
+            ..Default::default()
+        };
+        let is_remote = matches!(call.entry.config.transport, McpTransport::Http { .. });
         Ok(PreparedHostCall::new(
             name.into(),
             input.clone(),
@@ -316,6 +359,10 @@ impl HostToolProvider for McpToolProvider {
             format!("Call third-party MCP tool {name}"),
         )
         .with_mcp_server(call.entry.config.name.clone())
+        .with_target(call.target.clone())
+        .with_unruled(unruled, is_declared_read_only)
+        .with_remote(is_remote)
+        .with_approval_facts(facts)
         .with_payload(call))
     }
     async fn revalidate_call(
@@ -327,10 +374,12 @@ impl HostToolProvider for McpToolProvider {
         if cancel.is_cancelled() {
             return Err("MCP call cancelled before dispatch".into());
         }
-        self.connections.revalidate(
-            call.payload::<PreparedMcpCall>()
-                .ok_or("MCP prepared call missing")?,
-        )
+        self.connections
+            .revalidate(
+                call.payload::<PreparedMcpCall>()
+                    .ok_or("MCP prepared call missing")?,
+            )
+            .map(|_| ())
     }
     async fn execute_prepared(
         &self,

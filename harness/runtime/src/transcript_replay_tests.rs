@@ -251,7 +251,7 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
                 &operation,
                 None,
                 None,
-                folder,
+                Some(folder),
                 auto.policy_for_directory(folder),
             )
             .unwrap();

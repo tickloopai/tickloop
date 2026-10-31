@@ -181,7 +181,7 @@ impl Agent {
             ..operation.clone()
         };
         let assessment = self
-            .review_operation(receipt, &operation, None, cancel.clone(), false)
+            .review_operation(receipt, &operation, None, cancel.clone(), false, false)
             .await
             .map_err(|error| error.to_string())?;
         self.refresh_project_rules(receipt.chat_id)

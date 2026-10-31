@@ -27,6 +27,15 @@ impl ToolHookFeedback {
         self.0.extend(other.0);
     }
 
+    /// Feedback a call's hooks gave earlier, as its wait kept it.
+    pub(crate) fn kept(lines: Vec<String>) -> Self {
+        Self(lines)
+    }
+
+    pub(crate) fn lines(&self) -> &[String] {
+        &self.0
+    }
+
     /// `result` followed by each piece of feedback as a system reminder.
     pub(crate) fn appended_to(&self, result: String) -> String {
         self.0.iter().fold(result, |mut text, feedback| {
@@ -61,6 +70,8 @@ pub(crate) enum PreToolGate {
         permission: Option<HookPermission>,
         reason: Option<String>,
         feedback: ToolHookFeedback,
+        /// The identity of the hooks that ran, when any did.
+        hooks: Option<String>,
     },
     /// A hook denied the call, or ended the turn: the call's result.
     Refused {
@@ -143,7 +154,29 @@ impl Agent {
             permission: verdict.permission,
             reason: verdict.permission_reason.clone(),
             feedback,
+            hooks: verdict.hooks.clone(),
         }
+    }
+
+    /// The identity of the `PreToolUse` hooks the call `call_id` to `tool` with `input` would
+    /// run now; `None` when none would.
+    pub(crate) async fn pre_tool_hooks(
+        &self,
+        receipt: &Receipt,
+        call_id: &str,
+        tool: &str,
+        input: &Value,
+    ) -> Option<String> {
+        self.hooks_identity(
+            receipt,
+            &HookCall {
+                event: HookEvent::PreToolUse,
+                match_query: Some(tool.into()),
+                fields: tool_fields(tool, call_id, input),
+                tool: Some((tool.into(), call_id.into())),
+            },
+        )
+        .await
     }
 
     /// Runs `PostToolUse` after a call that ran and succeeded, `PostToolUseFailure` after one

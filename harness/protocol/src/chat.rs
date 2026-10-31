@@ -788,6 +788,22 @@ pub enum PromptPolicy {
     Interactive,
     DenyOnPrompt,
     Unrestricted,
+    /// A durable host's Durable Approval: a model tool call that needs a person's approval
+    /// suspends its Run on a durable wait until the person answers, and a third-party tool
+    /// without a rule goes to the person instead of Auto review. Every other prompt is denied,
+    /// as under `DenyOnPrompt`.
+    DurableApproval,
+}
+
+impl PromptPolicy {
+    /// The policy of a prompt that cannot wait durably: `DurableApproval` denies it, as
+    /// `DenyOnPrompt` does.
+    pub const fn without_durable_approval(self) -> Self {
+        match self {
+            Self::DurableApproval => Self::DenyOnPrompt,
+            policy => policy,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

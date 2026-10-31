@@ -419,7 +419,11 @@ impl ToolRegistry {
         let mut folded = std::collections::BTreeSet::new();
         let mut deferred = Vec::new();
         let mut user_exposure = crate::cache_prefix::UserExposure::default();
+        let mut mcp_guidance = crate::tool_exposure::McpGuidance::default();
         if let Some(provider) = host_provider.filter(|_| policy.artifacts) {
+            if let Some(guidance) = provider.mcp_guidance() {
+                mcp_guidance = guidance;
+            }
             if provider.has_tool_search()
                 || provider
                     .mcp_resource_servers()
@@ -470,7 +474,8 @@ impl ToolRegistry {
         if offers_search {
             let directory = Arc::new(
                 crate::tool_exposure::ExposureDirectory::new(discovery_tools, search_support(chat))
-                    .with_unavailable_servers(unavailable_servers),
+                    .with_unavailable_servers(unavailable_servers)
+                    .with_mcp_guidance(&mcp_guidance),
             );
             deferred = directory.deferred_tools();
             deferred.sort_by(|first, second| first.name.cmp(&second.name));
@@ -851,9 +856,35 @@ struct RegisteredCall {
 struct HookGate {
     permission: Option<crate::hooks::HookPermission>,
     reason: Option<String>,
+    /// What the hooks decided, kept for the call's wait, when hooks ran.
+    preparation: Option<tickloop_harness_transcript::HookPreparation>,
 }
 
 impl HookGate {
+    /// The gate the hooks decided before the call waited, as its wait kept it.
+    fn kept(preparation: tickloop_harness_transcript::HookPreparation) -> Self {
+        use tickloop_harness_transcript::HookPreparedPermission;
+        Self {
+            permission: preparation.permission.map(|permission| match permission {
+                HookPreparedPermission::Allow => crate::hooks::HookPermission::Allow,
+                HookPreparedPermission::Ask => crate::hooks::HookPermission::Ask,
+            }),
+            reason: preparation.reason.clone(),
+            preparation: Some(preparation),
+        }
+    }
+
+    fn prepared_permission(
+        permission: crate::hooks::HookPermission,
+    ) -> Option<tickloop_harness_transcript::HookPreparedPermission> {
+        use tickloop_harness_transcript::HookPreparedPermission;
+        match permission {
+            crate::hooks::HookPermission::Allow => Some(HookPreparedPermission::Allow),
+            crate::hooks::HookPermission::Ask => Some(HookPreparedPermission::Ask),
+            crate::hooks::HookPermission::Deny => None,
+        }
+    }
+
     fn asks(&self) -> bool {
         self.permission == Some(crate::hooks::HookPermission::Ask)
     }
@@ -1137,6 +1168,9 @@ impl Agent {
         };
         let mut chats = self.inner.chats.lock().await;
         if let Some(chat) = chats.get_mut(&receipt.chat_id)
+            // A batch's call whose Run was released while it waited leaves its record alone.
+            && !(crate::nested_calls::is_nested()
+                && Self::release_of(chat, receipt.run_id).is_cancelled())
             && let Some(operation) = chat
                 .snapshot
                 .operations
@@ -1363,7 +1397,31 @@ impl Agent {
         {
             return Ok(ToolCallOutcome::not_admitted(error));
         }
-        let (input, hook_gate, pre_tool_feedback) = if registration.is_some() {
+        // A call a person allowed while its Run waited takes what its hooks decided then, while
+        // the same hooks would run: running them again could rewrite it differently. No
+        // PreToolUse hook runs for it again, a background one included: each already ran when
+        // the call was first prepared, and a background hook decides nothing.
+        let kept = match self.granted_hook_preparation(receipt, &id).await {
+            Some(kept)
+                if self
+                    .pre_tool_hooks(receipt, &id, &name, &input)
+                    .await
+                    .as_deref()
+                    == Some(kept.hooks.as_str()) =>
+            {
+                Some(kept)
+            }
+            _ => None,
+        };
+        let (input, hook_gate, pre_tool_feedback) = if let Some(kept) = kept {
+            if let Some(registered) = &registration
+                && let Err(error) = validate_registered_input(registered, &kept.input)
+            {
+                return Ok(ToolCallOutcome::not_admitted(error));
+            }
+            let feedback = crate::hooks::ToolHookFeedback::kept(kept.feedback.clone());
+            (kept.input.clone(), HookGate::kept(kept), feedback)
+        } else if registration.is_some() {
             match self
                 .pre_tool_use(receipt, &id, &name, input.clone(), &cancel)
                 .await
@@ -1387,6 +1445,7 @@ impl Agent {
                     permission,
                     reason,
                     feedback,
+                    hooks,
                 } => {
                     let route = registration.as_ref().map(|tool| &tool.route);
                     let rewritten = if rewritten == input {
@@ -1418,7 +1477,23 @@ impl Agent {
                             ..ToolCallOutcome::not_admitted(error)
                         });
                     }
-                    (rewritten, HookGate { permission, reason }, feedback)
+                    let preparation =
+                        hooks.map(|hooks| tickloop_harness_transcript::HookPreparation {
+                            input: rewritten.clone(),
+                            permission: permission.and_then(HookGate::prepared_permission),
+                            reason: reason.clone(),
+                            feedback: feedback.lines().to_vec(),
+                            hooks,
+                        });
+                    (
+                        rewritten,
+                        HookGate {
+                            permission,
+                            reason,
+                            preparation,
+                        },
+                        feedback,
+                    )
                 }
             }
         } else {
@@ -1860,6 +1935,20 @@ impl Agent {
                             | crate::host_tools::HostToolPermission::Confirmation
                     )
                 );
+            let prompt_policy = self.tool_prompt_policy();
+            let is_durable_third_party = prompt_policy == PromptPolicy::DurableApproval
+                && host_permission == Some(crate::host_tools::HostToolPermission::ThirdParty);
+            let is_granted = decision == Decision::Check
+                && self
+                    .is_permission_granted(
+                        receipt,
+                        &operation,
+                        prepared_host_call
+                            .as_ref()
+                            .and_then(|call| call.mcp_server()),
+                        prepared_host_call.as_ref().and_then(|call| call.target()),
+                    )
+                    .await;
             let decision = match decision {
                 Decision::Deny => Decision::Deny,
                 _ if name == EXIT_PLAN_MODE_TOOL_NAME => Decision::Allow,
@@ -1876,6 +1965,27 @@ impl Agent {
                         ) =>
                 {
                     Decision::Allow
+                }
+                // Durable Approval hands a third-party call no rule decides to a person, unless its
+                // server's host chose Auto review first or admits a tool its declaration says
+                // only reads, and a call a person allowed while its Run waited is not reviewed
+                // again.
+                Decision::Check if is_granted => Decision::Ask,
+                Decision::Check
+                    if is_durable_third_party
+                        && prepared_host_call
+                            .as_ref()
+                            .is_some_and(|call| call.admits_unruled_read_only()) =>
+                {
+                    Decision::Allow
+                }
+                Decision::Check
+                    if is_durable_third_party
+                        && !prepared_host_call
+                            .as_ref()
+                            .is_some_and(|call| call.auto_reviews_unruled()) =>
+                {
+                    Decision::Ask
                 }
                 other => other,
             };
@@ -1900,9 +2010,10 @@ impl Agent {
             } else {
                 decision
             };
-            let prompts_unavailable = decision == Decision::Ask
-                && self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt;
-            let mut decision = self.apply_prompt_policy_keeping_required_approval(
+            let prompts_unavailable =
+                decision == Decision::Ask && prompt_policy == PromptPolicy::DenyOnPrompt;
+            let mut decision = Self::apply_prompt_policy_keeping_required_approval(
+                prompt_policy,
                 decision,
                 explicit_ask
                     || hook_asks
@@ -1946,13 +2057,17 @@ impl Agent {
             let mut auto_denial_message = None;
             if decision == Decision::Check {
                 let mut assessment = self
-                    .review_auto_operation(
+                    .review_operation(
                         receipt,
                         &operation,
                         prepared_host_call
                             .as_ref()
                             .map(|call| call.approval_facts().clone()),
                         cancel.clone(),
+                        true,
+                        prepared_host_call
+                            .as_ref()
+                            .is_some_and(|call| call.is_remote()),
                     )
                     .await
                     .map_err(|error| error.to_string())?;
@@ -1980,6 +2095,7 @@ impl Agent {
                         &policy,
                         &mut assessment,
                         allow_rule_skips_review,
+                        is_durable_third_party,
                     )
                     .await?;
                 assessment_details = Some(assessment.details.clone());
@@ -2004,6 +2120,11 @@ impl Agent {
                                     .as_ref()
                                     .and_then(|call| call.mcp_server())
                                     .map(str::to_owned),
+                                target: prepared_host_call
+                                    .as_ref()
+                                    .and_then(|call| call.target())
+                                    .map(str::to_owned),
+                                hooks: hook_gate.preparation.clone(),
                             },
                             cancel.clone(),
                         )
@@ -2540,9 +2661,16 @@ impl Agent {
                             )
                         }
                     });
-                    if decision == Decision::Ask
-                        && self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt
+                    let prompt_policy = self.tool_prompt_policy();
+                    // A call a person allowed while its Run waited is not reviewed again.
+                    if decision == Decision::Check
+                        && self
+                            .is_permission_granted(receipt, &operation, None, None)
+                            .await
                     {
+                        decision = Decision::Ask;
+                    }
+                    if decision == Decision::Ask && prompt_policy == PromptPolicy::DenyOnPrompt {
                         deterministic_denial_reason =
                             Some(auto_mode::prompts_unavailable_message(&prepared.name));
                     }
@@ -2550,9 +2678,12 @@ impl Agent {
                         explicit_ask || hook_asks || prepared.requires_environment_approval();
                     let bypassed_by_unrestricted_host = !approval_required
                         && matches!(decision, Decision::Ask | Decision::Check)
-                        && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted;
-                    decision = self
-                        .apply_prompt_policy_keeping_required_approval(decision, approval_required);
+                        && prompt_policy == PromptPolicy::Unrestricted;
+                    decision = Self::apply_prompt_policy_keeping_required_approval(
+                        prompt_policy,
+                        decision,
+                        approval_required,
+                    );
                     if decision == Decision::Check {
                         let mut review_attempts = 0;
                         loop {
@@ -2649,6 +2780,7 @@ impl Agent {
                                     &policy,
                                     &mut assessment,
                                     true,
+                                    false,
                                 )
                                 .await?;
                             assessment_details = Some(assessment.details.clone());
@@ -2672,6 +2804,8 @@ impl Agent {
                                         source: approval_source,
                                         reason: approval_reason,
                                         mcp_server: None,
+                                        target: None,
+                                        hooks: hook_gate.preparation.clone(),
                                     },
                                     cancel.clone(),
                                 )
@@ -2712,7 +2846,7 @@ impl Agent {
                                 _ => DenialCategory::NoHuman,
                             }
                         } else if approval_source == PermissionApprovalSource::ExplicitAsk
-                            || self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt
+                            || prompt_policy == PromptPolicy::DenyOnPrompt
                         {
                             DenialCategory::NoHuman
                         } else {
@@ -3040,6 +3174,7 @@ impl Agent {
         policy: &PermissionPolicy,
         assessment: &mut approval_assessment::ApprovalAssessment,
         allow_rule_skips_review: bool,
+        soft_block_asks: bool,
     ) -> Result<AutoPermissionDecision, ToolCallError> {
         let decision;
         let mut approval_reason = None;
@@ -3054,7 +3189,7 @@ impl Agent {
                 }
             }
             AutoReview::ContextLimit => {
-                if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt {
+                if self.tool_prompt_policy() == PromptPolicy::DenyOnPrompt {
                     self.emit_permission_check(
                         receipt,
                         Decision::Deny,
@@ -3113,9 +3248,7 @@ impl Agent {
                         .push(tickloop_harness_protocol::ApprovalDiagnostic::DenialLimit);
                 }
                 match limit_warning {
-                    Some(_)
-                        if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt =>
-                    {
+                    Some(_) if self.tool_prompt_policy() == PromptPolicy::DenyOnPrompt => {
                         let mut reason = auto_mode::HEADLESS_DENIAL_LIMIT_ERROR.to_owned();
                         if let Some(warning) = self
                             .log_auto_review(
@@ -3147,6 +3280,12 @@ impl Agent {
                         decision = Decision::Ask;
                         approval_reason =
                             Some(format!("{warning}\n\nLatest blocked action: {reason}"));
+                    }
+                    // Under Durable Approval, a third-party call its host sends to Auto review
+                    // first goes to the person when review blocks it softly; a hard deny stays.
+                    None if soft_block_asks && kind == AutoBlockKind::SoftDeny => {
+                        decision = Decision::Ask;
+                        approval_reason = Some(reason.clone());
                     }
                     _ => {
                         decision = Decision::Deny;

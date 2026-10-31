@@ -78,6 +78,7 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
     server.set_tools(json!([{"name":"mail","description":"Send email","inputSchema":{"type":"object","properties":{"value":{"anyOf":[{"type":"string"},{"type":"object"}]}},"required":["value"]}},{"name":"secret","inputSchema":{"type":"object"}}]));
     server.set_result(json!({"content":[{"type":"text","text":"MAIL_OK"}]}));
     let mut configs = vec![McpServerConfig {
+        unruled: Default::default(),
         name: "office".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -93,6 +94,7 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
         description: "Office tools".into(),
     }];
     configs.push(McpServerConfig {
+        unruled: Default::default(),
         name: "ui5".into(),
         transport: McpTransport::Failed {
             reason: "missing command".into(),
@@ -231,7 +233,7 @@ async fn agent_discovers_describes_and_executes_search_tools_with_stable_definit
 }
 
 #[tokio::test]
-async fn batch_waits_for_each_confirmation_while_other_calls_finish() {
+async fn batch_asks_for_each_confirmation_in_turn() {
     use std::{collections::BTreeMap, sync::Arc, time::Duration};
     use tickloop_harness_protocol::{
         EventKind, ExecutionMode,
@@ -248,6 +250,7 @@ async fn batch_waits_for_each_confirmation_while_other_calls_finish() {
     server.set_tools(json!([{"name":"mail","inputSchema":{"type":"object","properties":{}}}]));
     server.set_result(json!({"content":[{"type":"text","text":"MAIL_OK"}]}));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         name: "office".into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -298,50 +301,37 @@ async fn batch_waits_for_each_confirmation_while_other_calls_finish() {
         .unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, "Send two emails".into()).await.unwrap();
-    let mut requests = Vec::new();
-    while requests.len() < 2 {
-        match next_event(&mut events).await.kind {
-            EventKind::PermissionRequested { request } => requests.push(request),
-            EventKind::Completed { .. } => panic!("batch lost a confirmation"),
-            EventKind::Failed(error) => panic!("{error}"),
-            _ => {}
-        }
-    }
-    assert!(server.calls().is_empty());
-    for request in &requests {
-        let request = serde_json::to_value(request).unwrap();
-        assert_eq!(request["parent_call"]["call_id"], "batch");
+    for (index, comment) in [(0, Some("Keep the audit note")), (1, None)] {
+        let request = loop {
+            match next_event(&mut events).await.kind {
+                EventKind::PermissionRequested { request } => break request,
+                EventKind::Completed { .. } => panic!("batch lost a confirmation"),
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        };
+        assert_eq!(server.calls().len(), index, "one call at a time");
+        assert_eq!(agent.snapshot(chat).await.unwrap().permissions.len(), 1);
+        let shown = serde_json::to_value(&request).unwrap();
+        assert_eq!(shown["parent_call"]["call_id"], "batch");
         assert_eq!(
-            request["parent_call"]["input"]["calls"]
+            shown["parent_call"]["input"]["calls"]
                 .as_array()
                 .unwrap()
                 .len(),
             2
         );
+        agent
+            .answer_permission_with_comment(
+                chat,
+                request.id,
+                true,
+                tickloop_harness_protocol::PermissionScope::Once,
+                comment.map(Into::into),
+            )
+            .await
+            .unwrap();
     }
-    agent
-        .answer_permission_with_comment(
-            chat,
-            requests[1].id,
-            true,
-            tickloop_harness_protocol::PermissionScope::Once,
-            Some("Keep the audit note".into()),
-        )
-        .await
-        .unwrap();
-    loop {
-        if let EventKind::ToolCompleted { result, .. } = next_event(&mut events).await.kind
-            && result.content.contains("MAIL_OK")
-        {
-            break;
-        }
-    }
-    assert_eq!(server.calls().len(), 1);
-    assert_eq!(agent.snapshot(chat).await.unwrap().permissions.len(), 1);
-    agent
-        .answer_permission(chat, requests[0].id, true)
-        .await
-        .unwrap();
     loop {
         match next_event(&mut events).await.kind {
             EventKind::Completed { .. } => break,
@@ -707,7 +697,7 @@ async fn nested_results_survive_reload_with_parent_links_and_no_reexecution() {
 async fn a_batch_cut_off_by_a_process_exit_loads_as_interrupted_with_each_call_outcome() {
     use std::{collections::BTreeMap, sync::Arc, time::Duration};
     use tickloop_harness_protocol::{
-        Content, Decision, EventKind, ExecutionMode, OperationState, PermissionRule,
+        Content, Decision, ExecutionMode, OperationState, PermissionRule,
         mcp::{McpServerConfig, McpTransport},
     };
     use tickloop_harness_runtime::{
@@ -717,7 +707,7 @@ async fn a_batch_cut_off_by_a_process_exit_loads_as_interrupted_with_each_call_o
         transcript::StorePosition,
     };
     use tickloop_harness_test_support::{
-        ScriptedModel, call, config, harness::ChosenModels, mcp_service::McpService, next_event,
+        ScriptedModel, call, config, harness::ChosenModels, mcp_service::McpService,
         transcripts::InMemoryTranscriptStore,
     };
     let server = McpService::start().await;
@@ -725,6 +715,7 @@ async fn a_batch_cut_off_by_a_process_exit_loads_as_interrupted_with_each_call_o
     server.set_result(json!({"content":[{"type":"text","text":"WROTE"}]}));
     server.set_delay(Duration::from_secs(30));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         name: "slow".into(),
         source: "fixture".into(),
         transport: McpTransport::Http {
@@ -805,17 +796,9 @@ async fn a_batch_cut_off_by_a_process_exit_loads_as_interrupted_with_each_call_o
         )
         .await
         .unwrap();
-    let mut events = first.subscribe();
     first.submit(chat, "Run the batch".into()).await.unwrap();
-    let request = loop {
-        let event = next_event(&mut events).await;
-        match event.kind {
-            EventKind::PermissionRequested { request } if event.chat_id == chat => break request,
-            EventKind::Failed(error) => panic!("{error}"),
-            _ => {}
-        }
-    };
-    assert_eq!(request.parent_call.as_ref().unwrap().call_id, "batch");
+    // The batch makes its calls one at a time: the process exits while the slow call runs,
+    // before the batch reaches the last one.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let snapshot = first.snapshot(chat).await.unwrap();
@@ -872,7 +855,7 @@ async fn a_batch_cut_off_by_a_process_exit_loads_as_interrupted_with_each_call_o
             .iter()
             .filter(|operation| operation.parent_call_id.as_deref() == Some("batch"))
             .count(),
-        3
+        2
     );
     assert!(snapshot.permissions.is_empty());
     assert_eq!(server.calls().len(), 1);
@@ -1332,6 +1315,7 @@ async fn native_search_models_call_deferred_tools_directly_under_direct_call_app
     ]));
     server.set_result(json!({"content":[{"type":"text","text":"MAIL_OK"}]}));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         name: "office".into(),
         source: "global".into(),
         transport: McpTransport::Http {

@@ -1,6 +1,7 @@
 //! Logging in to a remote MCP Server: find its authorization server, register Tickloop or use
 //! the configured client, send the user to the authorization URL, and exchange the code that
-//! comes back through the loopback callback or a pasted redirect address.
+//! comes back through the loopback callback or a pasted redirect address. Discovery,
+//! registration and the authorization URL are shared with the server-side login.
 
 use std::fmt;
 use std::sync::Arc;
@@ -10,8 +11,9 @@ use reqwest::Url;
 use rmcp::transport::auth::{AuthorizationMetadata, WWWAuthenticateParams};
 use rmcp::transport::{
     AuthError, AuthorizationManager, AuthorizationRequest, AuthorizationSession,
+    InMemoryStateStore, StateStore, StoredAuthorizationState,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tick_oauth::OAuthToken;
 use tickloop_harness_base::oauth_callback::{
     CallbackError, CallbackListener, CallbackPages, CallbackPaste, PendingCallback,
@@ -23,6 +25,12 @@ use crate::tokens::now_seconds;
 use crate::{Cancelled, Connector, cancellable};
 
 const CLIENT_NAME: &str = "Tickloop";
+/// The OIDC registration `application_type` of a login whose browser comes back to this
+/// machine, the terminal's.
+const NATIVE_APPLICATION: &str = "native";
+/// The OIDC registration `application_type` of a login whose browser comes back to a web
+/// service's https address, which strict servers refuse to a native client.
+pub(crate) const WEB_APPLICATION: &str = "web";
 const CALLBACK_PATH: &str = "/callback";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// RFC 6749 only recommends `expires_in`; a token without it is renewed after an hour.
@@ -51,6 +59,22 @@ pub enum LoginError {
     Denied,
     #[error("the authorization server reported an error instead of an authorization code")]
     AuthorizationFailed,
+    /// The callback carries another login's `state`, or the pending login belongs to another
+    /// server address.
+    #[error("the callback belongs to a different login")]
+    StateMismatch,
+    #[error("the callback is invalid or has no authorization code")]
+    InvalidCallback,
+    /// RFC 9207: the callback names another authorization server, or none where one is required.
+    #[error("the callback does not come from the login's authorization server")]
+    IssuerMismatch,
+    /// A server-side login's callback arrived after the login expired.
+    #[error("the login expired; start it again")]
+    Expired,
+    #[error(
+        "the redirect address must use https, or http on this machine, without user information or a fragment"
+    )]
+    RedirectAddress,
     #[error("the login has already ended")]
     Ended,
     #[error("the server publishes no usable OAuth authorization server metadata: {0}")]
@@ -96,10 +120,64 @@ pub struct PendingLogin {
 }
 
 /// Where the token is renewed and revoked later.
-struct TokenEndpoints {
-    issuer: String,
-    token: String,
-    revocation: Option<String>,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct TokenEndpoints {
+    pub(crate) issuer: String,
+    pub(crate) token: String,
+    pub(crate) revocation: Option<String>,
+}
+
+/// The authorization server found for a login, before a client is chosen.
+pub(crate) struct Discovery {
+    manager: AuthorizationManager,
+    pub(crate) endpoints: TokenEndpoints,
+    redaction: CauseRedaction,
+}
+
+/// A login ready for the user's approval.
+pub(crate) struct Authorization {
+    pub(crate) session: AuthorizationSession,
+    pub(crate) url: String,
+    pub(crate) state: String,
+    pub(crate) registration: ClientRegistration,
+    pub(crate) resource: Option<String>,
+    pub(crate) endpoints: TokenEndpoints,
+    /// The PKCE verifier and the issuer the response must name, as the session recorded them.
+    pub(crate) recorded: StoredAuthorizationState,
+}
+
+/// The fields of an RFC 6749 token response that a saved token keeps.
+#[derive(Deserialize)]
+pub(crate) struct TokenFields {
+    access_token: String,
+    token_type: String,
+    refresh_token: Option<String>,
+    scope: Option<String>,
+    expires_in: Option<u64>,
+}
+
+impl TokenFields {
+    pub(crate) fn into_token(
+        self,
+        registration: &ClientRegistration,
+        endpoints: &TokenEndpoints,
+    ) -> Result<OAuthToken, LoginError> {
+        if self.access_token.is_empty() {
+            return Err(LoginError::TokenExchange);
+        }
+        Ok(OAuthToken {
+            access_token: self.access_token,
+            token_type: self.token_type,
+            refresh_token: self.refresh_token.filter(|token| !token.is_empty()),
+            scope: self.scope,
+            issuer: endpoints.issuer.clone(),
+            client_id: registration.client_id.clone(),
+            token_endpoint: endpoints.token.clone(),
+            revocation_endpoint: endpoints.revocation.clone(),
+            expires_at: now_seconds()
+                .saturating_add(self.expires_in.unwrap_or(DEFAULT_TOKEN_LIFETIME_SECONDS)),
+        })
+    }
 }
 
 impl PendingLogin {
@@ -137,53 +215,13 @@ impl PendingLogin {
         )
         .await?
         .map_err(|_| LoginError::TokenExchange)?;
-        let token = self.oauth_token(&token_response)?;
-        let credentials = &self.connector.credentials;
-        let _lock = cancellable(cancellation, credentials.lock()).await??;
-        if cancellation.is_cancelled() {
-            return Err(LoginError::Cancelled);
-        }
-        credentials
-            .save(&ConnectorCredential {
-                server_url: self.connector.server_url.to_string(),
-                registration: self.registration.clone(),
-                resource: self.resource.clone(),
-                token: Some(token),
-            })
-            .await?;
-        Ok(())
-    }
-
-    fn oauth_token(
-        &self,
-        response: &rmcp::transport::auth::OAuthTokenResponse,
-    ) -> Result<OAuthToken, LoginError> {
-        #[derive(Deserialize)]
-        struct TokenFields {
-            access_token: String,
-            token_type: String,
-            refresh_token: Option<String>,
-            scope: Option<String>,
-            expires_in: Option<u64>,
-        }
-        let fields: TokenFields = serde_json::to_value(response)
-            .and_then(serde_json::from_value)
-            .map_err(|_| LoginError::TokenExchange)?;
-        if fields.access_token.is_empty() {
-            return Err(LoginError::TokenExchange);
-        }
-        Ok(OAuthToken {
-            access_token: fields.access_token,
-            token_type: fields.token_type,
-            refresh_token: fields.refresh_token.filter(|token| !token.is_empty()),
-            scope: fields.scope,
-            issuer: self.endpoints.issuer.clone(),
-            client_id: self.registration.client_id.clone(),
-            token_endpoint: self.endpoints.token.clone(),
-            revocation_endpoint: self.endpoints.revocation.clone(),
-            expires_at: now_seconds()
-                .saturating_add(fields.expires_in.unwrap_or(DEFAULT_TOKEN_LIFETIME_SECONDS)),
-        })
+        let token = serde_json::to_value(&token_response)
+            .and_then(serde_json::from_value::<TokenFields>)
+            .map_err(|_| LoginError::TokenExchange)?
+            .into_token(&self.registration, &self.endpoints)?;
+        self.connector
+            .save_login(self.registration, self.resource, token, cancellation)
+            .await
     }
 }
 
@@ -204,6 +242,38 @@ impl Connector {
         challenge: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<PendingLogin, LoginError> {
+        let discovery = self.discover(challenge, cancellation).await?;
+        let stored = cancellable(cancellation, self.credentials.load()).await??;
+        let (listener, preregistered) = self
+            .callback_and_client(stored, &discovery.endpoints.issuer)
+            .await?;
+        let redirect_uri = listener.redirect_uri().to_owned();
+        let authorization = self
+            .authorize(
+                discovery,
+                redirect_uri,
+                preregistered,
+                NATIVE_APPLICATION,
+                cancellation,
+            )
+            .await?;
+        Ok(PendingLogin {
+            connector: self.clone(),
+            callback: listener.receive(authorization.state, CALLBACK_PAGES, LOGIN_TIMEOUT),
+            session: authorization.session,
+            authorization_url: authorization.url,
+            registration: authorization.registration,
+            resource: authorization.resource,
+            endpoints: authorization.endpoints,
+        })
+    }
+
+    /// Finds the authorization server from `challenge`, or the configured metadata address.
+    pub(crate) async fn discover(
+        &self,
+        challenge: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<Discovery, LoginError> {
         let redaction = self.cause_redaction(challenge);
         let mut manager = cancellable(
             cancellation,
@@ -221,12 +291,34 @@ impl Connector {
         .await??;
         let endpoints = TokenEndpoints::from_metadata(&metadata)?;
         manager.set_metadata(metadata);
+        Ok(Discovery {
+            manager,
+            endpoints,
+            redaction,
+        })
+    }
 
-        let stored = cancellable(cancellation, self.credentials.load()).await??;
-        let (listener, preregistered) = self.callback_and_client(stored, &endpoints.issuer).await?;
-        let redirect_uri = listener.redirect_uri().to_owned();
-        let mut request =
-            AuthorizationRequest::new(redirect_uri.clone()).with_client_name(CLIENT_NAME);
+    /// Registers Tickloop for `redirect_uri` as an `application_type` client unless
+    /// `preregistered` names the client, and builds the authorization URL with S256 PKCE and the
+    /// RFC 8707 resource.
+    pub(crate) async fn authorize(
+        &self,
+        discovery: Discovery,
+        redirect_uri: String,
+        preregistered: Option<String>,
+        application_type: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Authorization, LoginError> {
+        let Discovery {
+            mut manager,
+            endpoints,
+            redaction,
+        } = discovery;
+        let states = InMemoryStateStore::new();
+        manager.set_state_store(states.clone());
+        let mut request = AuthorizationRequest::new(redirect_uri.clone())
+            .with_client_name(CLIENT_NAME)
+            .with_application_type(application_type);
         if let Some(client_id) = preregistered {
             request = request.with_preregistered_client(client_id);
         }
@@ -236,9 +328,9 @@ impl Connector {
         let (client_id, _) = cancellable(cancellation, session.get_credentials())
             .await?
             .map_err(|_| LoginError::Registration)?;
-        let authorization_url = session.get_authorization_url().to_owned();
+        let url = session.get_authorization_url().to_owned();
         let query = |name: &str| {
-            Url::parse(&authorization_url).ok().and_then(|url| {
+            Url::parse(&url).ok().and_then(|url| {
                 url.query_pairs()
                     .find(|(field, _)| field == name)
                     .map(|(_, value)| value.into_owned())
@@ -246,11 +338,16 @@ impl Connector {
         };
         let state = query("state").ok_or(LoginError::Unsupported)?;
         let resource = query("resource");
-        Ok(PendingLogin {
-            connector: self.clone(),
+        let recorded = states
+            .load(&state)
+            .await
+            .ok()
+            .flatten()
+            .ok_or(LoginError::Unsupported)?;
+        Ok(Authorization {
             session,
-            callback: listener.receive(state, CALLBACK_PAGES, LOGIN_TIMEOUT),
-            authorization_url,
+            url,
+            state,
             registration: ClientRegistration {
                 authorization_server: endpoints.issuer.clone(),
                 client_id,
@@ -258,7 +355,32 @@ impl Connector {
             },
             resource,
             endpoints,
+            recorded,
         })
+    }
+
+    /// Saves the token of a finished login under the credential lock, unless it was cancelled.
+    pub(crate) async fn save_login(
+        &self,
+        registration: ClientRegistration,
+        resource: Option<String>,
+        token: OAuthToken,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LoginError> {
+        let _lock = cancellable(cancellation, self.credentials.lock()).await??;
+        if cancellation.is_cancelled() {
+            return Err(LoginError::Cancelled);
+        }
+        self.credentials
+            .save(&ConnectorCredential {
+                server_url: self.server_url.to_string(),
+                registration,
+                resource,
+                token: Some(token),
+                login: Some(tickloop_ids::generate().to_string()),
+            })
+            .await?;
+        Ok(())
     }
 
     async fn authorization_metadata(

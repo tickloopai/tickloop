@@ -420,6 +420,7 @@ impl Agent {
                     parked: HashMap::new(),
                     releases: HashMap::new(),
                     ready_runs: VecDeque::new(),
+                    permission_grants: HashMap::new(),
                     client,
                     pending_client: None,
                     pending_model_thinking: None,

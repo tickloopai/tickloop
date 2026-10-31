@@ -1156,7 +1156,7 @@ impl Agent {
             && snapshot.subagent_reports.contains_key(&receipt.run_id)
         {
             Some(
-                self.review_operation(receipt, operation, None, cancel.clone(), false)
+                self.review_operation(receipt, operation, None, cancel.clone(), false, false)
                     .await
                     .map_err(|error| error.to_string())?
                     .details,

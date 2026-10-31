@@ -6,8 +6,8 @@ use uuid::Uuid;
 use tickloop_harness_protocol::{
     AgentMessageSource, DelegationMetadata, DirectedHumanSource, FamilyCompletion,
     FamilyInputRecord, Message, ModelIdentity, MonitorMembership, OriginalUserInput,
-    PrivateHistorySource, QuestionRequest, Role, SubagentRegistration, ToolCallRecovery,
-    ToolResult, ToolResultContent, Usage,
+    PermissionRequest, PrivateHistorySource, QuestionRequest, Role, SubagentRegistration,
+    ToolCallRecovery, ToolResult, ToolResultContent, Usage,
 };
 
 /// One line in the Transcript. Unknown types are kept and written back unchanged, so older versions
@@ -1091,7 +1091,7 @@ pub enum InputOp {
     ReplacePrompt,
     /// Another answer to the prompt of an earlier answer, as its sibling.
     RegenerateAnswer,
-    /// The user's reply to a question a Run waits on; it joins that Run.
+    /// The user's reply to a question or a permission a Run waits on; it joins that Run.
     Answer,
     /// A Trigger, Tick update or other source that continues a Loop.
     Trigger,
@@ -1181,7 +1181,7 @@ pub enum DiscardReason {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WaitEntry {
-    /// A question's wait id is its request id.
+    /// A question's or a permission's wait id is its request id.
     pub wait_id: Uuid,
     pub chat_id: Uuid,
     pub loop_id: Uuid,
@@ -1204,6 +1204,27 @@ pub enum WaitKind {
         /// have in the process that asked.
         operation_id: Uuid,
     },
+    /// A model tool call waits for a person to allow or deny it, under Durable Approval.
+    #[serde(rename_all = "camelCase")]
+    Permission {
+        request: Box<PermissionRequest>,
+        /// The operation that asked. A rebuilt Run prepares the call again where it waited, under
+        /// an operation of its own.
+        operation_id: Uuid,
+        /// A token-free identity of what the call reaches, such as an MCP server's configuration
+        /// and account and the tool as listed: a rebuilt Run runs the allowed call only when the
+        /// call prepared again reaches the same, and asks again otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        /// The call's place in its `ExecuteTools` batch when it was made inside one; the wait's
+        /// resume point then names that batch call, which goes on at this call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nested_index: Option<usize>,
+        /// What the call's `PreToolUse` hooks decided before it waited: the call prepared again
+        /// takes this instead of running them again, while the same hooks would run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hooks: Option<HookPreparation>,
+    },
     /// A foreground `Subagent` call waits for its child's run to end and report.
     #[serde(rename_all = "camelCase")]
     Subagent {
@@ -1219,6 +1240,32 @@ pub enum WaitKind {
     /// A voluntary handover stopped the Run at a safe point: whoever holds the Chat next goes on
     /// with the same attempt where the wait says, once the Run takes the execution slot.
     Handover,
+}
+
+/// What a call's `PreToolUse` hooks decided, kept with the call's wait.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HookPreparation {
+    /// The input the call was prepared with, the hooks' rewrite when they gave one.
+    pub input: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<HookPreparedPermission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// What the hooks told the model, which follows the call's result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feedback: Vec<String>,
+    /// A token-free identity of the hooks that ran: a change to them makes the call run its
+    /// hooks again.
+    pub hooks: String,
+}
+
+/// What a call's `PreToolUse` hooks decided about its admission, short of denying it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HookPreparedPermission {
+    Allow,
+    Ask,
 }
 
 /// Where a Run continues.
@@ -1257,6 +1304,14 @@ pub enum WaitState {
     #[serde(rename_all = "camelCase")]
     Resolved {
         result: ModelVisibleResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_input: Option<Uuid>,
+    },
+    /// A person allowed the waiting call, which has not run yet: the Run runs it once it holds
+    /// the execution slot again, and ends the wait first, so the call never runs twice. `by_input`
+    /// is the ledger input that allowed it.
+    #[serde(rename_all = "camelCase")]
+    Allowed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by_input: Option<Uuid>,
     },
@@ -1803,6 +1858,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_permission_wait_records_its_request_and_the_allowing_input() {
+        let request: PermissionRequest = serde_json::from_value(serde_json::json!({
+            "mcp_server": "review",
+            "id": Uuid::nil(),
+            "loop_id": Uuid::nil(),
+            "execution": {"ToolCall": {"run_id": Uuid::nil(), "call_id": "call"}},
+            "name": "mcp__review__read",
+            "input": {"q": "status"},
+        }))
+        .unwrap();
+        let by_input = Uuid::from_u128(7);
+        let line = Line::Wait(WaitEntry {
+            wait_id: request.id,
+            chat_id: Uuid::nil(),
+            loop_id: Uuid::nil(),
+            run_id: Uuid::nil(),
+            response_id: Uuid::nil(),
+            kind: WaitKind::Permission {
+                request: Box::new(request),
+                operation_id: Uuid::nil(),
+                target: Some("target".into()),
+                nested_index: None,
+                hooks: None,
+            },
+            resume: ResumePoint::InBatch {
+                assistant_message: Uuid::nil(),
+                call_id: "call".into(),
+            },
+            timestamp: "2026-01-01T00:00:00.000Z".into(),
+            state: WaitState::Allowed {
+                by_input: Some(by_input),
+            },
+        });
+        let value = serde_json::to_value(&line).unwrap();
+        assert_eq!(value["kind"]["kind"], "permission");
+        assert_eq!(value["kind"]["request"]["mcp_server"], "review");
+        assert_eq!(value["kind"]["operationId"], Uuid::nil().to_string());
+        assert_eq!(
+            value["state"],
+            serde_json::json!({"kind": "allowed", "byInput": by_input})
+        );
+        let Line::Wait(read) = serde_json::from_value::<Line>(value).unwrap() else {
+            panic!("a wait line reads back as one");
+        };
+        assert!(matches!(
+            read.kind,
+            WaitKind::Permission { request, .. } if request.name == "mcp__review__read"
+        ));
+        assert!(matches!(read.state, WaitState::Allowed { by_input: Some(id) } if id == by_input));
+    }
+
     fn is_chain(raw: &[u8]) -> bool {
         serde_json::from_slice::<MetadataHeader>(raw)
             .unwrap()
@@ -1826,4 +1933,25 @@ mod tests {
 pub struct NestedCallEntry {
     pub chat_id: Uuid,
     pub operation: tickloop_harness_protocol::OperationRecord,
+    /// How the call ended for its batch, once it did. A batch that goes on after its Run waited
+    /// takes this outcome instead of making the call again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<NestedCallStatus>,
+    /// The images the call returned with its outcome, which the batch returns to the model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<tickloop_harness_protocol::Image>,
+    /// The numbered sources the call's result cites, which the batch's result cites in turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<tickloop_harness_protocol::CitationSource>,
+}
+
+/// How a call made inside an `ExecuteTools` batch ended, as the batch's result reports it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NestedCallStatus {
+    Completed,
+    Error,
+    Denied,
+    NotExecuted,
+    Unknown,
 }
