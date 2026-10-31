@@ -4462,12 +4462,12 @@ impl Agent {
         let goal_turn = self.goal_turn_events(chat, &receipt, goal_turn);
         // A durable host goes on with an answer whose host it lost: its input has not settled,
         // so its child run has no completion yet.
-        let is_settled = !was_unstarted
-            && !(self.inner.waits == WaitHosting::Durable
-                && ending
-                    == ResponseEnding::Interrupted {
-                        by: InterruptedBy::Host,
-                    });
+        let is_lost_by_durable_host = self.inner.waits == WaitHosting::Durable
+            && ending
+                == ResponseEnding::Interrupted {
+                    by: InterruptedBy::Host,
+                };
+        let is_settled = !was_unstarted && !is_lost_by_durable_host;
         if !was_unstarted {
             self.end_response(chat, receipt.run_id, ending, usage);
         }
