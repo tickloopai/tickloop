@@ -598,5 +598,9 @@ fn a_selection_copies_its_rows_text_and_shows_in_inverse() {
     assert!(shown.screen().cell(1, 5).unwrap().inverse());
     assert!(!shown.screen().cell(1, 6).unwrap().inverse());
     assert!(!shown.screen().cell(0, 5).unwrap().inverse());
-    assert_eq!(shown.screen().contents_between(0, 0, 0, 12), "first line");
+    assert_eq!(
+        shown.screen().contents_between(0, 0, 0, 12),
+        "first line  ",
+        "the text stays, padded with inverse blanks to the row's end"
+    );
 }
