@@ -78,7 +78,10 @@ impl Agent {
         )
     }
 
-    /// The tools of a Chat whose directories `execution` is bound for.
+    /// The tools of a Chat whose directories `execution` is bound for. A Chat whose Folder is
+    /// only in the environment gets no Chat directory or scratchpad here, so it stores no review
+    /// artifact, large result, inbox, lease or watermark on this machine, like a Chat without a
+    /// Folder; only Shells the environment runs keep their output under the task directory.
     pub(super) fn chat_tools_on(
         &self,
         snapshot: &ChatSnapshot,
@@ -117,7 +120,7 @@ impl Agent {
         Arc::new(
             Tools::for_chat(
                 ChatDirectory {
-                    chat: chat_directory,
+                    chat: (!in_environment).then_some(chat_directory),
                     task_output,
                     family_temp,
                 },
@@ -183,8 +186,9 @@ impl Agent {
 
     /// Externalizes tool results by threshold before they are written to the conversation;
     /// afterwards the result content becomes the replacement text, and results without their own
-    /// output reference point at the externalized file. A Chat without a Folder stores nothing, so
-    /// the result is cut instead.
+    /// output reference point at the externalized file. A Chat without a Chat directory (without
+    /// a Folder, or with one only in the environment) stores nothing, so the result is cut
+    /// instead.
     pub(super) async fn persist_large_tool_result(
         &self,
         receipt: &Receipt,
@@ -197,18 +201,17 @@ impl Agent {
                 .limit_third_party_mcp_result(receipt, tool_use_id, result)
                 .await;
         }
-        let chat_directory = self
-            .inner
-            .chats
-            .lock()
-            .await
-            .get(&receipt.chat_id)
-            .ok_or(AgentError::NotFound)?
-            .tools
-            .chat_directory()
-            .cloned();
+        let (chat_directory, unkept) = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
+            (
+                chat.tools.chat_directory().cloned(),
+                UnkeptResults::of(&chat.snapshot),
+            )
+        };
         let Some(chat_directory) = chat_directory else {
-            if let Some(truncated) = truncate_large_tool_result(tool_name, &result.content) {
+            if let Some(truncated) = truncate_large_tool_result(tool_name, &result.content, unkept)
+            {
                 result.content = truncated;
             }
             return Ok(result);
@@ -254,15 +257,19 @@ fn chat_temp_directory(snapshot: &ChatSnapshot) -> PrivateDirectory {
 }
 
 /// The result a call that ends while its Run waits records for the model, without the store a
-/// Chat with a Folder writes large results to: cut as [`Agent::persist_large_tool_result`] cuts
-/// it in a Chat without one, and as it is otherwise.
+/// Chat directory keeps large results in: cut as [`Agent::persist_large_tool_result`] cuts it in
+/// a Chat without one, and as it is otherwise.
 pub(super) fn waited_call_result(
     chat: &Chat,
     tool_name: &str,
     mut result: ToolResult,
 ) -> ToolResult {
     if chat.tools.chat_directory().is_none()
-        && let Some(truncated) = truncate_large_tool_result(tool_name, &result.content)
+        && let Some(truncated) = truncate_large_tool_result(
+            tool_name,
+            &result.content,
+            UnkeptResults::of(&chat.snapshot),
+        )
     {
         result.content = truncated;
     }
@@ -282,28 +289,64 @@ fn persistence_threshold(tool_name: &str) -> Option<usize> {
     Some(declared.min(DEFAULT_MAX_RESULT_SIZE_CHARS))
 }
 
+/// Why a Chat keeps no copy of the large results it cuts, which the note on each cut tells the
+/// model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UnkeptResults {
+    /// The Chat has no Folder.
+    NoFolder,
+    /// The Chat's Folder is only in its Execution Environment, and the Harness stores nothing for
+    /// it on this machine.
+    FolderInEnvironment,
+}
+
+impl UnkeptResults {
+    /// The reason for a Chat without a Chat directory.
+    pub(super) fn of(snapshot: &ChatSnapshot) -> Self {
+        if snapshot.folder.is_some() {
+            Self::FolderInEnvironment
+        } else {
+            Self::NoFolder
+        }
+    }
+
+    fn note(self) -> &'static str {
+        match self {
+            Self::NoFolder => "and this Chat has no Folder to keep the rest.",
+            Self::FolderInEnvironment => {
+                "and the rest is not kept anywhere, because this Chat's Folder is only in its execution environment; narrow the request to see more."
+            }
+        }
+    }
+}
+
 /// A result over its tool's threshold, cut to the threshold with a note on the rest, for a Chat
-/// with no Folder to store it in; `None` when it is within the threshold.
-fn truncate_large_tool_result(tool_name: &str, content: &str) -> Option<String> {
+/// with no Chat directory to store it in; `None` when it is within the threshold.
+fn truncate_large_tool_result(
+    tool_name: &str,
+    content: &str,
+    unkept: UnkeptResults,
+) -> Option<String> {
     let threshold = persistence_threshold(tool_name)?;
-    (utf16_length(content) > threshold).then(|| truncated_result(content, threshold))
+    (utf16_length(content) > threshold).then(|| truncated_result(content, threshold, unkept))
 }
 
 /// The start of `content`, at most `kept_units` UTF-16 code units, with a note on the rest.
-fn truncated_result(content: &str, kept_units: usize) -> String {
+fn truncated_result(content: &str, kept_units: usize, unkept: UnkeptResults) -> String {
     let (kept, _) = generate_preview(content, kept_units);
     format!(
-        "{kept}\n\n[Output truncated: the result has {} characters; only the first {} are shown, and this Chat has no Folder to keep the rest.]",
+        "{kept}\n\n[Output truncated: the result has {} characters; only the first {} are shown, {}]",
         utf16_length(content),
-        utf16_length(kept)
+        utf16_length(kept),
+        unkept.note()
     )
 }
 
-/// The per-message budget of [`enforce_tool_result_budget`] for a Chat without a Folder, which
-/// has nowhere to store results: each tool round over the budget has its largest results cut in
-/// place to an equal share of it. The cut depends only on the messages, so every request repeats
-/// it byte for byte.
-pub(super) fn cut_tool_results_over_budget(messages: &mut [Message]) {
+/// The per-message budget of [`enforce_tool_result_budget`] for a Chat without a Chat directory,
+/// which has nowhere to store results: each tool round over the budget has its largest results
+/// cut in place to an equal share of it. The cut depends only on the messages, so every request
+/// repeats it byte for byte.
+pub(super) fn cut_tool_results_over_budget(messages: &mut [Message], unkept: UnkeptResults) {
     let mut cuts = HashMap::new();
     for group in candidate_groups(messages) {
         let total = group.iter().map(|candidate| candidate.size).sum::<usize>();
@@ -325,7 +368,7 @@ pub(super) fn cut_tool_results_over_budget(messages: &mut [Message]) {
             }
             cuts.insert(
                 candidate.tool_use_id.to_owned(),
-                truncated_result(&candidate.content, share),
+                truncated_result(&candidate.content, share, unkept),
             );
             remaining = remaining - candidate.size + share;
         }
@@ -906,14 +949,20 @@ mod tests {
     #[test]
     fn a_large_result_without_a_folder_is_cut_at_its_threshold_with_a_note() {
         let threshold = persistence_threshold("WebFetch").unwrap();
-        assert!(truncate_large_tool_result("WebFetch", &"a".repeat(threshold)).is_none());
+        assert!(
+            truncate_large_tool_result("WebFetch", &"a".repeat(threshold), UnkeptResults::NoFolder)
+                .is_none()
+        );
         let content = format!("{}{}", "a".repeat(threshold), "b".repeat(threshold));
-        let truncated = truncate_large_tool_result("WebFetch", &content).unwrap();
+        let truncated =
+            truncate_large_tool_result("WebFetch", &content, UnkeptResults::NoFolder).unwrap();
         let (kept, note) = truncated.split_once("\n\n[Output truncated").unwrap();
         assert_eq!(kept, "a".repeat(threshold));
         assert!(note.contains(&format!("has {} characters", 2 * threshold)));
         assert!(note.contains("no Folder"));
-        assert!(truncate_large_tool_result(READ_TOOL_NAME, &content).is_none());
+        assert!(
+            truncate_large_tool_result(READ_TOOL_NAME, &content, UnkeptResults::NoFolder).is_none()
+        );
     }
 
     #[test]
@@ -948,13 +997,13 @@ mod tests {
         };
         let mut within = round(&[("a", &small), ("b", &small)]);
         let unchanged = within.clone();
-        cut_tool_results_over_budget(&mut within);
+        cut_tool_results_over_budget(&mut within, UnkeptResults::NoFolder);
         assert_eq!(within, unchanged);
 
         let mut over = round(&[("a", &small), ("b", &large), ("c", &large)]);
-        cut_tool_results_over_budget(&mut over);
+        cut_tool_results_over_budget(&mut over, UnkeptResults::NoFolder);
         let mut again = round(&[("a", &small), ("b", &large), ("c", &large)]);
-        cut_tool_results_over_budget(&mut again);
+        cut_tool_results_over_budget(&mut again, UnkeptResults::NoFolder);
         assert_eq!(over, again);
         let texts = over[1]
             .content

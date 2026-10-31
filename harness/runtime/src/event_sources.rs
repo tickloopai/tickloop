@@ -578,7 +578,8 @@ impl Agent {
             {
                 return;
             }
-            // Event sources deliver into a Chat's local inbox, which a Chat without a Folder lacks.
+            // Event sources deliver into a Chat's local inbox, which a Chat without a Chat
+            // directory (without a Folder, or with one only in the environment) lacks.
             if chat.tools.chat_directory().is_none() {
                 return;
             }

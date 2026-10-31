@@ -3435,7 +3435,10 @@ impl Agent {
                         self.record_content_replacements(&chat.snapshot, replacements);
                     }
                 }
-                None => tool_results::cut_tool_results_over_budget(&mut request.messages),
+                None => tool_results::cut_tool_results_over_budget(
+                    &mut request.messages,
+                    tool_results::UnkeptResults::of(&chat.snapshot),
+                ),
             }
             request.history_sources.insert(0, None);
             request.messages.insert(

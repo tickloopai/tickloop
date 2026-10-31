@@ -612,7 +612,7 @@ async fn an_unsupported_retained_shell_reports_a_blocker_without_discarding_its_
         state.tools = Arc::new(tickloop_harness_tools::Tools::for_chat(
             tickloop_harness_tools::ChatDirectory {
                 task_output: output.join("tasks"),
-                chat: output,
+                chat: Some(output),
                 family_temp: Some(family),
             },
             host.clone(),

@@ -1,6 +1,8 @@
 //! File history, Rewind and `@` mentions reach a Chat's Folder and Additional Directories only
 //! through its Execution Environment Port: here a memory environment whose display paths name
-//! directories that also exist, with other files, on this machine.
+//! directories that also exist, with other files, on this machine. The environment reports its
+//! roots as on this machine, since file history keeps backups only for such files; a Folder only
+//! in the environment is covered in `environment_folders`.
 
 use std::{
     path::PathBuf,
@@ -141,6 +143,8 @@ impl Fixture {
         let notes = Directory::new();
         memory.define_root(FOLDER, &folder.display(), FileAccess::ReadWrite);
         memory.define_root(NOTES, &notes.display(), notes_access);
+        memory.set_root_local_path(FOLDER, Some(folder.path.clone()));
+        memory.set_root_local_path(NOTES, Some(notes.path.clone()));
         let model = Arc::new(ScriptedModel::new(Vec::new()));
         let agent = Agent::with_seams(
             HarnessSeams {

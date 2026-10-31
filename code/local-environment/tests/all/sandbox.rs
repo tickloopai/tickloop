@@ -156,7 +156,7 @@ impl SandboxFixture {
         };
         let tools = Tools::for_chat(
             ChatDirectory {
-                chat: family.clone(),
+                chat: Some(family.clone()),
                 task_output: family.join("tasks"),
                 family_temp: Some(family),
             },

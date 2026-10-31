@@ -5,7 +5,8 @@
 //!
 //! The Port also says where the Folder is. A Folder root reported without a path on this machine
 //! is only in the environment: the Harness neither resolves nor checks it here, runs no local
-//! command for it and keeps no local scratchpad, plans or Skills for it. Any other Folder, also
+//! command for it and keeps no local scratchpad, plans, Skills, Chat directory or file-history
+//! backups for it. Any other Folder, also
 //! one a successfully bound environment reports no root for, is a directory on this machine.
 //! A failed binding never authorizes local access.
 

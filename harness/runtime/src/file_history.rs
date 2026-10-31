@@ -19,6 +19,14 @@
 //! is no longer a regular file, is neither backed up nor restored, and rewind records it as a
 //! failure and skips it. Backups do not keep permission bits, which the Port does not report; a
 //! restored file keeps its own, and a recreated one gets what the environment gives new files.
+//!
+//! Backups exist only for files on this machine. A file whose root the Port reports without a
+//! local path, and every file of a Chat whose Folder is only in the environment
+//! ([`FileLocation::is_only_in_environment`]), is never read into or restored from a backup and
+//! never makes the backup directory exist; such a Chat therefore writes nothing here. Its edits
+//! are only named in the snapshot they happened in, so rewind reports each such file as not
+//! restored instead of leaving it out silently, while files on this machine in the same Chat are
+//! restored as usual.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{CStr, CString};
@@ -54,6 +62,8 @@ const STAGED_FILE_PREFIX: &str = ".tickloop-file-history-";
 const PERMISSION_BITS: u32 = 0o7777;
 /// How much of a tracked file one read through its host asks for.
 const READ_CHUNK_BYTES: usize = 1024 * 1024;
+/// Why a file only in the environment is neither backed up nor restored.
+pub(crate) const ONLY_IN_ENVIRONMENT: &str = "the file is only in the execution environment, and file history keeps no copy of it on this machine";
 
 /// A file's version in one snapshot; an empty `backup_file_name` means the file does not exist in
 /// that version.
@@ -75,6 +85,9 @@ pub(crate) struct FileHistorySnapshot {
     backup_directory: Option<PathBuf>,
     pub message_id: Uuid,
     pub tracked_file_backups: BTreeMap<String, FileHistoryBackup>,
+    /// Files only in the environment edited after this snapshot's prompt, which have no backup.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    environment_files: BTreeSet<String>,
     pub timestamp: String,
 }
 
@@ -299,6 +312,17 @@ impl FileHistory {
         Some(latest.clone())
     }
 
+    /// Names a file only in the environment, which gets no backup, as edited after the latest
+    /// snapshot's prompt. Returns the updated snapshot, which the caller writes to the Transcript as
+    /// `isSnapshotUpdate`; returns `None` when there is no snapshot yet or it already names the file.
+    pub(crate) fn note_environment_edit(&mut self, key: &str) -> Option<FileHistorySnapshot> {
+        let latest = self.snapshots.last_mut()?;
+        latest
+            .environment_files
+            .insert(key.to_owned())
+            .then(|| latest.clone())
+    }
+
     /// Completes `fileHistoryTrackEdit` in one step: makes the initial backup when needed and
     /// records it into the latest snapshot.
     #[cfg(test)]
@@ -345,6 +369,7 @@ impl FileHistory {
             backup_directory: Some(self.directory.path().to_path_buf()),
             message_id,
             tracked_file_backups,
+            environment_files: BTreeSet::new(),
             timestamp: now_timestamp(),
         });
         self.pending_snapshots.push(PendingSnapshot {
@@ -440,12 +465,18 @@ impl FileHistory {
     /// Following Claude Code's `applySnapshot`: deletes the file when the target is empty; uses the
     /// initial backup for files absent from the snapshot; copies back only when the content
     /// differs. Errors without touching any file when no snapshot of the target message is found.
+    /// Files only in the environment edited since the target prompt are reported as failures.
     pub(crate) async fn rewind(
         &self,
         files: &FileLocator,
         message_id: Uuid,
     ) -> Result<FileRestoreReport, FileHistoryError> {
-        let target = self.target_snapshot(message_id)?;
+        let target_index = self
+            .snapshots
+            .iter()
+            .rposition(|snapshot| snapshot.message_id == message_id)
+            .ok_or(FileHistoryError::SnapshotNotFound)?;
+        let target = &self.snapshots[target_index];
         let mut report = FileRestoreReport::default();
         for key in &self.tracked_files {
             let path = PathBuf::from(key);
@@ -462,6 +493,16 @@ impl FileHistory {
                 Ok(true) => report.changed_files.push(path),
                 Ok(false) => {}
                 Err(error) => report.failures.push((path, error.to_string())),
+            }
+        }
+        let environment_files = self.snapshots[target_index..]
+            .iter()
+            .flat_map(|snapshot| &snapshot.environment_files)
+            .collect::<BTreeSet<_>>();
+        for key in environment_files {
+            let path = PathBuf::from(key);
+            if !report.failures.iter().any(|(failed, _)| *failed == path) {
+                report.failures.push((path, ONLY_IN_ENVIRONMENT.into()));
             }
         }
         Ok(report)
@@ -528,6 +569,20 @@ impl FileHistory {
     /// falling back to copying. Returns the snapshots whose backups were all copied successfully
     /// and should be written to the new Transcript.
     pub(crate) fn copy_backups_to(&self, directory: &PrivateDirectory) -> Vec<FileHistorySnapshot> {
+        let relocate = |mut snapshot: FileHistorySnapshot| {
+            snapshot.backup_directory = Some(directory.path().to_path_buf());
+            snapshot
+        };
+        // Without a backup to copy, the directory is not created: a Chat whose files are only in
+        // the environment keeps nothing on this machine.
+        if self.snapshots.iter().all(|snapshot| {
+            snapshot
+                .tracked_file_backups
+                .values()
+                .all(|backup| backup.backup_file_name.is_none())
+        }) {
+            return self.snapshots.iter().cloned().map(relocate).collect();
+        }
         let Ok(target) = open_backup_directory(directory, true) else {
             return Vec::new();
         };
@@ -546,10 +601,7 @@ impl FileHistory {
                     })
             })
             .cloned()
-            .map(|mut snapshot| {
-                snapshot.backup_directory = Some(directory.path().to_path_buf());
-                snapshot
-            })
+            .map(relocate)
             .collect()
     }
 
@@ -846,8 +898,11 @@ async fn tracked_file(files: &FileLocator, key: &str) -> Option<TrackedFile> {
 }
 
 impl TrackedLocation {
-    /// File history changes only files in directories the Chat can write.
+    /// File history changes only files on this machine in directories the Chat can write.
     fn new(location: FileLocation) -> io::Result<Self> {
+        if location.is_only_in_environment() {
+            return Err(io::Error::other(ONLY_IN_ENVIRONMENT));
+        }
         if !location
             .host
             .capabilities()
@@ -1225,6 +1280,44 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         (directory, root)
+    }
+
+    #[tokio::test]
+    async fn copying_a_history_without_backups_creates_no_directory() {
+        let (_directory, root) = canonical_temp_directory();
+        let files = local_files(&root);
+        let mut history = history(&root);
+        history.make_snapshot(&files, Uuid::from_u128(1)).await;
+        assert!(
+            history
+                .note_environment_edit("/design/index.html")
+                .is_some()
+        );
+        assert!(
+            history
+                .note_environment_edit("/design/index.html")
+                .is_none()
+        );
+        let target = PrivateDirectory::trusted(root.join("copy").join("chat"));
+
+        let (copied, recorded) = history.copy_to(target.clone());
+
+        assert!(!root.join("copy").exists());
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].backup_directory.as_deref(), Some(target.path()));
+        assert_eq!(
+            copied.snapshots()[0].environment_files,
+            recorded[0].environment_files
+        );
+        let report = copied.rewind(&files, Uuid::from_u128(1)).await.unwrap();
+        assert!(report.changed_files.is_empty());
+        assert_eq!(
+            report.failures,
+            vec![(
+                PathBuf::from("/design/index.html"),
+                ONLY_IN_ENVIRONMENT.to_owned()
+            )]
+        );
     }
 
     #[tokio::test]

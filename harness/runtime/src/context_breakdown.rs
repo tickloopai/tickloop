@@ -243,7 +243,10 @@ impl Agent {
                 &mut messages,
                 &chat.content_replacements,
             ),
-            None => crate::tool_results::cut_tool_results_over_budget(&mut messages),
+            None => crate::tool_results::cut_tool_results_over_budget(
+                &mut messages,
+                crate::tool_results::UnkeptResults::of(&chat.snapshot),
+            ),
         }
         let workspace_host = chat
             .snapshot

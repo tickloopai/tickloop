@@ -63,8 +63,9 @@ pub(super) struct FeedbackUnlink {
 }
 
 pub(super) struct FeedbackInbox {
-    /// `None` for a Chat without a Folder, which keeps no inbox: nothing is saved in it, and
-    /// its host delivers each request with `TurnOp::Deliver`.
+    /// `None` for a Chat without a Chat directory (without a Folder, or with one only in its
+    /// Execution Environment), which keeps no inbox: nothing is saved in it, and its host
+    /// delivers each request with `TurnOp::Deliver`.
     root: Option<PrivateDirectory>,
     chat_id: Uuid,
 }
@@ -103,7 +104,7 @@ impl FeedbackInbox {
         self.root
             .as_ref()
             .map(|root| root.join(name))
-            .ok_or_else(|| io::Error::other("this Chat has no Folder to keep Artifact feedback"))
+            .ok_or_else(|| io::Error::other("this Chat keeps no Artifact feedback on this machine"))
     }
 
     fn key(identity: &FeedbackIdentity) -> String {

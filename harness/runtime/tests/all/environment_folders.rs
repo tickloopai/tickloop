@@ -171,8 +171,21 @@ impl Fixture {
         chat: ChatId,
         calls: &[(&str, &str, Value)],
     ) -> (ModelRequest, Vec<(String, ToolResult)>) {
-        for (id, name, input) in calls {
-            self.model.enqueue(call(id, name, input.clone()));
+        let replies = calls
+            .iter()
+            .map(|(id, name, input)| call(id, name, input.clone()))
+            .collect();
+        self.turn_with_replies(chat, replies).await
+    }
+
+    /// [`Self::turn`] in which the model gives `replies` in order, each with any number of calls.
+    async fn turn_with_replies(
+        &self,
+        chat: ChatId,
+        replies: Vec<Vec<Content>>,
+    ) -> (ModelRequest, Vec<(String, ToolResult)>) {
+        for reply in replies {
+            self.model.enqueue(reply);
         }
         self.model.enqueue(text("done"));
         let mut events = self.agent.subscribe();
@@ -567,12 +580,12 @@ async fn remote_transcript_does_not_read_local_git() {
 }
 
 #[tokio::test]
-async fn reattach_preserves_original_rewind_backup() {
+async fn reattach_keeps_reporting_environment_edits_on_rewind() {
     check_reattached_history(false).await;
 }
 
 #[tokio::test]
-async fn restarting_while_detached_preserves_original_rewind_backup() {
+async fn restarting_while_detached_keeps_reporting_environment_edits_on_rewind() {
     check_reattached_history(true).await;
 }
 
@@ -621,18 +634,388 @@ async fn check_reattached_history(restart_detached: bool) {
     assert!(!result(&second, "edit2").is_error);
     let fixture = fixture.reopen().await;
     fixture.agent.resume_chat(chat).await.unwrap();
+    let code = fixture
+        .agent
+        .rewind(chat, point, tickloop_harness_protocol::RewindMode::Code)
+        .await
+        .unwrap()
+        .code
+        .unwrap();
+    let actual = fixture.environment.file(Some("app"), "notes.md");
+    fixture.agent.shutdown().await;
+    assert!(code.changed_files.is_empty(), "{code:?}");
+    assert_only_in_environment(&code.failed_files, &[format!("{APP}/notes.md")]);
+    assert_eq!(
+        actual.as_deref(),
+        Some(&b"final\n"[..]),
+        "a file only in the environment has no backup to restore"
+    );
+}
+
+/// Asserts that rewind reported exactly `paths` as not restored because file history keeps no
+/// copy of files only in the environment.
+fn assert_only_in_environment(failed: &[(PathBuf, String)], paths: &[String]) {
+    let mut reported = failed
+        .iter()
+        .map(|(path, reason)| {
+            assert!(
+                reason.contains("only in the execution environment"),
+                "{}: {reason}",
+                path.display()
+            );
+            path.display().to_string()
+        })
+        .collect::<Vec<_>>();
+    reported.sort();
+    let mut expected = paths.to_vec();
+    expected.sort();
+    assert_eq!(reported, expected);
+}
+
+/// The `file_change` each Write or Edit call of `chat` was prepared with, by call id.
+async fn prepared_file_changes(fixture: &Fixture, chat: ChatId) -> Vec<(String, bool)> {
     fixture
+        .agent
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .operations
+        .iter()
+        .filter(|operation| [WRITE_TOOL_NAME, EDIT_TOOL_NAME].contains(&operation.name.as_str()))
+        .map(|operation| (operation.call_id.clone(), operation.file_change.is_some()))
+        .collect()
+}
+
+const HOST_TEMP_CHILD: &str = "TICKLOOP_HOST_TEMP_CHILD";
+
+/// In the test process, runs `test` again in a child whose `TICKLOOP_TMPDIR` is first a directory
+/// nobody may write and then a writable one, checks that both runs passed and left the directory
+/// empty, and returns `false`; in the child, returns `true` so the caller runs the test body.
+fn in_child_with_host_temp(test: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if std::env::var_os(HOST_TEMP_CHILD).is_some() {
+        return true;
+    }
+    for mode in [0o500, 0o700] {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        let probe = std::fs::write(base.path().join("probe"), "x");
+        assert_eq!(probe.is_err(), mode == 0o500, "{probe:?}");
+        let _ = std::fs::remove_file(base.path().join("probe"));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(HOST_TEMP_CHILD, "1")
+            .env("TICKLOOP_TMPDIR", base.path())
+            .output()
+            .unwrap();
+        let left = std::fs::read_dir(base.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "mode {mode:o}:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(left.is_empty(), "mode {mode:o} left {left:?}");
+    }
+    false
+}
+
+/// `lines` lines of `width` characters each, every one containing `delivery`.
+fn text_of(lines: usize, width: usize) -> String {
+    (0..lines)
+        .map(|index| format!("{:<width$}\n", format!("delivery {index}")))
+        .collect()
+}
+
+fn utf16_length(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// The text of each tool result `request` sends, by call id.
+fn sent_results(request: &ModelRequest) -> Vec<(String, String)> {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => Some((tool_use_id.clone(), content.text().into_owned())),
+            _ => None,
+        })
+        .collect()
+}
+
+const NOT_KEPT_NOTE: &str = "the rest is not kept anywhere, because this Chat's Folder is only in its execution environment";
+
+#[tokio::test]
+async fn a_remote_folder_chat_keeps_nothing_on_the_host() {
+    if !in_child_with_host_temp(&tickloop_harness_test_support::test_path!(
+        a_remote_folder_chat_keeps_nothing_on_the_host
+    )) {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture
+        .environment
+        .put_file(Some("app"), "notes.md", "original\n");
+    fixture
+        .environment
+        .put_file(Some("app"), "log.txt", text_of(600, 150));
+    for part in 0..4 {
+        fixture
+            .environment
+            .put_file(Some("app"), &format!("part-{part}.txt"), text_of(1500, 30));
+    }
+    let chat = fixture.agent.create_chat(PathBuf::from(APP)).await.unwrap();
+
+    let (_, results) = fixture
+        .turn(
+            chat,
+            &[
+                ("read", "Read", json!({"file_path": "notes.md"})),
+                (
+                    "edit",
+                    "Edit",
+                    json!({"file_path": "notes.md", "old_string": "original", "new_string": "changed"}),
+                ),
+                (
+                    "write",
+                    "Write",
+                    json!({"file_path": format!("{APP}/answer.md"), "content": "yes\n"}),
+                ),
+            ],
+        )
+        .await;
+    for id in ["read", "edit", "write"] {
+        assert!(
+            !result(&results, id).is_error,
+            "{id}: {:?}",
+            result(&results, id)
+        );
+    }
+    assert_eq!(
+        fixture.environment.file(Some("app"), "notes.md").as_deref(),
+        Some(&b"changed\n"[..])
+    );
+    assert_eq!(
+        fixture
+            .environment
+            .file(Some("app"), "answer.md")
+            .as_deref(),
+        Some(&b"yes\n"[..])
+    );
+    assert_eq!(
+        prepared_file_changes(&fixture, chat).await,
+        vec![("edit".to_owned(), false), ("write".to_owned(), false)]
+    );
+    let point = *fixture
+        .agent
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .message_ids
+        .values()
+        .next()
+        .unwrap();
+
+    let (_, results) = fixture
+        .turn(
+            chat,
+            &[(
+                "grep",
+                "Grep",
+                json!({"pattern": "delivery", "path": "log.txt", "output_mode": "content", "head_limit": 0}),
+            )],
+        )
+        .await;
+    let grep = result(&results, "grep");
+    assert!(!grep.is_error, "{grep:?}");
+    assert!(
+        grep.content.contains(NOT_KEPT_NOTE),
+        "{}",
+        &grep.content[grep.content.len() - 400..]
+    );
+    assert!(grep.content.contains("delivery 0"));
+    assert!(!grep.content.contains("delivery 599"));
+    assert!(utf16_length(&grep.content) < 21_000);
+    assert_eq!(grep.output_ref, None);
+
+    let reads = (0..4)
+        .map(|part| {
+            (
+                format!("part-{part}"),
+                json!({"file_path": format!("part-{part}.txt")}),
+            )
+        })
+        .collect::<Vec<_>>();
+    let one_round = reads
+        .iter()
+        .flat_map(|(id, input)| call(id, READ_TOOL_NAME, input.clone()))
+        .collect();
+    let (request, results) = fixture.turn_with_replies(chat, vec![one_round]).await;
+    let total = reads
+        .iter()
+        .map(|(id, _)| {
+            let read = result(&results, id);
+            assert!(
+                !read.is_error && !read.content.contains(NOT_KEPT_NOTE),
+                "{id}"
+            );
+            utf16_length(&read.content)
+        })
+        .sum::<usize>();
+    assert!(total > 200_000, "{total}");
+    let sent = sent_results(&request);
+    let round = reads
+        .iter()
+        .map(|(id, _)| &sent.iter().find(|(sent_id, _)| sent_id == id).unwrap().1)
+        .collect::<Vec<_>>();
+    assert!(round.iter().any(|text| text.contains(NOT_KEPT_NOTE)));
+    assert!(
+        round.iter().map(|text| utf16_length(text)).sum::<usize>() <= 200_000 + 4 * 400,
+        "the round was not cut to the budget"
+    );
+
+    let fixture = fixture.reopen().await;
+    fixture.agent.resume_chat(chat).await.unwrap();
+    assert_eq!(
+        fixture
+            .agent
+            .rewind_file_changes(chat, point)
+            .await
+            .unwrap(),
+        Some(Vec::new())
+    );
+    let outcome = fixture
         .agent
         .rewind(chat, point, tickloop_harness_protocol::RewindMode::Code)
         .await
         .unwrap();
-    let actual = fixture.environment.file(Some("app"), "notes.md");
-    fixture.agent.shutdown().await;
-    assert_eq!(
-        actual.as_deref(),
-        Some(&b"original\n"[..]),
-        "reattaching must not replace original @v1 backup"
+    let code = outcome.code.unwrap();
+    assert!(
+        code.changed_files.is_empty() && code.error.is_none(),
+        "{code:?}"
     );
+    assert_only_in_environment(
+        &code.failed_files,
+        &[format!("{APP}/notes.md"), format!("{APP}/answer.md")],
+    );
+    assert_eq!(
+        fixture.environment.file(Some("app"), "notes.md").as_deref(),
+        Some(&b"changed\n"[..])
+    );
+    fixture.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn mixed_roots_keep_records_only_for_files_on_this_machine() {
+    let (fixture, chat, root, _) = local_fixture().await;
+    let folder = root.path().canonicalize().unwrap();
+    fixture
+        .environment
+        .define_root("design", DESIGN, FileAccess::ReadWrite);
+    fixture
+        .environment
+        .put_file(Some("app"), "local.md", "local original\n");
+    fixture
+        .environment
+        .put_file(Some("design"), "remote.md", "remote original\n");
+    fixture
+        .agent
+        .set_directories(chat, folder.clone(), vec![DESIGN.into()])
+        .await
+        .unwrap();
+    let remote = format!("{DESIGN}/remote.md");
+    let (_, results) = fixture
+        .turn(
+            chat,
+            &[
+                ("read-local", "Read", json!({"file_path": "local.md"})),
+                (
+                    "edit-local",
+                    "Edit",
+                    json!({"file_path": "local.md", "old_string": "original", "new_string": "changed"}),
+                ),
+                ("read-remote", "Read", json!({"file_path": remote})),
+                (
+                    "edit-remote",
+                    "Edit",
+                    json!({"file_path": remote, "old_string": "original", "new_string": "changed"}),
+                ),
+            ],
+        )
+        .await;
+    for id in ["edit-local", "edit-remote"] {
+        assert!(
+            !result(&results, id).is_error,
+            "{id}: {:?}",
+            result(&results, id)
+        );
+    }
+    assert_eq!(
+        prepared_file_changes(&fixture, chat).await,
+        vec![
+            ("edit-local".to_owned(), true),
+            ("edit-remote".to_owned(), false)
+        ]
+    );
+    let point = *fixture
+        .agent
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .message_ids
+        .values()
+        .next()
+        .unwrap();
+    fixture.agent.sync().await.unwrap();
+    let history = fixture
+        .store
+        .lines(chat)
+        .iter()
+        .find_map(|line| match line {
+            Line::FileHistorySnapshot(entry) => entry
+                .snapshot
+                .get("backupDirectory")
+                .and_then(Value::as_str)
+                .map(PathBuf::from),
+            _ => None,
+        })
+        .unwrap();
+    let backups = std::fs::read_dir(&history)
+        .unwrap()
+        .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(backups, vec![b"local original\n".to_vec()]);
+
+    let code = fixture
+        .agent
+        .rewind(chat, point, tickloop_harness_protocol::RewindMode::Code)
+        .await
+        .unwrap()
+        .code
+        .unwrap();
+    assert_eq!(code.changed_files, vec![folder.join("local.md")]);
+    assert_only_in_environment(&code.failed_files, std::slice::from_ref(&remote));
+    assert_eq!(
+        fixture.environment.file(Some("app"), "local.md").as_deref(),
+        Some(&b"local original\n"[..])
+    );
+    assert_eq!(
+        fixture
+            .environment
+            .file(Some("design"), "remote.md")
+            .as_deref(),
+        Some(&b"remote changed\n"[..])
+    );
+    fixture.agent.shutdown().await;
 }
 #[tokio::test]
 async fn permissions_view_avoids_remote_project_partition() {

@@ -19,7 +19,7 @@ use crate::{
 pub(crate) struct ChatFiles {
     environment: Arc<dyn FileHost>,
     /// The Chat's own directories, which the Harness keeps on this machine whatever the
-    /// environment.
+    /// environment; a Chat whose Folder is only in the environment has none.
     harness: Option<Arc<dyn FileHost>>,
 }
 
@@ -59,6 +59,29 @@ impl FileLocation {
     pub fn display(&self) -> String {
         self.host.capabilities().display(&self.path)
     }
+
+    /// Whether the Harness keeps no record of this file on this machine; see
+    /// [`is_only_in_environment`].
+    pub fn is_only_in_environment(&self) -> bool {
+        is_only_in_environment(self.host.as_ref(), &self.path)
+    }
+}
+
+/// Whether the Harness keeps no record of the file at `path` on this machine: no file-history
+/// backup and no file change review. That is so when the file's root has no path on this machine,
+/// or when the Chat's Folder is only in the environment, since such a Chat keeps nothing on this
+/// machine whatever its other roots are. Files in roots on this machine, in the Chat's own
+/// directories, and outside every root of a Chat whose Folder is here are kept as before.
+fn is_only_in_environment(host: &dyn FileHost, path: &FilePath) -> bool {
+    let capabilities = host.capabilities();
+    let folder_in_environment = capabilities
+        .folder()
+        .is_some_and(|folder| folder.local_path.is_none());
+    folder_in_environment
+        || path
+            .root()
+            .and_then(|name| capabilities.root(name))
+            .is_some_and(|root| root.local_path.is_none())
 }
 
 impl std::fmt::Debug for FileLocation {
@@ -299,6 +322,12 @@ fn outside_readable(path: &Path) -> ToolError {
 }
 
 impl FileTarget {
+    /// Whether the Harness keeps no record of this file on this machine; see
+    /// [`is_only_in_environment`].
+    pub(crate) fn is_only_in_environment(&self) -> bool {
+        is_only_in_environment(self.host.as_ref(), &self.path)
+    }
+
     pub(crate) fn location(&self) -> FileLocation {
         FileLocation {
             host: self.host.clone(),

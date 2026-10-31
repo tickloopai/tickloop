@@ -633,21 +633,23 @@ impl From<LocalFileError> for ToolError {
 /// The local directories of one Chat with a Folder.
 #[derive(Clone, Debug)]
 pub struct ChatDirectory {
-    /// File change reviews and stored tool results go here.
-    pub chat: PrivateDirectory,
+    /// File change reviews and stored tool results go here; `None` for a Chat whose Folder is
+    /// only in its Execution Environment, which keeps nothing on this machine: its large results
+    /// are cut instead of stored and its changes have no review artifact.
+    pub chat: Option<PrivateDirectory>,
     /// Background task output directory; following Claude Code, `<chatId>/tasks` under the system
     /// temp directory.
     pub task_output: PrivateDirectory,
     /// Canonical private family temp space, shared by the family's root and its children; `None`
-    /// for a Chat whose Folder is only in its Execution Environment, which has no scratchpad and
-    /// whose file tools only read the Chat's own directories on this machine.
+    /// for a Chat whose Folder is only in its Execution Environment, which has no scratchpad.
     pub family_temp: Option<PrivateDirectory>,
 }
 
 impl ChatDirectory {
     /// The Chat's own directories its file tools read without asking.
     fn harness_paths(&self) -> Vec<PathBuf> {
-        std::iter::once(&self.chat)
+        self.chat
+            .iter()
             .chain(&self.family_temp)
             .map(|directory| directory.path().to_path_buf())
             .collect()
@@ -694,7 +696,7 @@ impl Tools {
             Some(ChatDirectory {
                 task_output: output_dir.join(TASK_OUTPUT_SUBDIRECTORY),
                 family_temp: Some(output_dir.clone()),
-                chat: output_dir,
+                chat: Some(output_dir),
             }),
             shell::Registry::without_host(),
             None,
@@ -862,7 +864,7 @@ impl Tools {
             let name = name.to_owned();
             let input = input.clone();
             let file_reads = self.file_reads.clone();
-            let join_error_path = directory.chat.path().to_path_buf();
+            let join_error_path = workspace.folder.clone().unwrap_or_default();
             tokio::task::spawn_blocking(move || {
                 complete_now(prepare_call(
                     None,
@@ -882,24 +884,33 @@ impl Tools {
         };
         if let Operation::Write(operation) = &mut prepared.operation {
             let review = write::take_review(operation);
-            let output_dir = directory.chat;
-            let join_error_path = output_dir.path().to_path_buf();
-            let file_change = tokio::task::spawn_blocking(move || {
-                let review_directory = output_dir.join(ARTIFACT_DIRECTORY);
-                review_directory
-                    .create()
-                    .map_err(|error| FileChangeArtifactError::Io {
-                        path: review_directory.path().to_path_buf(),
-                        reason: error.to_string(),
-                    })?;
-                persist_file_change_review(output_dir.path(), &review)
-            })
-            .await
-            .map_err(|error| ToolError::Io {
-                path: join_error_path,
-                reason: format!("tool preparation did not finish: {error}"),
-            })??;
-            prepared.file_change = Some(file_change);
+            // A file only in the environment gets no review artifact: the Harness keeps nothing
+            // about it on this machine, so its change is reviewed from the call's input alone.
+            let output_dir = directory.chat.filter(|_| {
+                !prepared
+                    .file
+                    .as_ref()
+                    .is_some_and(FileTarget::is_only_in_environment)
+            });
+            if let Some(output_dir) = output_dir {
+                let join_error_path = output_dir.path().to_path_buf();
+                let file_change = tokio::task::spawn_blocking(move || {
+                    let review_directory = output_dir.join(ARTIFACT_DIRECTORY);
+                    review_directory
+                        .create()
+                        .map_err(|error| FileChangeArtifactError::Io {
+                            path: review_directory.path().to_path_buf(),
+                            reason: error.to_string(),
+                        })?;
+                    persist_file_change_review(output_dir.path(), &review)
+                })
+                .await
+                .map_err(|error| ToolError::Io {
+                    path: join_error_path,
+                    reason: format!("tool preparation did not finish: {error}"),
+                })??;
+                prepared.file_change = Some(file_change);
+            }
         }
         if let Operation::TaskStop(input) = &prepared.operation {
             self.commands.stoppable_task(ids, &input.task_id).await?;
@@ -1057,9 +1068,11 @@ impl Tools {
         Some(self.directory.as_ref()?.family_temp.as_ref()?.path())
     }
 
-    /// Where this Chat keeps file change reviews and stored tool results; `None` without a Folder.
+    /// Where this Chat keeps file change reviews and stored tool results; `None` without a Folder
+    /// and for a Chat whose Folder is only in its Execution Environment, which keeps nothing on
+    /// this machine.
     pub fn chat_directory(&self) -> Option<&PrivateDirectory> {
-        Some(&self.directory.as_ref()?.chat)
+        self.directory.as_ref()?.chat.as_ref()
     }
 
     /// What this Chat's `Read` calls returned, for Claude Code's read-before-write checks.

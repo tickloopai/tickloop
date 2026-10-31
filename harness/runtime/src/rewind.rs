@@ -265,7 +265,8 @@ impl Agent {
     }
 
     /// File rollback backup directory: `<root>/file-history/<chatId>` when persisting, following
-    /// Claude Code.
+    /// Claude Code. A Chat whose Folder is only in the environment never creates it, since it backs
+    /// up no file.
     pub(super) fn file_history_directory(
         &self,
         chat_id: ChatId,
@@ -342,7 +343,8 @@ impl Agent {
     /// backup for an untracked file and writes the snapshot update keyed by the assistant message
     /// that issued the edit. A failed backup (including a file replaced by a symlink, not a
     /// regular file or in a directory the Chat can only read) only gives up tracking and does not
-    /// block the edit.
+    /// block the edit. A file only in the environment gets no backup and is only named in the
+    /// snapshot, so that rewind reports it.
     pub(super) async fn track_file_edit(
         &self,
         chat_id: ChatId,
@@ -351,13 +353,19 @@ impl Agent {
     ) {
         let key = file.display();
         let directory = {
-            let chats = self.inner.chats.lock().await;
+            let mut chats = self.inner.chats.lock().await;
             let Some(history) = chats
-                .get(&chat_id)
-                .and_then(|chat| chat.file_history.as_ref())
+                .get_mut(&chat_id)
+                .and_then(|chat| chat.file_history.as_mut())
             else {
                 return;
             };
+            if file.is_only_in_environment() {
+                if let Some(snapshot) = history.note_environment_edit(&key) {
+                    self.record_file_history_snapshot(chat_id, message_id, &snapshot, true);
+                }
+                return;
+            }
             if !history.needs_backup(&key) {
                 return;
             }

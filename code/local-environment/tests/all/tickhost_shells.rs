@@ -74,7 +74,7 @@ impl Fixture {
         };
         let tools = Tools::for_chat(
             ChatDirectory {
-                chat: output.clone(),
+                chat: Some(output.clone()),
                 task_output: output.join("tasks"),
                 family_temp: Some(output),
             },
