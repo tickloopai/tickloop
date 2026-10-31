@@ -746,7 +746,11 @@ fn sse_stream(
     SseStream::from_bytes_stream(stream)
         .map(move |event| {
             event.and_then(|mut event| {
-                event.data = event.data.filter(|data| !data.is_empty());
+                // SEP-1699 priming sends an id (and usually retry) with empty data.
+                // The SSE spec records that id for Last-Event-ID and ignores the
+                // event. rmcp skips a payload whose trim is empty; whitespace is
+                // never JSON-RPC, so drop it before redaction parses the event.
+                event.data = event.data.filter(|data| !data.trim().is_empty());
                 if let Some(redact) = &redactor {
                     if let Some(data) = event.data.take() {
                         event.data = Some(
@@ -1074,8 +1078,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_sse_data_preserves_metadata_and_the_following_message() {
-        for newline in ["\n", "\r\n"] {
-            for data in ["data:", "data: ", ""] {
+        // `\r` alone is an SSE line ending, beside `\n` and `\r\n`. `data:  `
+        // keeps one space after the parser strips a single leading space.
+        for newline in ["\n", "\r\n", "\r"] {
+            for data in ["data:", "data: ", "data:  ", ""] {
                 for redacted in [false, true] {
                     let data = if data.is_empty() {
                         String::new()
@@ -1135,11 +1141,30 @@ mod tests {
 
     #[tokio::test]
     async fn nonempty_sse_data_keeps_existing_validation() {
-        for (body, payload) in [
-            ("data: not-json\n\n", "not-json"),
-            ("data:  \n\n", " "),
-            ("data:\ndata:\n\n", "\n"),
-        ] {
+        for redacted in [false, true] {
+            let redactor: Option<ResponseRedactor> =
+                redacted.then(|| Arc::new(|_: &mut Value, _| {}) as ResponseRedactor);
+            let mut events = sse_stream(
+                event_stream_response("data: not-json\n\n").await,
+                MAX_JSON_BYTES,
+                redactor,
+                DirectoryRequests::default(),
+                None,
+            );
+            let event = events.next().await.unwrap();
+            if redacted {
+                assert_eq!(
+                    event.unwrap_err().to_string(),
+                    "body error: invalid MCP event response"
+                );
+            } else {
+                assert_eq!(event.unwrap().data.as_deref(), Some("not-json"));
+            }
+        }
+
+        // A lone space (`data:  `) and two empty `data:` lines (`"\n"`) trim to
+        // nothing. rmcp skips those payloads, so they are empty data.
+        for body in ["data:  \n\n", "data:\ndata:\n\n"] {
             for redacted in [false, true] {
                 let redactor: Option<ResponseRedactor> =
                     redacted.then(|| Arc::new(|_: &mut Value, _| {}) as ResponseRedactor);
@@ -1150,35 +1175,76 @@ mod tests {
                     DirectoryRequests::default(),
                     None,
                 );
-                let event = events.next().await.unwrap();
-                if redacted {
-                    assert_eq!(
-                        event.unwrap_err().to_string(),
-                        "body error: invalid MCP event response"
-                    );
-                } else {
-                    assert_eq!(event.unwrap().data.as_deref(), Some(payload));
-                }
+                let event = events.next().await.expect(body).expect(body);
+                assert_eq!(event.data, None, "{body}");
+                assert!(events.next().await.is_none(), "{body}");
             }
         }
     }
 
     #[tokio::test]
     async fn empty_sse_data_alone_does_not_complete_initialization() {
-        let events = sse_stream(
-            event_stream_response("data: \nid: 0\nretry: 3000\n\n").await,
-            MAX_JSON_BYTES,
-            Some(Arc::new(|_, _| {})),
-            DirectoryRequests::default(),
-            None,
-        );
-        let result = StreamableHttpPostResponse::Sse(events, None)
-            .expect_initialized::<McpHttpError>()
-            .await;
-        assert!(matches!(
-            result,
-            Err(StreamableHttpError::UnexpectedServerResponse(_))
-        ));
+        for body in [
+            "data: \nid: 0\nretry: 3000\n\n",
+            "data:  \nid: 0\nretry: 3000\n\n",
+            "data:\ndata:\nid: 0\nretry: 3000\n\n",
+            ": ping\n\n",
+            ": ping\r\r",
+        ] {
+            let events = sse_stream(
+                event_stream_response(body).await,
+                MAX_JSON_BYTES,
+                Some(Arc::new(|_, _| {})),
+                DirectoryRequests::default(),
+                None,
+            );
+            let result = StreamableHttpPostResponse::Sse(events, None)
+                .expect_initialized::<McpHttpError>()
+                .await;
+            match result {
+                Err(StreamableHttpError::UnexpectedServerResponse(_)) => {}
+                other => panic!("{body:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// A comment-only keep-alive, then a priming event, then a JSON-RPC
+    /// notification, then the response. Line endings are LF, CRLF, and bare CR.
+    #[tokio::test]
+    async fn comment_keep_alive_and_priming_then_a_notification_still_settle() {
+        let notification = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
+        let response_body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+        for newline in ["\n", "\r\n", "\r"] {
+            for priming in [
+                format!("data:{newline}"),
+                format!("data:  {newline}"),
+                format!("data:{newline}data:{newline}"),
+            ] {
+                let body = [
+                    format!(": ping{newline}"),
+                    format!("{newline}{priming}id: 0{newline}retry: 3000{newline}"),
+                    format!("{newline}data: {notification}{newline}"),
+                    format!("{newline}data: {response_body}{newline}{newline}"),
+                ]
+                .concat();
+                let events = sse_stream(
+                    event_stream_response(&body).await,
+                    MAX_JSON_BYTES,
+                    Some(Arc::new(|_: &mut Value, _| {})),
+                    DirectoryRequests::default(),
+                    None,
+                );
+                let (message, session_id) = StreamableHttpPostResponse::Sse(events, None)
+                    .expect_initialized::<McpHttpError>()
+                    .await
+                    .unwrap_or_else(|error| panic!("newline {newline:?}: {error}"));
+                assert!(session_id.is_none());
+                let ServerJsonRpcMessage::Response(response) = message else {
+                    panic!("newline {newline:?}: expected the JSON-RPC response");
+                };
+                assert_eq!(response.id, rmcp::model::RequestId::Number(1));
+            }
+        }
     }
 
     #[tokio::test]

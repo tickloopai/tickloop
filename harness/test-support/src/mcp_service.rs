@@ -127,7 +127,11 @@ impl McpService {
                                     let response = state.directory_response.take();
                                     if response.is_some() {
                                         state.directory_resumes += 1;
-                                        state.directory_resume_id = headers.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("last-event-id")).map(|(_, value)| value.trim().to_owned()));
+                                        state.directory_resume_id = headers.lines().find_map(|line| {
+                                            let (name, value) = line.split_once(':')?;
+                                            name.eq_ignore_ascii_case("last-event-id")
+                                                .then(|| value.trim().to_owned())
+                                        });
                                     }
                                     response
                                 };
@@ -213,16 +217,38 @@ impl McpService {
                                 } else { false }
                             };
                             let empty_sse_priming = state.lock().unwrap().empty_sse_priming;
+                            let discover_error_over_sse = request["method"] == "server/discover"
+                                && state.lock().unwrap().discover_error_over_sse;
+                            let prime_sse =
+                                empty_sse_priming && request["method"] != "server/discover";
                             let (status, content_type, body) = if resume_directory {
                                 let data = if empty_sse_priming { "data: \n" } else { "" };
-                                (200, "text/event-stream", format!("{data}id: directory-cut\nretry: 0\n\n"))
+                                (
+                                    200,
+                                    "text/event-stream",
+                                    format!("{data}id: directory-cut\nretry: 0\n\n"),
+                                )
                             } else if request.get("id").is_none() {
                                 (202, "application/json", String::new())
-                            } else if !notifications.is_empty() || (request["method"] == "server/discover" && state.lock().unwrap().discover_error_over_sse) || (empty_sse_priming && request["method"] != "server/discover") {
-                                let priming = if empty_sse_priming { "data: \nid: 0\nretry: 3000\n\n" } else { "" };
-                                let events: String = notifications.iter().map(|notification| format!("data: {notification}\n\n")).collect();
-                                (status, "text/event-stream", format!("{priming}{events}data: {response}\n\n"))
-                            } else { (status, "application/json", response.to_string()) };
+                            } else if !notifications.is_empty() || discover_error_over_sse || prime_sse
+                            {
+                                let priming = if empty_sse_priming {
+                                    "data: \nid: 0\nretry: 3000\n\n"
+                                } else {
+                                    ""
+                                };
+                                let events: String = notifications
+                                    .iter()
+                                    .map(|notification| format!("data: {notification}\n\n"))
+                                    .collect();
+                                (
+                                    status,
+                                    "text/event-stream",
+                                    format!("{priming}{events}data: {response}\n\n"),
+                                )
+                            } else {
+                                (status, "application/json", response.to_string())
+                            };
                             let (status, body) = state.lock().unwrap().http_responses.get(request["method"].as_str().unwrap_or("")).cloned().unwrap_or((status, body));
                             let challenge = challenge.map(|value| format!("WWW-Authenticate: {value}\r\n")).unwrap_or_default();
                             let body_length = body.len() + if request["method"] == "server/discover" && state.lock().unwrap().truncate_discover { 100 } else { 0 };
