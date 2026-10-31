@@ -1100,10 +1100,10 @@ impl McpConnections {
         let current = call.entry.snapshot.read().unwrap().clone();
         if current.generation != call.generation
             || current.secret_generation != call.entry.secret_generation.load(Ordering::SeqCst)
-            || !current
+            || current
                 .tools
                 .get(&call.tool.definition.name)
-                .is_some_and(|tool| tool.fingerprint == call.tool.fingerprint)
+                .is_none_or(|tool| tool.fingerprint != call.tool.fingerprint)
         {
             return Err("MCP tool changed before dispatch".into());
         }
