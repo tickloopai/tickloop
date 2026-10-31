@@ -124,7 +124,7 @@ fn enter_shows_and_focuses_a_card_and_a_lone_escape_leaves_a_read_only_one_open(
     assert!(state.card_focused());
     state.draw_frame(&mut Vec::new()).unwrap();
     let shown = screen(&state);
-    assert!(shown.contains("input"), "{shown}");
+    assert!(shown.contains("focused"), "{shown}");
     assert!(
         shown.contains("━━"),
         "the focused card's rule is heavy: {shown}"
@@ -340,7 +340,11 @@ fn a_focused_card_and_an_unfocused_card_render_their_rows_rules_and_screens() {
 
     let focused = frame(true);
     let row = line_of(&focused, "tail log");
-    assert!(row.text().trim_end().ends_with("input"), "{:?}", row.text());
+    assert!(
+        row.text().trim_end().ends_with("focused"),
+        "{:?}",
+        row.text()
+    );
     assert_eq!(row.fill, Some(Role::Selection));
     assert!(row.preserve_selection_colours);
     assert!(

@@ -17,8 +17,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    DEFAULT_OUTPUT_BYTES, Operation, ToolDefinition, ToolError, io_error, read::semantic_integer,
-    write::semantic_boolean,
+    DEFAULT_OUTPUT_BYTES, Operation, ToolDefinition, ToolError,
+    input::{given_text, parse_input, semantic_boolean, semantic_integer},
+    io_error,
 };
 use tickloop_harness_base::private_fs::{
     OpenTarget, PrivateDirectory, open_without_following_links,
@@ -50,6 +51,9 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 /// How often a running command's output size is published.
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(40);
+/// How long a stop waits for the command's exit once the stop is dispatched; a host that never
+/// reports the exit leaves the outcome unknown instead of holding the caller.
+const STOP_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(15);
 /// Size limit for a single task output file. Claude Code uses 5GB; per the decision in ticket 34
 /// Tickloop keeps 64 MiB, enforced by the Tickhost running the command.
 pub(crate) const MAX_COMMAND_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -78,6 +82,7 @@ pub(super) struct ShellInput {
         deserialize_with = "semantic_boolean"
     )]
     dangerously_disable_sandbox: bool,
+    #[serde(default, deserialize_with = "given_text")]
     cwd: Option<String>,
     /// Internal directories whose files shell commands may read without approval.
     #[serde(skip)]
@@ -348,16 +353,18 @@ pub(super) fn definition() -> ToolDefinition {
 }
 
 pub(super) fn prepare_input(input: &Value) -> Result<(String, Operation, Value), ToolError> {
-    let parsed: ShellInput = serde_json::from_value(input.clone())
-        .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let parsed: ShellInput = parse_input(input)?;
     if parsed.command.trim().is_empty() || parsed.command.contains('\0') {
         return Err(ToolError::InvalidInput(
             "command cannot be empty or contain NUL".into(),
         ));
     }
     let mut normalized_input = input.clone();
-    if let Some(timeout) = normalized_input.get_mut("timeout") {
-        *timeout = json!(parsed.timeout);
+    if let Some(fields) = normalized_input.as_object_mut() {
+        match parsed.timeout {
+            Some(timeout) => fields.insert("timeout".into(), json!(timeout)),
+            None => fields.remove("timeout"),
+        };
     }
     if let Some(run_in_background) = normalized_input.get_mut("run_in_background") {
         *run_in_background = json!(parsed.run_in_background);
@@ -1003,17 +1010,26 @@ impl Registry {
                 ),
             }));
         }
-        loop {
-            let update = updates.borrow().clone();
-            if update.result.is_some() {
-                return Ok(update.snapshot);
+        let ended = tokio::time::timeout(STOP_CONFIRMATION_TIMEOUT, async {
+            loop {
+                let update = updates.borrow().clone();
+                if update.result.is_some() {
+                    return Ok(update.snapshot);
+                }
+                if updates.changed().await.is_err() {
+                    return Err(ToolError::InvalidInput(
+                        "command status channel closed before a result".into(),
+                    ));
+                }
             }
-            if updates.changed().await.is_err() {
-                return Err(ToolError::InvalidInput(
-                    "command status channel closed before a result".into(),
-                ));
-            }
-        }
+        })
+        .await;
+        ended.unwrap_or_else(|_| {
+            Err(ToolError::Rejected(format!(
+                "Shell stop outcome unknown after dispatch: its exit was not confirmed within {}s; do not repeat the stop without inspecting the task",
+                STOP_CONFIRMATION_TIMEOUT.as_secs()
+            )))
+        })
     }
 
     pub(super) async fn stop(&self, id: Uuid) -> Result<CommandSnapshot, ToolError> {

@@ -402,6 +402,14 @@ pub enum EventKind {
         goal: Option<crate::GoalSnapshot>,
         notice: Option<crate::GoalNotice>,
     },
+    /// A hook ran; the Chat's activity history keeps the record.
+    HookRan {
+        record: Box<crate::hooks::HookRunRecord>,
+    },
+    /// Hooks an event matched did not run; shown once per hook and Chat in a process.
+    HooksSkipped {
+        notice: crate::hooks::HookSkipNotice,
+    },
 }
 
 impl EventKind {
@@ -443,6 +451,10 @@ pub enum HostNote {
     /// Claude Code's `date_change` attachment: the user's date moved on to this `YYYY-MM-DD`
     /// after the user context told the model an earlier one.
     DateChange(String),
+    /// Claude Code's hook attachments: what a hook of this event gave the model, such as a
+    /// `SessionStart` or `UserPromptSubmit` hook's additional context or a `Stop` hook's reason
+    /// to go on.
+    Hook(crate::hooks::HookEvent),
 }
 
 /// What an execution mode note told the model.
@@ -463,7 +475,8 @@ impl HostNote {
             | Self::LoopState
             | Self::TaskReminder
             | Self::Guidance(_)
-            | Self::DateChange(_) => None,
+            | Self::DateChange(_)
+            | Self::Hook(_) => None,
         }
     }
 }
@@ -490,6 +503,9 @@ pub enum GuidanceNote {
     /// The MCP configuration warnings one note announced, by the digest of their text; the
     /// digest of no warnings withdraws earlier ones.
     McpWarnings { digest: String },
+    /// Environment guidance by content digest; `None` withdraws it. A compact boundary carries
+    /// the last delivery state without carrying its text.
+    Environment { digest: Option<String> },
     /// Guidance announced earlier that no longer applies.
     Withdrawn {
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -510,6 +526,7 @@ impl crate::TaggedRecord for GuidanceNote {
         "mcp_instructions",
         "mcp_servers",
         "mcp_warnings",
+        "environment",
         "withdrawn",
     ];
 }
@@ -581,6 +598,16 @@ pub enum PermissionApprovalSource {
     ExplicitAsk,
     SafetyCheck,
     AutoReviewer,
+    /// A `PreToolUse` hook asked for the user's confirmation.
+    Hook,
+}
+
+impl PermissionApprovalSource {
+    /// Whether an answer covers this one action only: an explicit Ask rule or a hook asked, and
+    /// a saved rule would not keep either from asking again.
+    pub fn is_single_use(self) -> bool {
+        matches!(self, Self::ExplicitAsk | Self::Hook)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -594,6 +621,9 @@ pub enum OperationState {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OperationRecord {
+    /// The user input that caused this host-prepared operation, rather than a model tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_message_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -680,6 +710,9 @@ pub struct UserShellReceipt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PendingInput {
+    /// Already prepared guidance for a queued Skill with no Shell plan to replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_guidance: Option<crate::InvokedSkill>,
     pub receipt: Receipt,
     pub input: String,
     #[serde(default)]
@@ -755,6 +788,22 @@ pub enum PromptPolicy {
     Interactive,
     DenyOnPrompt,
     Unrestricted,
+    /// A durable host's Durable Approval: a model tool call that needs a person's approval
+    /// suspends its Run on a durable wait until the person answers, and a third-party tool
+    /// without a rule goes to the person instead of Auto review. Every other prompt is denied,
+    /// as under `DenyOnPrompt`.
+    DurableApproval,
+}
+
+impl PromptPolicy {
+    /// The policy of a prompt that cannot wait durably: `DurableApproval` denies it, as
+    /// `DenyOnPrompt` does.
+    pub const fn without_durable_approval(self) -> Self {
+        match self {
+            Self::DurableApproval => Self::DenyOnPrompt,
+            policy => policy,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

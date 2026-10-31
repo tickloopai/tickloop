@@ -353,6 +353,7 @@ async fn managed_settlement_reports_an_unknown_operation_once_and_keeps_it() {
             .snapshot
             .operations
             .push(tickloop_harness_protocol::OperationRecord {
+                input_message_id: None,
                 parent_call_id: None,
                 parent_call_index: None,
                 task_binding: None,
@@ -416,6 +417,18 @@ async fn managed_settlement_has_a_deadline_when_a_run_cannot_quiesce() {
 async fn compositions_that_cannot_keep_their_waits_are_refused() {
     let durable_chat = composed(false, durable_chat_options()).unwrap();
     durable_chat.shutdown().await;
+    let durable_approval = composed(
+        false,
+        HarnessOptions {
+            host: AgentHostOptions {
+                prompt_policy: tickloop_harness_protocol::PromptPolicy::DurableApproval,
+                ..AgentHostOptions::product_defaults()
+            },
+            ..durable_chat_options()
+        },
+    )
+    .unwrap();
+    durable_approval.shutdown().await;
     for (environment, options, reason) in [
         (
             false,
@@ -467,6 +480,22 @@ async fn compositions_that_cannot_keep_their_waits_are_refused() {
                 ..durable_chat_options()
             },
             "denies what would prompt",
+        ),
+        (
+            true,
+            HarnessOptions {
+                host: AgentHostOptions {
+                    prompt_policy: tickloop_harness_protocol::PromptPolicy::DurableApproval,
+                    ..AgentHostOptions::product_defaults()
+                },
+                tools: ToolPolicy {
+                    tick_subscriptions: false,
+                    ..ToolPolicy::local()
+                },
+                waits: WaitHosting::Process,
+                ..durable_chat_options()
+            },
+            "Durable Approval needs durable waits",
         ),
     ] {
         let Err(AgentError::Invalid(refusal)) = composed(environment, options) else {

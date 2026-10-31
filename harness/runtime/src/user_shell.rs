@@ -528,7 +528,8 @@ impl Agent {
                 (authority, evaluation)
             };
             let mut policy_revision = authority.policy_revision;
-            let decision = self.apply_prompt_policy_keeping_required_approval(
+            let decision = Self::apply_prompt_policy_keeping_required_approval(
+                self.other_prompt_policy(),
                 authority.decision,
                 authority.explicit_ask || prepared.requires_environment_approval(),
             );
@@ -559,7 +560,14 @@ impl Agent {
                     ),
                 };
                 let answer = self
-                    .wait_for_permission(chat_id, request, operation.clone(), cancel.clone())
+                    .wait_for_permission(
+                        chat_id,
+                        request,
+                        operation.clone(),
+                        None,
+                        None,
+                        cancel.clone(),
+                    )
                     .await
                     .map_err(AgentError::Invalid)?;
                 if !answer.allow {

@@ -21,6 +21,10 @@ use tickloop_code_access::{
     ReceiptState, RequestRef, ResetReason, ServerHello, ServerMessage, TranscriptRef, UserInput,
     ViewRef,
 };
+use tickloop_harness::protocol::hooks::{
+    ConfiguredHook, HookBackground, HookEvent, HookList, HookPluginDirectories, HookSource,
+    HookTrust, HookTrustAction, HookTrustChange,
+};
 use tickloop_harness::protocol::mcp::{McpServerState, McpServerStatus, McpToolSummary};
 use tickloop_harness::protocol::{
     Adapter, AgentHostOptions, ArtifactTick, ChatSnapshot, ConnectionRegion, Content,
@@ -551,8 +555,40 @@ fn live_chat_snapshot() -> LiveChatSnapshot {
     live
 }
 
+fn hook_list() -> HookList {
+    HookList {
+        hooks: vec![ConfiguredHook {
+            key: "k1".into(),
+            source: HookSource::Plugin {
+                id: "guard@market".into(),
+            },
+            file: "/home/user/.tickloop/plugins/cache/guard/hooks/hooks.json".into(),
+            event: HookEvent::PreToolUse,
+            matcher: Some("Bash".into()),
+            command: "${CLAUDE_PLUGIN_ROOT}/check.sh".into(),
+            resolved_command: Some("/home/user/.tickloop/plugins/cache/guard/check.sh".into()),
+            sensitive_values: Vec::new(),
+            condition: Some("Bash(rm *)".into()),
+            timeout_secs: 30,
+            background: Some(HookBackground::AsyncRewake {
+                message: Some("Review:".into()),
+                summary: None,
+            }),
+            plugin: Some(HookPluginDirectories {
+                root: "/home/user/.tickloop/plugins/cache/guard".into(),
+                data: "/home/user/.tickloop/plugins/data/guard".into(),
+            }),
+            hash: Some("h1".into()),
+            trust: HookTrust::Pending,
+        }],
+        warnings: vec!["Notification hooks are not supported yet; skipped".into()],
+        revision: "r1".into(),
+    }
+}
+
 fn launch_spec() -> LaunchSpec {
     LaunchSpec {
+        after_clear: false,
         additional_directories: Vec::new(),
         profile: tickloop_code_access::ExecutionProfile::Local,
         folder: "/work/project".into(),
@@ -778,6 +814,24 @@ fn agent_commands_keep_their_recorded_wire() {
                     chat_id: id(0x90),
                 },
             },
+            AgentCommand::WriteHookTrust {
+                launch: Box::new(launch_spec()),
+                changes: vec![
+                    HookTrustChange {
+                        source: HookSource::Plugin {
+                            id: "guard@market".into(),
+                        },
+                        key: "k1".into(),
+                        action: HookTrustAction::Trust { hash: "h1".into() },
+                    },
+                    HookTrustChange {
+                        source: HookSource::Repository,
+                        key: "k2".into(),
+                        action: HookTrustAction::Disable,
+                    },
+                ],
+                expected_revision: Some("r1".into()),
+            },
         ],
     );
 }
@@ -877,6 +931,9 @@ fn observation_requests_keep_their_recorded_wire() {
             },
             ObservationRequest::EndedAgents {
                 store_root: Some("/home/user/.tickloop".into()),
+            },
+            ObservationRequest::Hooks {
+                launch: Box::new(launch_spec()),
             },
         ],
     );
@@ -989,6 +1046,7 @@ fn observation_values_keep_their_recorded_wire() {
             ObservationValue::TaskToolsSetting(true),
             ObservationValue::TaskToolsSetting(false),
             ObservationValue::Operation(Some(Box::new(OperationRecord {
+                input_message_id: None,
                 parent_call_id: None,
                 parent_call_index: None,
                 task_binding: None,
@@ -1051,6 +1109,7 @@ fn observation_values_keep_their_recorded_wire() {
                 error: None,
                 workers: Vec::new(),
             })),
+            ObservationValue::Hooks(Box::new(hook_list())),
             ObservationValue::EndedAgents(vec![
                 EndedAgent {
                     record: TranscriptRef {
@@ -1210,6 +1269,23 @@ fn observation_changes_keep_their_recorded_wire() {
                 reason: ResetReason::ConversationChanged,
                 snapshot: Box::new(live_chat_snapshot()),
             },
+            ObservationChange::TaskNotification(
+                tickloop_harness::protocol::TaskNotification::for_background_command(
+                    id(0xc1).into(),
+                    id(0x42).into(),
+                    Some("call-1".into()),
+                    "/tmp/task.log".into(),
+                    "make test",
+                    tickloop_harness::protocol::TaskNotificationStatus::Failed,
+                    Some(2),
+                ),
+            ),
+            ObservationChange::TaskNotification(
+                tickloop_harness::protocol::TaskNotification::for_background_hook(
+                    id(0xc1).into(),
+                    "Background check found something",
+                ),
+            ),
         ],
     );
 }
@@ -1271,6 +1347,7 @@ fn command_results_keep_their_recorded_wire() {
             },
             CommandResult::Text("ok".into()),
             CommandResult::Done,
+            CommandResult::Hooks(Box::new(hook_list())),
             CommandResult::PromptTakenBack {
                 snapshot: Box::new(live_chat_snapshot()),
                 draft: TakenBackPrompt {

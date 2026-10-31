@@ -19,6 +19,223 @@ use uuid::Uuid;
 
 use tickloop_harness_test_support::{ScriptedModel, call, config, text};
 
+mod guidance {
+    use std::sync::{Arc, Mutex};
+    use tickloop_harness_protocol::{ChatId, EventKind};
+    use tickloop_harness_runtime::{
+        Agent, HarnessOptions, HarnessSeams, ToolPolicy, environment::*,
+    };
+    use tickloop_harness_test_support::{
+        ScriptedModel, config, execution_environment::MemoryEnvironment, harness::ChosenModels,
+        host_note_texts, next_event, text,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    const ACTIVE: &str = "Commands in this fixture use restricted writes.";
+    const WITHDRAWN: &str = "The fixture's earlier execution guidance no longer applies.";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Response {
+        Active,
+        BindError,
+        InspectError,
+        Unsupported,
+        WrongVariant,
+        Withdrawn,
+    }
+
+    struct ControlledEnvironment {
+        inner: MemoryEnvironment,
+        state: Arc<Mutex<(Response, usize)>>,
+    }
+
+    struct ControlledPort {
+        inner: Arc<dyn ExecutionPort>,
+        state: Arc<Mutex<(Response, usize)>>,
+    }
+
+    impl ExecutionEnvironment for ControlledEnvironment {
+        fn bind(
+            &self,
+            scope: ExecutionScope,
+            authority: ExecutionAuthority,
+        ) -> Result<Arc<dyn ExecutionPort>, ExecutionError> {
+            if self.state.lock().unwrap().0 == Response::BindError {
+                return Err(ExecutionError::new("Unavailable", "fixture bind failed"));
+            }
+            Ok(Arc::new(ControlledPort {
+                inner: self.inner.bind(scope, authority)?,
+                state: self.state.clone(),
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionPort for ControlledPort {
+        async fn inspect(
+            &self,
+            query: ExecutionQuery,
+        ) -> Result<ExecutionInspection, ExecutionError> {
+            if matches!(query, ExecutionQuery::Guidance) {
+                let mut state = self.state.lock().unwrap();
+                state.1 += 1;
+                return match state.0 {
+                    Response::Active | Response::Withdrawn => {
+                        Ok(ExecutionInspection::Guidance(ExecutionGuidance {
+                            content: (state.0 == Response::Active).then(|| ACTIVE.into()),
+                            withdrawal: WITHDRAWN.into(),
+                        }))
+                    }
+                    Response::InspectError => Err(ExecutionError::new(
+                        "Unavailable",
+                        "fixture inspection failed",
+                    )),
+                    Response::Unsupported => Err(ExecutionError::new(
+                        "Unsupported",
+                        "fixture has no guidance",
+                    )),
+                    Response::WrongVariant => Ok(ExecutionInspection::Instances(Vec::new())),
+                    Response::BindError => panic!("a failed bind supplies no Port"),
+                };
+            }
+            self.inner.inspect(query).await
+        }
+
+        async fn prepare(
+            &self,
+            intent: ExecutionIntent,
+        ) -> Result<PreparedExecution, ExecutionError> {
+            self.inner.prepare(intent).await
+        }
+
+        async fn execute(
+            &self,
+            prepared: PreparedExecution,
+            admission: ExecutionAdmission,
+            cancel: CancellationToken,
+        ) -> ExecutionOutcome {
+            self.inner.execute(prepared, admission, cancel).await
+        }
+
+        async fn observe(
+            &self,
+            request: ObserveRequest,
+        ) -> Result<ExecutionObservation, ExecutionError> {
+            self.inner.observe(request).await
+        }
+    }
+
+    async fn run_turn(agent: &Agent, chat: ChatId) {
+        let mut events = agent.subscribe();
+        let receipt = agent.submit(chat, "Continue".into()).await.unwrap();
+        loop {
+            let event = next_event(&mut events).await;
+            if event.run_id != receipt.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                EventKind::PermissionRequested { .. } => panic!("text-only turn needs no approval"),
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_environment_preserves_guidance_until_authoritative_withdrawal() {
+        let responses = [
+            Response::Active,
+            Response::BindError,
+            Response::InspectError,
+            Response::Unsupported,
+            Response::WrongVariant,
+            Response::Active,
+            Response::Withdrawn,
+        ];
+        let state = Arc::new(Mutex::new((Response::Active, 0)));
+        let model = Arc::new(ScriptedModel::new(
+            responses.iter().map(|_| text("Ready")).collect(),
+        ));
+        let agent = Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: None,
+                environment: Some(Arc::new(ControlledEnvironment {
+                    inner: MemoryEnvironment::new(),
+                    state: state.clone(),
+                })),
+                models: ChosenModels::new(model.clone()),
+            },
+            HarnessOptions::local(config()),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        for response in responses {
+            *state.lock().unwrap() = (response, 0);
+            run_turn(&agent, chat).await;
+            assert_eq!(
+                state.lock().unwrap().1,
+                usize::from(response != Response::BindError),
+                "{response:?}"
+            );
+        }
+        agent.shutdown().await;
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), responses.len());
+        for (index, request) in requests.iter().enumerate() {
+            let notes = host_note_texts(request).join("\n");
+            assert_eq!(notes.matches(ACTIVE).count(), 1, "request {index}");
+            assert_eq!(
+                notes.matches(WITHDRAWN).count(),
+                usize::from(index == responses.len() - 1),
+                "request {index}"
+            );
+            assert_eq!(request.messages[..2], requests[0].messages[..2]);
+            assert_eq!(request.tools, requests[0].tools);
+            if index > 0 {
+                let previous = &requests[index - 1].messages;
+                assert_eq!(request.messages[..previous.len()], previous[..]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn folderless_chat_has_no_bash_or_environment_guidance() {
+        let model = Arc::new(ScriptedModel::new(vec![text("Ready")]));
+        let agent = Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: None,
+                environment: None,
+                models: ChosenModels::new(model.clone()),
+            },
+            HarnessOptions {
+                tools: ToolPolicy::durable_chat(),
+                waits: tickloop_harness_runtime::WaitHosting::Durable,
+                host: tickloop_harness_protocol::AgentHostOptions {
+                    prompt_policy: tickloop_harness_protocol::PromptPolicy::DenyOnPrompt,
+                    ..tickloop_harness_protocol::AgentHostOptions::product_defaults()
+                },
+                ..HarnessOptions::local(config())
+            },
+        )
+        .unwrap();
+        let chat = agent.create_chat_without_folder().await.unwrap();
+        run_turn(&agent, chat).await;
+        agent.shutdown().await;
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].tools.iter().any(|tool| tool.name == "Bash"));
+        assert!(
+            !host_note_texts(&requests[0])
+                .iter()
+                .any(|note| note.contains("Current execution environment guidance"))
+        );
+    }
+}
+
 #[derive(Default)]
 struct WorkspaceTools {
     calls: Mutex<Vec<(ChatId, String, Value)>>,
@@ -1190,4 +1407,105 @@ async fn blocked_host_catalog_capture_does_not_hold_the_chats_lock() {
     provider.gate.1.notify_all();
     agent.shutdown().await;
     responsive.expect("a blocked catalog capture must not hold the Chats lock");
+}
+
+#[derive(Default)]
+struct OptionalFieldsTool {
+    executed: Mutex<Vec<Value>>,
+}
+
+#[async_trait]
+impl HostToolProvider for OptionalFieldsTool {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "search_notes".into(),
+            description: "Search notes.".into(),
+            input_schema: json!({"type":"object","properties":{
+                "query":{"type":"string","minLength":1},
+                "scope":{"type":"string","enum":["all","open"]},
+                "limit":{"type":"integer","minimum":1},
+                "label":{"type":"string","minLength":1},
+                "note":{"type":"string"}
+            },"required":["query"],"additionalProperties":false}),
+        }]
+    }
+
+    fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
+        HostToolPermission::ReadOnly
+    }
+
+    async fn execute(&self, _: ChatId, _: &str, input: Value, _: CancellationToken) -> ToolResult {
+        self.executed.lock().unwrap().push(input);
+        ToolResult {
+            content: "found".into(),
+            is_error: false,
+            output_ref: None,
+        }
+    }
+}
+
+/// Models fill every property of a flat schema: an optional property left `null` or `""` where
+/// its schema cannot take that value was not given, so the call runs without it. Required
+/// properties and values the schema accepts are still judged as written.
+#[tokio::test]
+async fn optional_host_tool_fields_left_empty_are_not_given() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "filled",
+            "search_notes",
+            json!({"query":"q","scope":"","limit":null,"label":"","note":""}),
+        ),
+        call("empty-query", "search_notes", json!({"query":""})),
+        call(
+            "bad-scope",
+            "search_notes",
+            json!({"query":"q","scope":"closed"}),
+        ),
+        text("done"),
+    ]));
+    let provider = Arc::new(OptionalFieldsTool::default());
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_host_tools(provider.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent.submit(chat, "Search".into()).await.unwrap();
+    wait_for_completion(&agent, chat).await;
+
+    assert_eq!(
+        provider.executed.lock().unwrap().as_slice(),
+        [json!({"query":"q","note":""})]
+    );
+    let requests = model.requests.lock().unwrap();
+    let result = |id: &str| {
+        requests
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|content| match content {
+                Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == id => Some((content.text(), *is_error)),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(result("filled"), ("found".into(), false));
+    assert_eq!(
+        result("empty-query"),
+        (
+            "invalid search_notes input: input.query is too short".into(),
+            true
+        )
+    );
+    assert_eq!(
+        result("bad-scope"),
+        (
+            "invalid search_notes input: input.scope has an invalid value; expected one of \"all\", \"open\"".into(),
+            true
+        )
+    );
 }

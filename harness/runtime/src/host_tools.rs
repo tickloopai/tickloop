@@ -53,6 +53,17 @@ pub struct PreparedHostCall {
     artifact_account: Option<ArtifactAccountContext>,
     policy_identity: Option<HostPolicyIdentity>,
     mcp_server: Option<String>,
+    /// A token-free identity of what the call reaches, which an approval given for it is bound
+    /// to: for an MCP call, the server's configuration and account and the tool as listed.
+    target: Option<String>,
+    /// Under Durable Approval, who admits the call when no rule decides it, as its server's host
+    /// chose.
+    unruled: tickloop_harness_protocol::mcp::McpUnruled,
+    /// The tool's declaration the call was prepared against says the tool only reads.
+    is_declared_read_only: bool,
+    /// The call reaches only a remote service, such as an MCP server over HTTP, and touches no
+    /// local file: Auto review needs no Folder for it.
+    is_remote: bool,
     approval_facts: tickloop_harness_protocol::PreparedApprovalFacts,
     local_read: Option<(tickloop_harness_tools::PreparedTool, bool)>,
 }
@@ -91,6 +102,10 @@ impl PreparedHostCall {
             artifact_account: None,
             policy_identity: None,
             mcp_server: None,
+            target: None,
+            unruled: Default::default(),
+            is_declared_read_only: false,
+            is_remote: false,
             local_read: None,
         }
     }
@@ -102,6 +117,45 @@ impl PreparedHostCall {
 
     pub(crate) fn mcp_server(&self) -> Option<&str> {
         self.mcp_server.as_deref()
+    }
+
+    pub(crate) fn with_target(mut self, target: String) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    pub(crate) fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    pub(crate) fn with_unruled(
+        mut self,
+        unruled: tickloop_harness_protocol::mcp::McpUnruled,
+        is_declared_read_only: bool,
+    ) -> Self {
+        self.unruled = unruled;
+        self.is_declared_read_only = is_declared_read_only;
+        self
+    }
+
+    pub(crate) fn auto_reviews_unruled(&self) -> bool {
+        self.unruled == tickloop_harness_protocol::mcp::McpUnruled::AutoReview
+    }
+
+    /// Whether the call runs without a person when no rule decides it: its server's host admits
+    /// unruled calls of tools that only read, and its tool's declaration says so.
+    pub(crate) fn admits_unruled_read_only(&self) -> bool {
+        self.unruled == tickloop_harness_protocol::mcp::McpUnruled::AllowReadOnly
+            && self.is_declared_read_only
+    }
+
+    pub(crate) fn with_remote(mut self, is_remote: bool) -> Self {
+        self.is_remote = is_remote;
+        self
+    }
+
+    pub(crate) fn is_remote(&self) -> bool {
+        self.is_remote
     }
 
     pub fn with_payload<T: Any + Send + Sync>(mut self, payload: T) -> Self {
@@ -440,6 +494,12 @@ pub trait HostToolProvider: Send + Sync {
 
     fn has_tool_search(&self) -> bool {
         false
+    }
+
+    /// What the model is told of where the user manages this provider's MCP servers; `None`
+    /// keeps the terminal's.
+    fn mcp_guidance(&self) -> Option<crate::tool_exposure::McpGuidance> {
+        None
     }
 
     /// How many times the user changed each MCP server's exposure, by server name. A Run lets

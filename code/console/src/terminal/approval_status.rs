@@ -168,6 +168,7 @@ impl ApprovalStatus {
             PermissionApprovalSource::ExplicitAsk => "Explicit Ask".into(),
             PermissionApprovalSource::PermissionPolicy => "Permission policy".into(),
             PermissionApprovalSource::SafetyCheck => "Safety check".into(),
+            PermissionApprovalSource::Hook => "PreToolUse hook".into(),
         };
         Some(match reason.filter(|reason| !reason.is_empty()) {
             Some(reason) => format!("{source}: {}", single_line(reason)),

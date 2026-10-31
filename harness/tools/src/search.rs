@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use ignore::overrides::OverrideBuilder;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
@@ -16,10 +16,10 @@ use super::{
         FileSearchError, GLOB_RESULT_LIMIT, GlobQuery, GrepLine, GrepOutput, GrepOutputMode,
         GrepQuery, file_types, glob_text, grep_text, override_matcher,
     },
+    input::{given_text, optional_semantic_boolean, parse_input, semantic_integer},
     is_sensitive_path,
-    read::semantic_integer,
     shell::BASH_TOOL_NAME,
-    write::{FILE_NOT_FOUND_CWD_NOTE, semantic_boolean},
+    write::FILE_NOT_FOUND_CWD_NOTE,
 };
 use tickloop_harness_protocol::ToolResult;
 
@@ -159,9 +159,17 @@ fn invalid_input(error: FileSearchError) -> ToolError {
 #[serde(deny_unknown_fields)]
 struct GrepInput {
     pattern: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "given_text",
+        skip_serializing_if = "Option::is_none"
+    )]
     path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "given_text",
+        skip_serializing_if = "Option::is_none"
+    )]
     glob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_mode: Option<GrepOutputMode>,
@@ -206,7 +214,12 @@ struct GrepInput {
         skip_serializing_if = "Option::is_none"
     )]
     case_insensitive: Option<bool>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "given_text",
+        skip_serializing_if = "Option::is_none"
+    )]
     file_type: Option<String>,
     #[serde(
         default,
@@ -228,12 +241,6 @@ struct GrepInput {
     multiline: Option<bool>,
 }
 
-fn optional_semantic_boolean<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<bool>, D::Error> {
-    semantic_boolean(deserializer).map(Some)
-}
-
 pub(super) fn prepare_input(
     name: &str,
     input: &Value,
@@ -250,10 +257,10 @@ fn prepare_glob(input: &Value) -> Result<(String, Operation, Value), ToolError> 
     #[serde(deny_unknown_fields)]
     struct GlobInput {
         pattern: String,
+        #[serde(default, deserialize_with = "given_text")]
         path: Option<String>,
     }
-    let parsed: GlobInput = serde_json::from_value(input.clone())
-        .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let parsed: GlobInput = parse_input(input)?;
     let (root, pattern) = split_absolute_glob(&parsed.pattern).unwrap_or_else(|| {
         (
             parsed.path.unwrap_or_else(|| CURRENT_DIRECTORY.into()),
@@ -297,8 +304,7 @@ fn prepare_grep(input: &Value) -> Result<(String, Operation, Value), ToolError> 
 
 /// The searched path, the checked query and the normalized input of a `Grep` call.
 pub(crate) fn grep_query(input: &Value) -> Result<(String, GrepQuery, Value), ToolError> {
-    let parsed: GrepInput = serde_json::from_value(input.clone())
-        .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+    let parsed: GrepInput = parse_input(input)?;
     let (lines_before, lines_after) = match parsed.context.or(parsed.context_alias) {
         Some(context) => (context, context),
         None => (

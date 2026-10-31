@@ -933,7 +933,8 @@ fn sandbox_pty_mode_and_overrides_save_for_this_folder() {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        fixture.wait(|frame| frame.contains("Cannot enable sandbox: 本平台暂不支持"));
+        fixture
+            .wait(|frame| frame.contains("Cannot enable sandbox: not supported on this platform"));
         let settings = UserSettings::in_root(&fixture.directory.path().join("config"));
         assert!(
             !settings
@@ -989,7 +990,7 @@ fn sandbox_pty_config_shows_effective_rules_sources_and_scrolls_without_writing(
     fixture.wait(|frame| {
         frame.contains("*.github.com [this Folder]")
             && frame.contains("failIfUnavailable: true [this Folder]")
-            && frame.contains("暂不支持")
+            && frame.contains("not supported yet")
     });
     fixture.send(b"\r\x1b");
     fixture.wait(|frame| !frame.contains("[Config]"));
@@ -1056,7 +1057,7 @@ fn sandbox_pty_permissions_status_uses_this_folder_and_points_to_sandbox() {
     )
     .unwrap();
     fixture.send(b"/permissions\r");
-    fixture.wait(|frame| frame.contains("Sandbox: on") && frame.contains("用 /sandbox 修改"));
+    fixture.wait(|frame| frame.contains("Sandbox: on") && frame.contains("change with /sandbox"));
 }
 
 #[test]

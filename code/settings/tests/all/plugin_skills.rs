@@ -50,6 +50,70 @@ fn names(registry: &SkillRegistry) -> Vec<&str> {
         .collect()
 }
 
+#[test]
+fn plugin_commands_share_skill_invocation_without_granting_tools() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    let source = claude_plugin(
+        directory.path(),
+        "commands",
+        serde_json::json!({"name":"commands"}),
+        &[],
+    );
+    fs::create_dir_all(source.join("commands/nested")).unwrap();
+    fs::write(source.join("commands/nested/check.md"), "---\ndescription: Check a target\nargument-hint: <target>\nallowed-tools: [Bash]\n---\nCheck $0 against $1; all=$ARGUMENTS; @README.md").unwrap();
+    fs::write(
+        source.join("commands/manual.md"),
+        "---\ndisable-model-invocation: true\n---\nManual only",
+    )
+    .unwrap();
+    fs::write(source.join("commands/plain.md"), "Plain command").unwrap();
+    install(&config, &source);
+    let registry = SkillRegistry::discover(directory.path(), Some(&config));
+    assert!(
+        registry.contains("commands:nested:check"),
+        "{:?}",
+        registry.warnings()
+    );
+    let expansion = registry
+        .expand(
+            "commands:nested:check",
+            "'two words' next",
+            SkillCaller::Model,
+        )
+        .unwrap();
+    assert!(
+        expansion
+            .content
+            .contains("Check two words against next; all='two words' next; @README.md"),
+        "{}",
+        expansion.content
+    );
+    assert!(expansion.allowed_tools.is_empty());
+    assert!(
+        registry
+            .expand("commands:manual", "", SkillCaller::Model)
+            .is_err()
+    );
+    assert!(
+        registry
+            .expand("commands:manual", "", SkillCaller::User)
+            .is_ok()
+    );
+    assert!(!registry.model_listing().contains("commands:plain"));
+    assert!(
+        registry
+            .expand("commands:plain", "", SkillCaller::Model)
+            .is_ok()
+    );
+    PluginStore::in_config_root(&config)
+        .set_enabled("commands", false)
+        .unwrap();
+    assert!(
+        !SkillRegistry::discover(directory.path(), Some(&config)).contains("commands:nested:check")
+    );
+}
+
 /// Installs, as an earlier Tickloop would, the Tick package `name` with a `usage` Skill.
 fn install_tick_package(directory: &Path, config_root: &Path, name: &str) {
     let source = directory.join("sources").join(name);
@@ -110,8 +174,7 @@ fn enabled_plugin_skills_are_named_after_their_plugin_beside_tick_package_skills
             "notes:summary",
             "notes:write",
             "quotes:usage",
-            "slides",
-            "tickloop"
+            "slides"
         ]
     );
     assert!(registry.warnings().is_empty(), "{:?}", registry.warnings());
@@ -143,7 +206,7 @@ fn enabled_plugin_skills_are_named_after_their_plugin_beside_tick_package_skills
     let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
     assert_eq!(
         names(&registry),
-        ["loop", "quotes:usage", "slides", "tickloop"],
+        ["loop", "quotes:usage", "slides"],
         "a disabled plugin's Skills are not loaded"
     );
 
@@ -268,7 +331,7 @@ fn an_unusable_plugin_or_registry_only_warns_and_a_disabled_one_is_quiet() {
     fs::remove_dir_all(&notes.root).unwrap();
 
     let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
-    assert!(registry.contains("tickloop"));
+    assert!(registry.contains("loop"));
     assert!(!registry.contains("notes:write"));
     assert_eq!(registry.warnings().len(), 1, "{:?}", registry.warnings());
     assert!(
@@ -286,7 +349,7 @@ fn an_unusable_plugin_or_registry_only_warns_and_a_disabled_one_is_quiet() {
 
     fs::write(store.directory().join("installed.json"), "not json").unwrap();
     let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
-    assert!(registry.contains("tickloop"));
+    assert!(registry.contains("loop"));
     assert_eq!(registry.warnings().len(), 1);
     assert!(
         registry.warnings()[0].starts_with("the Skills of installed plugins are not loaded"),
@@ -542,4 +605,124 @@ fn plugin_skill_config_replaces_public_values_and_masks_sensitive_values_after_u
         .unwrap();
     assert!(expansion.content.contains("Host updated"));
     assert!(!expansion.content.contains("private-config-key"));
+}
+
+#[test]
+fn command_cache_refreshes_and_commands_win_over_same_named_skills() {
+    use tickloop_code_settings::skills::SkillDiscoveryCache;
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    let source = claude_plugin(
+        directory.path(),
+        "overlap",
+        serde_json::json!({"name":"overlap"}),
+        &[("skills/check", &skill("check", "Skill", "old skill"))],
+    );
+    fs::create_dir_all(source.join("commands")).unwrap();
+    fs::write(
+        source.join("commands/check.md"),
+        "---\ndescription: Command\n---\ncommand body",
+    )
+    .unwrap();
+    let installed = install(&config, &source);
+    let mut cache = SkillDiscoveryCache::default();
+    let registry = cache.refresh(directory.path(), Some(&config)).unwrap();
+    assert!(
+        registry
+            .expand("overlap:check", "", SkillCaller::User)
+            .unwrap()
+            .content
+            .ends_with("command body")
+    );
+    assert!(
+        registry
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("already registered"))
+    );
+    fs::write(installed.root.join("commands/new.md"), "new command").unwrap();
+    let registry = cache.refresh(directory.path(), Some(&config)).unwrap();
+    assert!(registry.contains("overlap:new"));
+    fs::remove_file(installed.root.join("commands/check.md")).unwrap();
+    let registry = cache.refresh(directory.path(), Some(&config)).unwrap();
+    assert!(
+        registry
+            .expand("overlap:check", "", SkillCaller::User)
+            .unwrap()
+            .content
+            .ends_with("old skill")
+    );
+    PluginStore::in_config_root(&config)
+        .uninstall("overlap", false)
+        .unwrap();
+    assert!(
+        !cache
+            .refresh(directory.path(), Some(&config))
+            .unwrap()
+            .contains("overlap:new")
+    );
+}
+
+#[test]
+fn a_command_can_alias_a_skill_file_without_hiding_the_differently_named_skill() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config-$0");
+    let source = claude_plugin(
+        directory.path(),
+        "alias",
+        serde_json::json!({"name":"alias", "commands":{"review":{"source":"./skills/check/SKILL.md"}}}),
+        &[(
+            "skills/check",
+            &skill("check", "Check", "Root ${CLAUDE_PLUGIN_ROOT}; $0"),
+        )],
+    );
+    let installed = install(&config, &source);
+    let registry = SkillRegistry::discover(directory.path(), Some(&config));
+    assert!(registry.contains("alias:check"));
+    assert!(registry.contains("alias:review"));
+    let expanded = registry
+        .expand("alias:review", "${CLAUDE_PLUGIN_ROOT}", SkillCaller::User)
+        .unwrap();
+    assert!(
+        expanded.content.ends_with(&format!(
+            "Root {}; {}",
+            installed.root.display(),
+            installed.root.display()
+        )),
+        "{}",
+        expanded.content
+    );
+}
+
+#[test]
+fn command_compatibility_notices_do_not_force_periodic_rediscovery() {
+    use tickloop_code_settings::skills::SkillDiscoveryCache;
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    let source = claude_plugin(
+        directory.path(),
+        "notices",
+        serde_json::json!({"name":"notices"}),
+        &[],
+    );
+    fs::create_dir_all(source.join("commands")).unwrap();
+    fs::write(
+        source.join("commands/check.md"),
+        "---\nmodel: inherit\n---\nGuide",
+    )
+    .unwrap();
+    install(&config, &source);
+    let mut cache = SkillDiscoveryCache::default();
+    let registry = cache.refresh(directory.path(), Some(&config)).unwrap();
+    assert!(!registry.warnings().is_empty());
+    assert!(!registry.needs_discovery_retry());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert!(cache.refresh(directory.path(), Some(&config)).is_none());
+    fs::write(config.join("plugins/installed.json"), "not json").unwrap();
+    assert!(
+        cache
+            .refresh(directory.path(), Some(&config))
+            .unwrap()
+            .needs_discovery_retry()
+    );
 }

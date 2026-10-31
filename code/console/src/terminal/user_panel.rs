@@ -1,4 +1,5 @@
-//! The one management panel a Chat's dialog shows at a time: `/plugins` or `/ticks`, or `/mcp`.
+//! The one management panel a Chat's dialog shows at a time: `/plugins` or `/ticks`, `/mcp`, or
+//! `/hooks`.
 
 use crossterm::event::KeyEvent;
 use uuid::Uuid;
@@ -6,6 +7,7 @@ use uuid::Uuid;
 use super::{
     conversation_picker::ConversationPickerFrame,
     display::DisplayProfile,
+    hooks_panel::{HooksPanel, HooksPanelEffect, HooksRequest},
     mcp_panel::{McpPanel, McpPanelEffect, McpRequest},
     ticks_panel::{TickPackageRequest, TicksPanel, TicksPanelEffect},
 };
@@ -15,6 +17,7 @@ use super::{
 pub(super) enum UserPanel {
     Packages(TicksPanel),
     Mcp(McpPanel),
+    Hooks(HooksPanel),
 }
 
 pub(super) enum UserPanelEffect {
@@ -24,6 +27,7 @@ pub(super) enum UserPanelEffect {
     EditText,
     Packages(TickPackageRequest),
     Mcp(McpRequest),
+    Hooks(HooksRequest),
 }
 
 impl UserPanel {
@@ -31,6 +35,7 @@ impl UserPanel {
         match self {
             Self::Packages(panel) => panel.id(),
             Self::Mcp(panel) => panel.id(),
+            Self::Hooks(panel) => panel.id(),
         }
     }
 
@@ -38,6 +43,7 @@ impl UserPanel {
         match self {
             Self::Packages(panel) => panel.chat,
             Self::Mcp(panel) => panel.chat,
+            Self::Hooks(panel) => panel.chat,
         }
     }
 
@@ -45,6 +51,7 @@ impl UserPanel {
         match self {
             Self::Packages(panel) => panel.title(),
             Self::Mcp(panel) => panel.title(),
+            Self::Hooks(panel) => panel.title(),
         }
     }
 
@@ -52,6 +59,7 @@ impl UserPanel {
         match self {
             Self::Packages(panel) => panel.minimum_frame_rows(width),
             Self::Mcp(panel) => panel.minimum_frame_rows(width),
+            Self::Hooks(panel) => panel.minimum_frame_rows(width),
         }
     }
 
@@ -59,6 +67,7 @@ impl UserPanel {
         match self {
             Self::Packages(panel) => panel.content_rows(width),
             Self::Mcp(panel) => panel.content_rows(width),
+            Self::Hooks(panel) => panel.content_rows(width),
         }
     }
 
@@ -71,6 +80,7 @@ impl UserPanel {
         match self {
             Self::Packages(panel) => panel.frame(width, height, display),
             Self::Mcp(panel) => panel.frame(width, height, display),
+            Self::Hooks(panel) => panel.frame(width, height, display),
         }
     }
 
@@ -78,6 +88,7 @@ impl UserPanel {
         match self {
             Self::Packages(panel) => panel.select_at_row(row),
             Self::Mcp(panel) => panel.select_at_row(row),
+            Self::Hooks(panel) => panel.select_at_row(row),
         }
     }
 
@@ -85,6 +96,7 @@ impl UserPanel {
         match self {
             Self::Packages(panel) => panel.paste(text),
             Self::Mcp(panel) => panel.paste(text),
+            Self::Hooks(_) => {}
         }
     }
 
@@ -102,6 +114,11 @@ impl UserPanel {
                 McpPanelEffect::EditCallback => UserPanelEffect::EditText,
                 McpPanelEffect::Work(request) => UserPanelEffect::Mcp(request),
             },
+            Self::Hooks(panel) => match panel.key(key) {
+                HooksPanelEffect::None => UserPanelEffect::None,
+                HooksPanelEffect::Close => UserPanelEffect::Close,
+                HooksPanelEffect::Work(request) => UserPanelEffect::Hooks(request),
+            },
         }
     }
 
@@ -110,6 +127,7 @@ impl UserPanel {
         match self {
             Self::Packages(panel) => panel.filter_text(),
             Self::Mcp(panel) => panel.callback_text(),
+            Self::Hooks(_) => "",
         }
     }
 
@@ -117,6 +135,7 @@ impl UserPanel {
         match self {
             Self::Packages(panel) => panel.replace_filter(text),
             Self::Mcp(panel) => panel.replace_callback(text),
+            Self::Hooks(_) => {}
         }
     }
 
@@ -124,18 +143,22 @@ impl UserPanel {
         match self {
             Self::Packages(panel) => panel.report(error),
             Self::Mcp(panel) => panel.report(error),
+            Self::Hooks(panel) => panel.report(error),
         }
     }
 
     pub(super) fn cancel_uninstall(&mut self) {
-        if let Self::Packages(panel) = self {
-            panel.cancel_uninstall();
+        match self {
+            Self::Packages(panel) => panel.cancel_uninstall(),
+            Self::Hooks(panel) => panel.cancel_confirmation(),
+            Self::Mcp(_) => {}
         }
     }
 
     pub(super) fn expire_confirmation(&mut self) -> bool {
         match self {
             Self::Packages(panel) => panel.expire_confirmation(),
+            Self::Hooks(panel) => panel.expire_confirmation(),
             Self::Mcp(_) => false,
         }
     }

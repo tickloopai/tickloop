@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use super::ChatBookkeeping;
 use tickloop_harness_protocol::{
-    COMPACT_BOUNDARY_TEXT, ChatSnapshot, CompactBoundary, CompactionMarker, Content, Message, Role,
-    SummarizeMetadata, Usage,
+    COMPACT_BOUNDARY_TEXT, ChatSnapshot, CompactBoundary, CompactionMarker, Content, GuidanceNote,
+    HostNote, Message, Role, SummarizeMetadata, Usage,
 };
 
 /// Source of one message in the conversation after compaction.
@@ -93,6 +93,7 @@ impl CompactionLayout {
         compacted_bookkeeping.loop_state_views = BTreeMap::new();
         compacted_bookkeeping.later_provenance = BTreeMap::new();
         compacted_bookkeeping.message_responses = BTreeMap::new();
+        compacted_bookkeeping.task_board_checkpoints = BTreeMap::new();
         compacted_bookkeeping
             .lifecycle
             .restart_claims_at(self.sources.len());
@@ -134,6 +135,11 @@ impl CompactionLayout {
                         compacted_bookkeeping
                             .later_provenance
                             .insert(index, later.clone());
+                    }
+                    if let Some(boards) = bookkeeping.task_board_checkpoints.get(&original) {
+                        compacted_bookkeeping
+                            .task_board_checkpoints
+                            .insert(index, boards.clone());
                     }
                     if let Some(original_id) = snapshot.message_ids.get(&original) {
                         let id = if rewrites_existing {
@@ -191,6 +197,14 @@ impl CompactionLayout {
                     compacted.messages.push(message);
                 }
                 MessageSource::Boundary => {
+                    // Loading a full compact starts at this boundary, not at the old notes, and a
+                    // directed summary drops the notes of the messages it summarizes; either way
+                    // the boundary keeps what the summary may still carry, so it can be withdrawn.
+                    if let Some(note) = snapshot.host_notes.values().rev().find(|note| {
+                        matches!(note, HostNote::Guidance(GuidanceNote::Environment { .. }))
+                    }) {
+                        compacted.host_notes.insert(index, note.clone());
+                    }
                     compacted.messages.push(Message {
                         role: Role::System,
                         content: vec![Content::Text {
@@ -203,6 +217,18 @@ impl CompactionLayout {
                     compacted
                         .message_compactions
                         .insert(index, CompactionMarker::Boundary(self.boundary.clone()));
+                    // The chain restarts at the boundary: it carries the boards that stood at
+                    // its logical parent.
+                    if let Some((_, boards)) = self.logical_parent.and_then(|parent| {
+                        bookkeeping
+                            .task_board_checkpoints
+                            .range(..=parent)
+                            .next_back()
+                    }) {
+                        compacted_bookkeeping
+                            .task_board_checkpoints
+                            .insert(index, boards.clone());
+                    }
                 }
                 MessageSource::Summary => {
                     compacted.messages.push(self.summary.clone());

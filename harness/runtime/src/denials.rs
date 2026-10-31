@@ -32,6 +32,8 @@ pub(super) enum DirectApprovalBasis {
     FullAccess,
     UnrestrictedHost,
     Sandbox,
+    /// A `PreToolUse` hook from the user's own settings allowed the call.
+    Hook,
 }
 
 pub(super) struct AllowedDecision<'a> {
@@ -85,13 +87,18 @@ pub(super) fn allowed_approval_record(
             DirectApprovalBasis::Sandbox => {
                 "Sandboxed command allowed without approval by the current execution mode"
             }
+            DirectApprovalBasis::Hook => {
+                "A PreToolUse hook from your settings allowed this operation"
+            }
         },
     }
     .into();
-    if decision.path == ApprovalPath::Direct
-        && matches!(decision.direct_basis, DirectApprovalBasis::Sandbox)
-    {
-        record.direct_reason = Some(DirectApprovalReason::Sandbox);
+    if decision.path == ApprovalPath::Direct {
+        record.direct_reason = match decision.direct_basis {
+            DirectApprovalBasis::Sandbox => Some(DirectApprovalReason::Sandbox),
+            DirectApprovalBasis::Hook => Some(DirectApprovalReason::Hook),
+            _ => None,
+        };
     }
     record
 }
@@ -99,6 +106,9 @@ pub(super) fn allowed_approval_record(
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct DenialWindow {
     pub records: VecDeque<ApprovalRecord>,
+    /// The Chat's recent hook runs, newest first.
+    #[serde(default)]
+    pub hook_runs: VecDeque<tickloop_harness_protocol::hooks::HookRunRecord>,
     #[serde(skip)]
     pub human_prompts: VecDeque<(tickloop_harness_protocol::RunId, String, Option<String>)>,
     pub revision: u64,
@@ -155,6 +165,19 @@ impl DenialWindow {
         self.revision += 1;
     }
 
+    /// What the Chat's activity history file keeps.
+    pub fn saved_activity(
+        &self,
+    ) -> (
+        Vec<ApprovalRecord>,
+        Vec<tickloop_harness_protocol::hooks::HookRunRecord>,
+    ) {
+        (
+            self.records.iter().cloned().collect(),
+            self.hook_runs.iter().cloned().collect(),
+        )
+    }
+
     pub fn view(&self, saves_chats: bool) -> DenialsView {
         let history = self.history_view(saves_chats);
         DenialsView {
@@ -185,6 +208,7 @@ impl DenialWindow {
             records: self.records.iter().cloned().collect(),
             persistence,
             load_warning: self.load_warning.clone(),
+            hook_runs: self.hook_runs.iter().cloned().collect(),
         }
     }
 }

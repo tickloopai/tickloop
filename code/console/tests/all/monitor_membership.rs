@@ -531,7 +531,13 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
         subscriptions: vec![only_subscribed],
         member_states: HashMap::from([
             (running.clone(), MemberState::Live),
-            (exited.clone(), MemberState::Exited("exit 0".into())),
+            (
+                exited.clone(),
+                MemberState::Exited(Some(tickloop_harness::protocol::HostedProgramExit {
+                    code: None,
+                    signal: Some(libc::SIGTERM),
+                })),
+            ),
             (gone.clone(), MemberState::Gone),
             (lost.clone(), MemberState::Lost),
         ]),
@@ -545,13 +551,8 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
             .clone()
     };
     let action = |key, label, intent| MonitorAction { key, label, intent };
-    let subscribe = |instance: &InstanceRef| {
-        action(
-            's',
-            "subscriptions",
-            TickIntent::Subscribe(instance.clone()),
-        )
-    };
+    let subscribe =
+        |instance: &InstanceRef| action('s', "subscribe", TickIntent::Subscribe(instance.clone()));
 
     let live = row(&running);
     assert!(live.running);
@@ -573,6 +574,11 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
             action('u', "send update", TickIntent::SendUpdate(running.clone())),
         ],
         "a running Tick this Chat opened closes with x"
+    );
+    assert_eq!(
+        (row(&exited).status, row(&exited).notes),
+        ("exited by SIGTERM".to_owned(), vec!["SIGTERM".to_owned()]),
+        "an exited program's row names the signal that ended it"
     );
     assert_eq!(
         row(&exited).actions,
@@ -622,7 +628,7 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
                 "remove",
                 TickIntent::RemoveFromMonitor(foreign.clone())
             ),
-            action('s', "subscriptions", TickIntent::Subscribe(foreign.clone())),
+            action('s', "every 10 min", TickIntent::Subscribe(foreign.clone())),
         ],
         "a Tick only this Chat's subscriptions show leaves with them and is never closed; \
          its s cycles their subscriptions"

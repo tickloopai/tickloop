@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    shell_screen::ShellScreen,
+    shell_screen::{self, ShellScreen},
     views::{ViewGrants, Views},
 };
 
@@ -449,10 +449,23 @@ struct ShellOwnership {
     is_handoff_pending: bool,
 }
 
-/// The screen a task's views show and how far its output was read into it.
+/// The screen a task's views show, how far its output was read into it, and how far back each
+/// view that scrolled shows it; a view not listed follows the newest output.
 struct TaskView {
     screen: ShellScreen,
     read_to: u64,
+    scrolled_back: HashMap<u64, usize>,
+}
+
+impl TaskView {
+    /// Keeps each scrolled view within the history the screen now holds.
+    fn clamp_scrolls(&mut self) {
+        let history = self.screen.history_rows();
+        self.scrolled_back.retain(|_, back| {
+            *back = (*back).min(history);
+            *back > 0
+        });
+    }
 }
 
 impl ShellTask {
@@ -527,6 +540,7 @@ impl ShellTask {
                 binding.approval.cwd.display().to_string(),
             ),
             read_to: 0,
+            scrolled_back: HashMap::new(),
         };
         let task = Arc::new(Self {
             instance: InstanceRef::shell(binding.operation),
@@ -700,10 +714,17 @@ impl ShellTask {
 
     /// Reads what the task wrote since its view last did into that view, starting over from the
     /// end of the output when it fell far behind.
+    /// A view scrolled back keeps showing the same lines as more arrive. The running time in the
+    /// header moves on too.
     fn follow_output(&self) {
         let length = self.output_length();
         let mut view = self.view.lock().unwrap();
+        let ticked = view.screen.tick(Instant::now());
         if length <= view.read_to {
+            drop(view);
+            if ticked {
+                self.view_changes.send_replace(());
+            }
             return;
         }
         if length - view.read_to > VIEW_OUTPUT_BYTES {
@@ -711,14 +732,46 @@ impl ShellTask {
             let (tail, read_to) = self.output_end(length);
             view.screen.redraw(size, &tail);
             view.read_to = read_to;
+            view.clamp_scrolls();
         } else {
             let mut added = vec![0u8; (length - view.read_to) as usize];
             let read = self.output.read_at(&mut added, view.read_to).unwrap_or(0);
-            view.screen.append(&added[..read]);
+            let pushed = view.screen.append(&added[..read]);
             view.read_to += read as u64;
+            for back in view.scrolled_back.values_mut() {
+                *back += pushed;
+            }
+            view.clamp_scrolls();
         }
         drop(view);
         self.view_changes.send_replace(());
+    }
+
+    /// Moves `view`'s place in the output by the scroll keys in `input`.
+    pub(crate) fn scroll(&self, view: u64, input: &[u8]) {
+        let scrolls = shell_screen::scroll_keys(input);
+        if scrolls.is_empty() {
+            return;
+        }
+        let mut task_view = self.view.lock().unwrap();
+        let history = task_view.screen.history_rows();
+        let page = task_view.screen.output_rows();
+        let mut back = task_view.scrolled_back.get(&view).copied().unwrap_or(0);
+        for scroll in scrolls {
+            back = shell_screen::scrolled(back, scroll, history, page);
+        }
+        if back == 0 {
+            task_view.scrolled_back.remove(&view);
+        } else {
+            task_view.scrolled_back.insert(view, back);
+        }
+        drop(task_view);
+        self.view_changes.send_replace(());
+    }
+
+    /// Forgets where `view` scrolled to, once it detached.
+    pub(crate) fn forget_scroll(&self, view: u64) {
+        self.view.lock().unwrap().scrolled_back.remove(&view);
     }
 
     /// The last [`VIEW_OUTPUT_BYTES`] of the first `length` output bytes, from the start of a
@@ -746,10 +799,16 @@ impl ShellTask {
         self.view_changes.send_replace(());
     }
 
-    /// The terminal output that brings a view showing `shown` to the task's screen now, with the
-    /// screen it then shows.
-    pub(crate) fn frame_since(&self, shown: Option<&vt100::Screen>) -> (Vec<u8>, vt100::Screen) {
-        self.view.lock().unwrap().screen.screen().frame_since(shown)
+    /// The terminal output that brings `view`, showing `shown`, to the task's screen now at its
+    /// place in the output, with the screen it then shows.
+    pub(crate) fn frame_since(
+        &self,
+        view: u64,
+        shown: Option<&vt100::Screen>,
+    ) -> (Vec<u8>, vt100::Screen) {
+        let mut task_view = self.view.lock().unwrap();
+        let back = task_view.scrolled_back.get(&view).copied().unwrap_or(0);
+        task_view.screen.frame_since(back, shown)
     }
 
     pub(crate) fn view_count(&self) -> usize {
@@ -772,6 +831,7 @@ impl ShellTask {
             let (tail, read_to) = self.output_end(self.output_length());
             view.screen.redraw(size, &tail);
             view.read_to = read_to;
+            view.clamp_scrolls();
             drop(view);
             self.view_changes.send_replace(());
         }
@@ -905,6 +965,8 @@ async fn supervise(task: Arc<ShellTask>, mut child: Child) {
     task.follow_output();
     task.show_exit(&exit);
     task.exit.send_replace(Some(exit));
+    // Views tell their clients the task ended once its exit is readable.
+    task.view_changes.send_replace(());
 }
 
 async fn terminate(child: &mut Child, pid: u32) -> std::io::Result<std::process::ExitStatus> {

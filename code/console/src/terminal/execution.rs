@@ -34,6 +34,7 @@ use tickloop_code_client::{LocalAgentClient, RecoveringAgentClient};
 use tickloop_code_daemon::EmbeddedAgentAccess;
 use tickloop_code_settings::new_chat::new_chat_settings;
 use tickloop_harness::model::judgment::jev_key_status_in;
+use tickloop_harness::protocol::hooks::{HookList, HookTrustChange};
 use tickloop_harness::protocol::{
     ApprovalHistoryView, BranchOutcome, BranchRequest, ChatSnapshot, ChatStatus, CommandSnapshot,
     CompactionOutcome, ContextBreakdown, DirectedSummaryOutcome, DirectedSummaryRequest, Event,
@@ -477,6 +478,13 @@ impl EventForwarder {
             return true;
         }
         self.forwarded_through = event.sequence;
+        let _phase = super::stall_watch::enter_with(|| {
+            format!(
+                "feed {}: waiting for event delivery to forward event {}",
+                event.chat_id.public(),
+                event.sequence
+            )
+        });
         let covered = tokio::select! {
             _ = cancel.cancelled() => return false,
             covered = self.event_delivery.lock() => covered,
@@ -617,7 +625,7 @@ impl ConsoleExecution {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                access,
+                access: Arc::new(super::stall_watch::WatchedAccess(access)),
                 upgrades_supported: false,
                 epoch,
                 launch,
@@ -782,6 +790,10 @@ impl ConsoleExecution {
 
     pub(super) fn launch_spec(&self) -> LaunchSpec {
         self.effective_launch()
+    }
+    /// `/clear` left the shown Agent: the New Agent the draft creates starts the session it began.
+    pub(super) fn follow_clear_in_draft(&self) {
+        self.inner.draft.lock().unwrap().follow_clear();
     }
     pub(super) fn access(&self) -> Arc<dyn AgentAccess> {
         self.inner.access.clone()
@@ -1431,6 +1443,13 @@ impl ConsoleExecution {
                         let Some(inner) = weak.upgrade() else {
                             break;
                         };
+                        let _phase = super::stall_watch::enter_with(|| {
+                            format!(
+                                "feed {}: resync after event {}",
+                                chat.public(),
+                                forwarder.forwarded_through
+                            )
+                        });
                         match inner
                             .missed_events(execution, forwarder.forwarded_through)
                             .await
@@ -1489,6 +1508,7 @@ impl ConsoleExecution {
     }
 
     pub(super) async fn pause_event_delivery(&self) -> EventRecovery {
+        let _phase = super::stall_watch::enter("event recovery: waiting for event delivery");
         EventRecovery {
             covered: self.inner.event_delivery.clone().lock_owned().await,
             inner: self.inner.clone(),
@@ -2689,8 +2709,7 @@ impl ConsoleExecution {
             arguments,
             tickloop_code_settings::skills::SkillCaller::User,
         )
-        .and_then(tickloop_harness::protocol::InvokedSkill::try_from)
-        .map(|_| ())
+        .and_then(|expanded| expanded.validate())
     }
     fn initial_directory_sources(
         &self,
@@ -4301,6 +4320,50 @@ impl ConsoleExecution {
         }
     }
 
+    /// The hooks configured for `folder`, read through this View's configuration root.
+    pub(super) async fn hooks(&self, folder: PathBuf) -> Result<HookList, AccessError> {
+        let mut launch = self.effective_launch();
+        launch.folder = folder;
+        match self
+            .inner
+            .access
+            .observe(ObservationRequest::Hooks {
+                launch: Box::new(launch),
+            })
+            .await?
+            .initial
+        {
+            ObservationValue::Hooks(hooks) => Ok(*hooks),
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// Changes the trust records of hooks configured for `folder`, while they are still at
+    /// `expected_revision`, and returns the hooks as they then stand.
+    pub(super) async fn write_hook_trust(
+        &self,
+        folder: PathBuf,
+        changes: Vec<HookTrustChange>,
+        expected_revision: String,
+    ) -> Result<HookList, AccessError> {
+        let mut launch = self.effective_launch();
+        launch.folder = folder;
+        match self
+            .command(
+                AgentCommand::WriteHookTrust {
+                    launch: Box::new(launch),
+                    changes,
+                    expected_revision: Some(expected_revision),
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::Hooks(hooks) => Ok(*hooks),
+            _ => Err(unexpected()),
+        }
+    }
+
     pub(super) async fn reconnect_mcp_server(
         &self,
         chat: Uuid,
@@ -4959,9 +5022,12 @@ mod tests {
         Arc<Recording>,
         ConsoleExecution,
     ) {
-        let runtime = tickloop_harness::runtime::Agent::new_embedded(
+        use tickloop_code_settings::local_agent::LocalAgent;
+
+        let runtime = tickloop_harness::runtime::Agent::new_with_user_settings_embedded(
             model.clone(),
             Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![])),
+            tickloop_code_settings::UserSettings::in_root(directory),
         );
         let actual = EmbeddedAgentAccess::new(runtime.clone());
         let epoch = actual.daemon_epoch();
@@ -5634,6 +5700,13 @@ mod tests {
         accepted: impl Fn(&CommandResult) -> bool,
     ) {
         let directory = tempfile::tempdir().unwrap();
+        let skill_directory = directory.path().join(".tickloop/skills/guide");
+        std::fs::create_dir_all(&skill_directory).unwrap();
+        std::fs::write(
+            skill_directory.join("SKILL.md"),
+            "---\nname: guide\ndescription: Test guidance\n---\nGuide $ARGUMENTS",
+        )
+        .unwrap();
         let (runtime, access, terminal) = recording_terminal(directory.path());
         let chat = terminal
             .create_from_draft(directory.path().into())
@@ -5693,12 +5766,7 @@ mod tests {
     async fn a_late_accepted_skill_is_adopted_instead_of_sent_again() {
         assert_late_accepted_input_is_adopted(
             "skill",
-            async |terminal, chat| {
-                terminal
-                    .invoke_skill(chat, "tickloop", "")
-                    .await
-                    .map(|_| ())
-            },
+            async |terminal, chat| terminal.invoke_skill(chat, "guide", "").await.map(|_| ()),
             |command| {
                 matches!(
                     command,
@@ -5719,7 +5787,7 @@ mod tests {
             "queued",
             async |terminal, chat| {
                 terminal
-                    .queue_command(chat, "/tickloop".into())
+                    .queue_command(chat, "/guide".into())
                     .await
                     .map(|_| ())
             },

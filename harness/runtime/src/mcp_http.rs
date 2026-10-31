@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     io,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -24,8 +24,10 @@ use rmcp::{
 };
 use sse_stream::{Sse, SseStream};
 
-use crate::mcp::negotiation::ProbeState;
-use tickloop_harness_base::network::{HttpPolicy, build_http_client};
+use crate::mcp::{HostBearer, negotiation::ProbeState};
+use tickloop_harness_base::network::{
+    HttpPolicy, Reach, build_http_client, check_public_url, not_public_refusal,
+};
 
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
@@ -37,12 +39,15 @@ const RESOURCE_NOT_FOUND: &str = "MCP resource not found";
 const MAX_URI_CHARS: usize = 200;
 const MAX_ERROR_SOURCE_DEPTH: usize = 8;
 
-/// Why the HTTP exchange under an MCP message failed. Every variant shows only fixed text, so
-/// neither the bearer nor anything the server sent can surface through it.
+/// Why the HTTP exchange under an MCP message failed. Every variant shows only fixed text or the
+/// configured address, so neither the bearer nor anything the server sent can surface through it.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum McpHttpError {
     #[error("MCP connection failed")]
     Connection,
+    /// The address resolved to one the host's reach excludes; no connection was made.
+    #[error("MCP endpoint refused: {0}")]
+    NotPublic(String),
     #[error("MCP request timed out")]
     TimedOut,
     #[error("MCP returned HTTP {0}")]
@@ -57,7 +62,9 @@ pub(crate) enum McpHttpError {
 
 impl From<reqwest::Error> for McpHttpError {
     fn from(error: reqwest::Error) -> Self {
-        if error.is_timeout() {
+        if let Some(refusal) = not_public_refusal(&error) {
+            Self::NotPublic(refusal.to_string())
+        } else if error.is_timeout() {
             Self::TimedOut
         } else {
             Self::Connection
@@ -211,15 +218,33 @@ pub(crate) type ResponseRedactor = Arc<dyn Fn(&mut serde_json::Value, ResponsePa
 pub(crate) type DirectoryRequests =
     Arc<Mutex<HashMap<rmcp::model::RequestId, tokio::time::Instant>>>;
 
+/// The host's token a response answers, kept with that response: the server's verdict on it is
+/// about that token, not the one the connection sent last.
+#[derive(Clone)]
+struct SentHostToken(Arc<str>);
+
+/// The host's login behind a connection: asked for the token before each request, and told
+/// about each token the server rejects.
+#[derive(Clone)]
+pub(crate) struct ConnectionBearer {
+    pub(crate) source: Arc<dyn HostBearer>,
+    /// Takes up each token before it is sent, so that whatever echoes it is redacted.
+    pub(crate) sending: Arc<dyn Fn(&str) + Send + Sync>,
+    /// The token the server refused last, shared with the server's entry.
+    pub(crate) rejected: Arc<RwLock<Option<Arc<str>>>>,
+}
+
 #[derive(Clone)]
 pub(crate) struct McpHttpClient {
     client: Client,
     endpoint: Url,
-    /// Shared by every clone, so a renewed token reaches the open connection.
-    token: Arc<std::sync::RwLock<Arc<str>>>,
+    /// Shared by every clone, so a renewed token reaches the open connection. With a host
+    /// bearer, the token sent last.
+    token: Arc<RwLock<Arc<str>>>,
     unauthorized: Arc<AtomicBool>,
     insufficient_scope: Arc<AtomicBool>,
     artifact: Option<tickloop_harness_artifacts::ArtifactClient>,
+    bearer: Option<ConnectionBearer>,
     redactor: Option<ResponseRedactor>,
     directory_requests: DirectoryRequests,
     headers: HashMap<HeaderName, HeaderValue>,
@@ -236,10 +261,11 @@ impl McpHttpClient {
         Ok(Self {
             client,
             endpoint,
-            token: Arc::new(std::sync::RwLock::new(token.into())),
+            token: Arc::new(RwLock::new(token.into())),
             unauthorized: Arc::new(AtomicBool::new(false)),
             insufficient_scope: Arc::new(AtomicBool::new(false)),
             artifact: None,
+            bearer: None,
             redactor: None,
             directory_requests: Arc::default(),
             headers: HashMap::new(),
@@ -247,12 +273,19 @@ impl McpHttpClient {
         })
     }
 
+    /// A client for a configured server. With [`Reach::PublicAddresses`] it connects only to
+    /// public addresses, after name resolution as well, and never through a proxy.
     pub(crate) fn for_server(
         endpoint: Url,
         headers: &std::collections::BTreeMap<String, String>,
         token: Option<String>,
         timeout: Duration,
+        reach: Reach,
     ) -> Result<Self, String> {
+        if reach == Reach::PublicAddresses {
+            check_public_url(&endpoint)
+                .map_err(|refusal| format!("MCP endpoint refused: {refusal}"))?;
+        }
         let local = endpoint.host_str().is_some_and(|host| {
             host == "localhost"
                 || host
@@ -270,6 +303,7 @@ impl McpHttpClient {
         let mut policy = HttpPolicy::new(Policy::none());
         policy.timeout = Some(timeout);
         policy.connect_timeout = Some(Duration::from_secs(5));
+        policy.reach = reach;
         http.client = build_http_client(&endpoint, policy)
             .map_err(|_| "MCP HTTP client unavailable")?
             .0;
@@ -327,10 +361,19 @@ impl McpHttpClient {
         self
     }
 
+    /// Sends each request with the host's current token instead of a token of its own.
+    pub(crate) fn with_host_bearer(mut self, bearer: ConnectionBearer) -> Self {
+        self.bearer = Some(bearer);
+        self
+    }
+
     async fn send(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, StreamableHttpError<McpHttpError>> {
+        if let Some(bearer) = &self.bearer {
+            return self.send_with_host_bearer(request, bearer).await;
+        }
         let Some(artifact) = &self.artifact else {
             return request
                 .send()
@@ -353,6 +396,75 @@ impl McpHttpClient {
             Err(_) => McpHttpError::CredentialUnavailable,
         };
         Err(StreamableHttpError::Client(failure))
+    }
+
+    /// Sends `request` with the host's current token. When the server answers 401, the host drops
+    /// that token and the request goes once more with the next one: a server that refused to
+    /// authenticate a request has not acted on it. A second refusal is returned as it is.
+    async fn send_with_host_bearer(
+        &self,
+        request: reqwest::RequestBuilder,
+        bearer: &ConnectionBearer,
+    ) -> Result<reqwest::Response, StreamableHttpError<McpHttpError>> {
+        let (client, template) = request.build_split();
+        let template = template.map_err(|_| unexpected("invalid MCP request"))?;
+        let mut token = self.host_token(bearer).await?;
+        let mut retried = false;
+        loop {
+            let mut request = template
+                .try_clone()
+                .ok_or_else(|| unexpected("invalid MCP request"))?;
+            let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| StreamableHttpError::Client(McpHttpError::CredentialUnavailable))?;
+            authorization.set_sensitive(true);
+            request
+                .headers_mut()
+                .insert(header::AUTHORIZATION, authorization);
+            *self.token.write().unwrap() = token.as_str().into();
+            let mut response = client
+                .execute(request)
+                .await
+                .map_err(|error| StreamableHttpError::Client(error.into()))?;
+            response
+                .extensions_mut()
+                .insert(SentHostToken(token.as_str().into()));
+            if response.status() != StatusCode::UNAUTHORIZED || retried {
+                return Ok(response);
+            }
+            retried = true;
+            bearer
+                .source
+                .invalidate(&token)
+                .await
+                .map_err(|_| StreamableHttpError::Client(McpHttpError::CredentialUnavailable))?;
+            let renewed = self.host_token(bearer).await?;
+            if renewed == token {
+                return Ok(response);
+            }
+            token = renewed;
+        }
+    }
+
+    /// The host's current token; without one the server needs a login.
+    async fn host_token(
+        &self,
+        bearer: &ConnectionBearer,
+    ) -> Result<String, StreamableHttpError<McpHttpError>> {
+        match bearer.source.bearer().await {
+            Ok(Some(token)) if !token.is_empty() => {
+                (bearer.sending)(&token);
+                Ok(token)
+            }
+            Ok(_) => {
+                self.unauthorized.store(true, Ordering::SeqCst);
+                Err(StreamableHttpError::Client(
+                    McpHttpError::CredentialUnavailable,
+                ))
+            }
+            Err(_) => Err(StreamableHttpError::Client(
+                McpHttpError::CredentialUnavailable,
+            )),
+        }
     }
 
     pub(crate) fn unauthorized(&self) -> bool {
@@ -570,6 +682,11 @@ impl McpHttpClient {
         }
         if status == StatusCode::UNAUTHORIZED || insufficient_scope {
             self.unauthorized.store(true, Ordering::SeqCst);
+            if let Some(bearer) = &self.bearer
+                && let Some(SentHostToken(sent)) = response.extensions().get::<SentHostToken>()
+            {
+                *bearer.rejected.write().unwrap() = Some(sent.clone());
+            }
         }
         if !status.is_success() {
             return Err(StreamableHttpError::Client(McpHttpError::Status(status)));
@@ -629,6 +746,11 @@ fn sse_stream(
     SseStream::from_bytes_stream(stream)
         .map(move |event| {
             event.and_then(|mut event| {
+                // SEP-1699 priming sends an id (and usually retry) with empty data.
+                // The SSE spec records that id for Last-Event-ID and ignores the
+                // event. rmcp skips a payload whose trim is empty; whitespace is
+                // never JSON-RPC, so drop it before redaction parses the event.
+                event.data = event.data.filter(|data| !data.trim().is_empty());
                 if let Some(redact) = &redactor {
                     if let Some(data) = event.data.take() {
                         event.data = Some(
@@ -891,6 +1013,254 @@ mod tests {
     };
 
     use super::*;
+
+    struct RotatedLogin;
+
+    #[async_trait::async_trait]
+    impl HostBearer for RotatedLogin {
+        fn account(&self) -> String {
+            "account-a".into()
+        }
+
+        async fn bearer(&self) -> Result<Option<String>, crate::mcp::BearerUnavailable> {
+            Ok(Some("token-b".into()))
+        }
+    }
+
+    /// A refusal that arrives late answers the token its request carried: a token the connection
+    /// sent since, after a rotation, is not taken for refused.
+    #[test]
+    fn a_late_refusal_marks_the_token_its_request_sent() {
+        let rejected = Arc::new(RwLock::new(None));
+        let client = McpHttpClient::new(
+            Url::parse("https://mcp.example.test/mcp").unwrap(),
+            String::new(),
+        )
+        .unwrap()
+        .with_host_bearer(ConnectionBearer {
+            source: Arc::new(RotatedLogin),
+            sending: Arc::new(|_| {}),
+            rejected: rejected.clone(),
+        });
+        // The request with token A went out first; the host rotated to B, which a later request
+        // sent; then A's refusal arrives.
+        client.set_token("token-b");
+        let mut refusal = reqwest::Response::from(
+            http::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Vec::<u8>::new())
+                .unwrap(),
+        );
+        refusal
+            .extensions_mut()
+            .insert(SentHostToken("token-a".into()));
+        assert!(client.verify_status(&refusal).is_err());
+        assert_eq!(rejected.read().unwrap().as_deref(), Some("token-a"));
+    }
+
+    async fn event_stream_response(body: &str) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(stream.read(&mut bytes).await.unwrap() > 0);
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let response = reqwest::Client::new().get(endpoint).send().await.unwrap();
+        server.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn empty_sse_data_preserves_metadata_and_the_following_message() {
+        // `\r` alone is an SSE line ending, beside `\n` and `\r\n`. `data:  `
+        // keeps one space after the parser strips a single leading space.
+        for newline in ["\n", "\r\n", "\r"] {
+            for data in ["data:", "data: ", "data:  ", ""] {
+                for redacted in [false, true] {
+                    let data = if data.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{data}{newline}")
+                    };
+                    let body = format!(
+                        "{data}id: secret{newline}event: secret{newline}retry: 3000{newline}{newline}data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"tools\":[],\"text\":\"secret\"}}}}{newline}{newline}"
+                    );
+                    let directory_requests = DirectoryRequests::default();
+                    let request_id = rmcp::model::RequestId::Number(1);
+                    directory_requests
+                        .lock()
+                        .unwrap()
+                        .insert(request_id.clone(), tokio::time::Instant::now());
+                    let directory_redacted = Arc::new(AtomicBool::new(false));
+                    let observed = directory_redacted.clone();
+                    let redactor: Option<ResponseRedactor> = redacted.then(|| {
+                        Arc::new(move |value: &mut Value, part| {
+                            if matches!(part, ResponsePart::ToolDirectory) {
+                                observed.store(true, Ordering::SeqCst);
+                            }
+                            if value.as_str() == Some("secret") {
+                                *value = Value::String("[redacted]".into());
+                            } else if let Some(text) = value.get_mut("text") {
+                                *text = Value::String("[redacted]".into());
+                            }
+                        }) as ResponseRedactor
+                    });
+                    let mut events = sse_stream(
+                        event_stream_response(&body).await,
+                        MAX_JSON_BYTES,
+                        redactor,
+                        directory_requests.clone(),
+                        None,
+                    );
+                    let priming = events.next().await.unwrap().unwrap();
+                    assert_eq!(priming.data, None);
+                    let expected = if redacted { "[redacted]" } else { "secret" };
+                    assert_eq!(priming.id.as_deref(), Some(expected));
+                    assert_eq!(priming.event.as_deref(), Some(expected));
+                    assert_eq!(priming.retry, Some(3000));
+                    assert!(directory_requests.lock().unwrap().contains_key(&request_id));
+                    let response = events.next().await.unwrap().unwrap();
+                    let message: Value =
+                        serde_json::from_str(response.data.as_deref().unwrap()).unwrap();
+                    assert_eq!(message["id"], 1);
+                    assert_eq!(message["result"]["tools"], serde_json::json!([]));
+                    assert_eq!(message["result"]["text"], expected);
+                    assert_eq!(directory_redacted.load(Ordering::SeqCst), redacted);
+                    assert_eq!(directory_requests.lock().unwrap().is_empty(), redacted);
+                    assert!(events.next().await.is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nonempty_sse_data_keeps_existing_validation() {
+        for redacted in [false, true] {
+            let redactor: Option<ResponseRedactor> =
+                redacted.then(|| Arc::new(|_: &mut Value, _| {}) as ResponseRedactor);
+            let mut events = sse_stream(
+                event_stream_response("data: not-json\n\n").await,
+                MAX_JSON_BYTES,
+                redactor,
+                DirectoryRequests::default(),
+                None,
+            );
+            let event = events.next().await.unwrap();
+            if redacted {
+                assert_eq!(
+                    event.unwrap_err().to_string(),
+                    "body error: invalid MCP event response"
+                );
+            } else {
+                assert_eq!(event.unwrap().data.as_deref(), Some("not-json"));
+            }
+        }
+
+        // A lone space (`data:  `) and two empty `data:` lines (`"\n"`) trim to
+        // nothing. rmcp skips those payloads, so they are empty data.
+        for body in ["data:  \n\n", "data:\ndata:\n\n"] {
+            for redacted in [false, true] {
+                let redactor: Option<ResponseRedactor> =
+                    redacted.then(|| Arc::new(|_: &mut Value, _| {}) as ResponseRedactor);
+                let mut events = sse_stream(
+                    event_stream_response(body).await,
+                    MAX_JSON_BYTES,
+                    redactor,
+                    DirectoryRequests::default(),
+                    None,
+                );
+                let event = events.next().await.expect(body).expect(body);
+                assert_eq!(event.data, None, "{body}");
+                assert!(events.next().await.is_none(), "{body}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_sse_data_alone_does_not_complete_initialization() {
+        for body in [
+            "data: \nid: 0\nretry: 3000\n\n",
+            "data:  \nid: 0\nretry: 3000\n\n",
+            "data:\ndata:\nid: 0\nretry: 3000\n\n",
+            ": ping\n\n",
+            ": ping\r\r",
+        ] {
+            let events = sse_stream(
+                event_stream_response(body).await,
+                MAX_JSON_BYTES,
+                Some(Arc::new(|_, _| {})),
+                DirectoryRequests::default(),
+                None,
+            );
+            let result = StreamableHttpPostResponse::Sse(events, None)
+                .expect_initialized::<McpHttpError>()
+                .await;
+            match result {
+                Err(StreamableHttpError::UnexpectedServerResponse(_)) => {}
+                other => panic!("{body:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// A comment-only keep-alive, then a priming event, then a JSON-RPC
+    /// notification, then the response. Line endings are LF, CRLF, and bare CR.
+    #[tokio::test]
+    async fn comment_keep_alive_and_priming_then_a_notification_still_settle() {
+        let notification = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
+        let response_body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+        for newline in ["\n", "\r\n", "\r"] {
+            for priming in [
+                format!("data:{newline}"),
+                format!("data:  {newline}"),
+                format!("data:{newline}data:{newline}"),
+            ] {
+                let body = [
+                    format!(": ping{newline}"),
+                    format!("{newline}{priming}id: 0{newline}retry: 3000{newline}"),
+                    format!("{newline}data: {notification}{newline}"),
+                    format!("{newline}data: {response_body}{newline}{newline}"),
+                ]
+                .concat();
+                let events = sse_stream(
+                    event_stream_response(&body).await,
+                    MAX_JSON_BYTES,
+                    Some(Arc::new(|_: &mut Value, _| {})),
+                    DirectoryRequests::default(),
+                    None,
+                );
+                let (message, session_id) = StreamableHttpPostResponse::Sse(events, None)
+                    .expect_initialized::<McpHttpError>()
+                    .await
+                    .unwrap_or_else(|error| panic!("newline {newline:?}: {error}"));
+                assert!(session_id.is_none());
+                let ServerJsonRpcMessage::Response(response) = message else {
+                    panic!("newline {newline:?}: expected the JSON-RPC response");
+                };
+                assert_eq!(response.id, rmcp::model::RequestId::Number(1));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_sse_data_still_counts_toward_event_size_limits() {
+        let mut events = sse_stream(
+            event_stream_response("data: \nid: 0\nretry: 3000\n\n").await,
+            8,
+            Some(Arc::new(|_, _| {})),
+            DirectoryRequests::default(),
+            None,
+        );
+        assert_eq!(
+            events.next().await.unwrap().unwrap_err().to_string(),
+            "body error: MCP SSE event too large"
+        );
+    }
 
     #[tokio::test]
     async fn bearer_request_does_not_follow_a_cross_origin_redirect() {

@@ -125,12 +125,8 @@ pub enum SettingsStoreError {
 pub trait SettingsStore: Send + Sync {
     fn read(&self, project: Option<&Path>) -> SettingsSnapshot;
     fn write(&self, change: SettingsUpdate) -> Result<(), SettingsStoreError>;
-    fn skills(&self, folder: Option<&Path>) -> crate::skills::SkillRegistry {
-        if folder.is_some() {
-            crate::skills::SkillRegistry::builtin()
-        } else {
-            crate::skills::SkillRegistry::builtin_without_ticks()
-        }
+    fn skills(&self, _folder: Option<&Path>) -> crate::skills::SkillRegistry {
+        crate::skills::SkillRegistry::builtin()
     }
     fn loop_instructions(
         &self,
@@ -186,6 +182,7 @@ struct MemorySettings {
     auto_revision: u64,
     has_thinking_selection: bool,
     previous_effort: Option<ReasoningEffort>,
+    hooks: HookList,
 }
 
 impl MemorySettingsStore {
@@ -207,7 +204,18 @@ impl MemorySettingsStore {
     }
 }
 
+impl MemorySettingsStore {
+    /// The hooks every Folder reads from now on.
+    pub fn set_hooks(&self, hooks: HookList) {
+        self.state.lock().unwrap().hooks = hooks;
+    }
+}
+
 impl SettingsStore for MemorySettingsStore {
+    fn hooks(&self, _folder: Option<&Path>) -> HookList {
+        self.state.lock().unwrap().hooks.clone()
+    }
+
     fn read(&self, project: Option<&Path>) -> SettingsSnapshot {
         let state = self.state.lock().unwrap();
         let mut snapshot = state.snapshot.clone();

@@ -27,6 +27,7 @@ pub use chat_files::{FileLocation, FileLocator};
 pub mod file_change;
 pub mod file_port;
 pub mod file_search;
+mod input;
 pub mod local_files;
 pub mod local_roots;
 pub mod permissions;

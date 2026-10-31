@@ -5,6 +5,44 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
+test('workspace tests rebuild the CLI before script tests and stop if the build fails', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'workspace-build-test-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  copyFileSync(resolve('Makefile'), join(directory, 'Makefile'));
+  const bin = join(directory, 'bin');
+  mkdirSync(bin);
+  const executable = join(directory, 'target/debug/tickloop');
+  mkdirSync(join(directory, 'target/debug'), { recursive: true });
+  const calls = join(directory, 'calls');
+  writeFileSync(join(bin, 'cargo'), `#!${process.execPath}
+    const fs = require('node:fs');
+    if (process.argv.includes('--version')) process.exit(0);
+    if (process.argv[2] !== 'build') process.exit(1);
+    fs.appendFileSync(${JSON.stringify(calls)}, 'build\\n');
+    if (fs.existsSync(${JSON.stringify(join(directory, 'fail'))})) process.exit(1);
+    fs.writeFileSync(${JSON.stringify(executable)}, 'current');
+  `, { mode: 0o755 });
+  writeFileSync(join(bin, 'node'), `#!${process.execPath}
+    const fs = require('node:fs');
+    fs.appendFileSync(${JSON.stringify(calls)}, process.argv.includes('--test') ? 'scripts\\n' : 'workspace\\n');
+    if (fs.readFileSync(${JSON.stringify(executable)}, 'utf8') !== 'current') process.exit(1);
+  `, { mode: 0o755 });
+  for (const state of ['stale', 'missing', 'failed']) {
+    rmSync(calls, { force: true });
+    if (state === 'missing') rmSync(executable);
+    else writeFileSync(executable, 'stale');
+    if (state === 'failed') writeFileSync(join(directory, 'fail'), '');
+    const result = spawnSync('make', ['test-workspace', 'PACKAGE_TARGET=fixture'], {
+      cwd: directory,
+      env: { ...process.env, PATH: `${bin}:/usr/bin:/bin`, HOME: directory, MAKEFLAGS: '', MAKELEVEL: '' },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status === 0, state !== 'failed', `${state}: ${result.stderr}`);
+    assert.deepEqual(readFileSync(calls, 'utf8').trim().split('\n'),
+      state === 'failed' ? ['build'] : ['build', 'scripts', 'workspace']);
+  }
+});
+
 test('workspace runner removes its temporary roots on success and failure', t => {
   const directory = mkdtempSync(join(tmpdir(), 'workspace-runner-test-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -18,7 +56,7 @@ test('workspace runner removes its temporary roots on success and failure', t =>
   writeFileSync(join(bin, 'node'), `#!/bin/sh\ncase "$1" in *test-workspace.mjs) exec '${process.execPath}' "$@";; esac\n`, { mode: 0o755 });
   writeFileSync(join(bin, 'cargo'), `#!${process.execPath}
     const fs = require('node:fs');
-    if (process.argv.includes('--version')) process.exit(0);
+    if (process.argv.includes('--version') || process.argv[2] === 'build') process.exit(0);
     fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify([process.env.TICKLOOP_CONFIG_DIR, process.env.TICKLOOP_TMPDIR, process.env.TICKLOOP_DEBUG ?? null]));
     process.exit(fs.existsSync(${JSON.stringify(join(directory, 'fail'))}) ? 1 : 0);
   `, { mode: 0o755 });
@@ -63,4 +101,33 @@ test('workspace runner reports and cleans only its leaked process and runtime wi
   assert.match(result.stderr, /1 owned processes, 1 owned runtime directories/);
   assert.ok(!existsSync(readFileSync(runtimeFile, 'utf8')));
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+});
+
+test('workspace runner reruns failed tests one at a time and keeps the rerun result', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'workspace-rerun-test-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const bin = join(directory, 'bin');
+  mkdirSync(bin);
+  const calls = join(directory, 'calls');
+  writeFileSync(join(bin, 'cargo'), `#!${process.execPath}
+    const fs = require('node:fs');
+    const args = process.argv.slice(2);
+    fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify([args, process.env.NEXTEST_EXPERIMENTAL_RECORD ?? null]) + '\\n');
+    if (!args.includes('--rerun')) process.exit(Number(process.env.FIRST_EXIT));
+    process.exit(Number(process.env.RERUN_EXIT));
+  `, { mode: 0o755 });
+  for (const [firstExit, rerunExit, reruns, status] of [[0, 1, false, 0], [101, 0, false, 101], [100, 0, true, 0], [100, 100, true, 100]]) {
+    rmSync(calls, { force: true });
+    const result = spawnSync(process.execPath, [resolve('scripts/test-workspace.mjs')], { encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIRST_EXIT: String(firstExit), RERUN_EXIT: String(rerunExit) } });
+    const runs = readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(result.status, status, result.stderr);
+    assert.equal(runs.length, reruns ? 2 : 1, result.stderr);
+    assert.ok(runs.every(([args, record]) => record === '1' && args.includes('--user-config-file')));
+    if (reruns) {
+      const rerun = runs[1][0].join(' ');
+      assert.match(rerun, /--no-fail-fast .*--rerun latest --test-threads 1$/);
+      assert.match(result.stderr, /Rerunning the failed tests one at a time/);
+    }
+  }
 });

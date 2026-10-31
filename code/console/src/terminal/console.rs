@@ -27,6 +27,7 @@ use uuid::Uuid;
 mod agent_layout;
 mod cards;
 mod delayed_submissions;
+mod full_screen;
 use delayed_submissions::DelayedSubmission;
 #[cfg(test)]
 mod image_preparation_tests;
@@ -56,6 +57,9 @@ mod ended_agents_tests;
 #[cfg(test)]
 #[path = "console/foreground_command_tests.rs"]
 mod foreground_command_tests;
+#[cfg(test)]
+#[path = "console/full_screen_tests.rs"]
+mod full_screen_tests;
 #[cfg(test)]
 #[path = "console/goal_tests.rs"]
 mod goal_tests;
@@ -400,6 +404,7 @@ pub(super) enum InputEvent {
     /// Work `/plugins` asks for, or the login state to read again once a login program ended.
     TickPackages(super::ticks_panel::TickPackageWork),
     Mcp(super::mcp_panel::McpWork),
+    Hooks(super::hooks_panel::HooksWork),
     TickAction {
         chat: Uuid,
         action: super::tick_actions::PreparedTickAction,
@@ -465,6 +470,7 @@ impl fmt::Debug for InputEvent {
             Self::ArtifactSignOut => formatter.write_str("ArtifactSignOut"),
             Self::TickPackages(work) => formatter.debug_tuple("TickPackages").field(work).finish(),
             Self::Mcp(work) => formatter.debug_tuple("Mcp").field(work).finish(),
+            Self::Hooks(work) => formatter.debug_tuple("Hooks").field(work).finish(),
             Self::TickAction { chat, action } => formatter
                 .debug_struct("TickAction")
                 .field("chat", chat)
@@ -1018,6 +1024,12 @@ pub(super) struct State {
     queued_card_inputs: Vec<InputEvent>,
     /// A left press on a card or on a row with a card; it acts on its release.
     card_press: Option<(Cell, super::monitor::MonitorTarget)>,
+    /// A full-screen view waiting to take this terminal; the input thread lends it between keys.
+    full_screen_attach: Option<full_screen::FullScreenAttach>,
+    /// A full-screen view owns the terminal; nothing is drawn until it is taken back.
+    terminal_lent: bool,
+    /// The permission request or question the terminal last rang for while it was lent.
+    rung_for: Option<Uuid>,
     /// One probe per access whose members' host state can be read: Herdr members inside a
     /// Herdr View and hosted Ticks in every View.
     member_probes: Vec<Arc<dyn crate::monitor_rows::TickProbe>>,
@@ -1985,6 +1997,54 @@ impl Console {
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())?;
         Ok(Some(taken))
+    }
+
+    /// Hands `result` to the `/hooks` panel `panel`, shown or waiting; `None` when it is closed,
+    /// otherwise whether it still has something to show.
+    pub(super) fn apply_hooks_result(
+        &self,
+        panel: Uuid,
+        result: super::hooks_panel::HooksResult,
+    ) -> Result<Option<bool>, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let Some(super::user_panel::UserPanel::Hooks(open)) = state.user_panel_mut(panel) else {
+            return Ok(None);
+        };
+        let keeps_showing = open.apply(result);
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(Some(keeps_showing))
+    }
+
+    /// Closes the panel `panel` when it is the one shown.
+    pub(super) fn close_user_panel(&self, panel: Uuid) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state
+            .user_panel
+            .as_ref()
+            .is_none_or(|shown| shown.id() != panel)
+        {
+            return Ok(());
+        }
+        state.user_panel = None;
+        state.rendered_region = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Whether the New Agent screen is shown with nothing over its input, so the review of its
+    /// Folder's hooks can show.
+    pub(super) fn can_offer_hook_review(&self) -> Result<bool, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state.interactive
+            && state.chat.is_none()
+            && state.overview.projection.is_none()
+            && state.request_layout.is_none()
+            && state.transcript.is_none()
+            && state.diff_screen.is_none()
+            && !state.input_dialog_visible())
     }
 
     /// The `/mcp` panel shown while its servers are still connecting.
@@ -4017,6 +4077,25 @@ impl Console {
         Ok(())
     }
 
+    pub(super) fn set_monitor_action_waiting(
+        &self,
+        chat: Uuid,
+        waiting: bool,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let monitor = state.monitor_for_chat_mut(chat);
+        if monitor.action_waiting == waiting {
+            return Ok(());
+        }
+        monitor.action_waiting = waiting;
+        if state.chat == Some(chat) {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Shows why an action did nothing, kept across periodic status refreshes until the next key.
     pub(super) fn hold_status(&self, text: &str) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
@@ -4267,22 +4346,26 @@ impl Console {
         Ok(())
     }
 
-    pub(super) fn write_shell_notification(
+    /// Adds a background task's line as it ends; a Shell task's flashes with its Monitor row.
+    pub(super) fn write_task_notification(
         &self,
         notification: &tickloop_harness::protocol::TaskNotification,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let runs = super::task_notification_line(notification, state.display);
-        let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
-        state.monitor.flash_received(
-            tick_protocol::InstanceRef::shell(notification.task_id),
-            now_ms,
-        );
-        state.scrollback.append_flashing_label(
-            &runs,
-            Some((super::list_row::RowFlash::TakeIn, now_ms)),
-            Some(tick_protocol::InstanceRef::shell(notification.task_id)),
-        );
+        match &notification.shell {
+            Some(shell) => {
+                let instance = tick_protocol::InstanceRef::shell(shell.task_id);
+                let now_ms = tickloop_harness::base::private_fs::unix_time_milliseconds();
+                state.monitor.flash_received(instance.clone(), now_ms);
+                state.scrollback.append_flashing_label(
+                    &runs,
+                    Some((super::list_row::RowFlash::TakeIn, now_ms)),
+                    Some(instance),
+                );
+            }
+            None => state.scrollback.append_flashing_label(&runs, None, None),
+        }
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
@@ -6451,6 +6534,9 @@ impl State {
             collapsed_cards: Vec::new(),
             queued_card_inputs: Vec::new(),
             card_press: None,
+            full_screen_attach: None,
+            terminal_lent: false,
+            rung_for: None,
             member_probes: Vec::new(),
             member_probe_running: false,
             permissions_surface: None,
@@ -6852,8 +6938,20 @@ impl State {
                     self.conversation_focused = false;
                     self.monitor.focus(self.monitor.overlay, None);
                     self.monitor.select_target(&instance);
+                    // A row shown full screen takes a double click, so a single click only
+                    // selects it.
+                    let clicks = self.count_click(at, Instant::now());
+                    let opens_full_screen = matches!(
+                        &instance,
+                        super::monitor::MonitorTarget::Tick(selected)
+                            if self.monitor.selected().is_some_and(|entry| {
+                                &entry.instance == selected && entry.opens_full_screen()
+                            })
+                    );
                     // An edge line only scrolls to the row it counts; it opens nothing.
-                    if !matches!(instance, super::monitor::MonitorTarget::Unseen { .. }) {
+                    if !matches!(instance, super::monitor::MonitorTarget::Unseen { .. })
+                        && (!opens_full_screen || clicks >= 2)
+                    {
                         self.pointer_input =
                             self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                     }
@@ -7346,6 +7444,10 @@ impl State {
 
     fn draw(&mut self, output: &mut impl Write) -> io::Result<()> {
         self.schedule_file_index();
+        if self.terminal_lent {
+            self.ring_for_waiting_question();
+            return Ok(());
+        }
         if !self.interactive {
             return Ok(());
         }
@@ -8819,18 +8921,11 @@ impl State {
         let overview = self.overview.projection.is_some();
         let command_feedback =
             (self.status_held && !self.status.is_empty()).then(|| self.status.clone());
-        let suggestion = (self.monitor_visible() && !self.monitor.overlay)
-            .then(|| self.visible_prompt_suggestion().map(str::to_owned))
-            .flatten();
-        let feedback_rows =
-            usize::from(command_feedback.is_some()) + usize::from(suggestion.is_some());
+        let feedback_rows = usize::from(command_feedback.is_some());
         let short = self.height < agent_layout::NORMAL_LAYOUT_MIN_ROWS;
         let cap = agent_layout::bottom_capacity(self.height);
-        let (draft, cursor) = if suggestion.is_some() {
-            (String::new(), 0)
-        } else {
-            self.input_display()
-        };
+        // A prompt suggestion shows in the empty input itself, Monitor beside it or not.
+        let (draft, cursor) = self.input_display();
         let mut input_rows = agent_layout::editor_capacity(self.height);
         let input = InputView::frame_with_prompt(
             &draft,
@@ -9091,11 +9186,7 @@ impl State {
             self.width,
             input_rows,
             self.input_prompt(),
-            &if suggestion.is_some() {
-                Vec::new()
-            } else {
-                self.input_image_marks()
-            },
+            &self.input_image_marks(),
         );
         if !candidates.is_empty() {
             candidates = self.candidate_rows(candidates.len());
@@ -9127,14 +9218,6 @@ impl State {
             let mut line = RoleLine::role(feedback, Role::Warning);
             line.truncate(self.content_columns());
             lines.push(line);
-        }
-        if let Some(suggestion) = suggestion {
-            let lead = format!("{} ", self.display.glyph(Glyph::Prompt));
-            let text = super::loop_view_text::ellipsize(
-                &super::safe_line(&suggestion),
-                self.content_columns().saturating_sub(display_width(&lead)),
-            );
-            lines.push(RoleLine::role(format!("{lead}{text}"), Role::Subtle));
         }
         let conversation_footer = if overview {
             Vec::new()
@@ -10203,7 +10286,7 @@ impl State {
                 width,
                 rows,
                 self.display,
-                self.can_send_now(),
+                self.can_send_now() && self.oldest_queued_message().is_some(),
             );
         }
         if rows == 0 {
@@ -10481,6 +10564,7 @@ impl State {
         let input_visible = self.interactive
             && self.file_index_focused
             && self.prompt_enabled
+            && !self.terminal_lent
             && self.workspace_trust.is_none()
             && self.menu.is_none()
             && self.conversation_picker.is_none()
@@ -10888,6 +10972,7 @@ impl State {
             && self.scrollback.is_at_bottom()
             && !self.monitor.focused
             && !self.conversation_focused
+            && !self.terminal_lent
             && self.status_area.tasks_can_take_focus()
     }
 
@@ -12410,9 +12495,20 @@ impl State {
     }
 
     fn oldest_queued_message(&self) -> Option<Uuid> {
+        let active = self
+            .monitor
+            .chat_status
+            .as_ref()
+            .filter(|status| {
+                status.chat_loop.state == tickloop_harness::protocol::LoopState::Running
+            })
+            .and_then(|status| status.chat_loop.run_id)
+            .map(|run| run.uuid());
         self.queued_inputs
             .iter()
-            .find(|entry| entry.kind == QueuedInputKind::Message)
+            .find(|entry| {
+                entry.kind == QueuedInputKind::Message && entry.armed && Some(entry.id) != active
+            })
             .map(|entry| entry.id)
     }
 
@@ -12917,6 +13013,12 @@ impl State {
                         request,
                     }))
                 }
+                super::user_panel::UserPanelEffect::Hooks(request) => {
+                    Some(InputEvent::Hooks(super::hooks_panel::HooksWork {
+                        panel: panel.id(),
+                        request,
+                    }))
+                }
             };
         }
         if self.menu.is_none() && self.conversation_picker.is_some() {
@@ -13048,10 +13150,31 @@ impl State {
                         Err(error) => self.monitor.action_error = Some(super::safe_line(&error)),
                     }
                 }
-                // Space is the card key of hosted Tick and Shell rows; on one without a card, such
-                // as a Tick another Chat opened that ended, it does nothing rather than leave the
-                // list and type into the input. An Artifact row never has a card, so there Space
-                // types into the input.
+                // An ended Terminal Tick has no card to show or reopen into: Enter shows its last
+                // screen, or reopens it full screen once that is gone too.
+                (KeyCode::Char(' '), KeyModifiers::NONE)
+                    if self.monitor.selected().is_some_and(|entry| {
+                        entry.opens_full_screen() && entry.ended.is_some()
+                    }) =>
+                {
+                    let is_gone = self
+                        .monitor
+                        .selected()
+                        .is_some_and(|entry| entry.reopens_full_screen().is_some());
+                    self.monitor_notice = Some(TimedNotice {
+                        text: if is_gone {
+                            full_screen::ENDED_TERMINAL_NOTICE
+                        } else {
+                            full_screen::EXITED_TERMINAL_NOTICE
+                        }
+                        .into(),
+                        until: Instant::now() + MONITOR_NOTICE_WINDOW,
+                    });
+                }
+                // Space is the card key of hosted Tick rows; on one without a card, such as a
+                // Terminal Tick, a Shell or a Tick another Chat opened that ended, it does nothing
+                // rather than leave the list and type into the input. An Artifact row never has a
+                // card, so there Space types into the input.
                 (KeyCode::Char(' '), KeyModifiers::NONE)
                     if self
                         .monitor
@@ -13094,7 +13217,8 @@ impl State {
                 (KeyCode::Enter, KeyModifiers::NONE) if self.monitor.is_goal_selected() => {
                     return Some(InputEvent::Line("/goal".into()));
                 }
-                (KeyCode::Enter, _) | (KeyCode::Char(_), KeyModifiers::NONE) => {
+                (KeyCode::Enter, _)
+                | (KeyCode::Char(_), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                     if let Some(entry) = self.monitor.selected().cloned() {
                         let action_key = match key.code {
                             KeyCode::Enter => crate::monitor_rows::MONITOR_ENTER_KEY,
@@ -14267,6 +14391,17 @@ fn read_keys(
             break;
         }
         if !event::poll(INPUT_POLL_INTERVAL)? {
+            let attach = state
+                .lock()
+                .map_err(|error| io::Error::other(error.to_string()))?
+                .full_screen_attach
+                .take();
+            if let Some(attach) = attach {
+                if !full_screen::lend_terminal_to_attached_view(state, attach, stop, sender)? {
+                    break;
+                }
+                continue;
+            }
             if !idle_tick(state, stop, sender)? {
                 break;
             }

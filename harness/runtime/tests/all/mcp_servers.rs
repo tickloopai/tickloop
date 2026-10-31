@@ -42,6 +42,7 @@ async fn discover_classification_accepts_modern_results_and_retries_supported_ve
             let connections = McpConnections::new(
                 HostCapabilities {
                     local_processes: true,
+                    ..Default::default()
                 },
                 BTreeMap::new(),
                 std::env::vars().collect(),
@@ -121,6 +122,7 @@ async fn discover_classification_falls_back_for_legacy_responses_over_http_sse_a
             let connections = McpConnections::new(
                 HostCapabilities {
                     local_processes: true,
+                    ..Default::default()
                 },
                 BTreeMap::new(),
                 std::env::vars().collect(),
@@ -293,6 +295,7 @@ async fn probe_network_errors_and_timeouts_do_not_fall_back_over_http_but_stdio_
             let connections = McpConnections::new(
                 HostCapabilities {
                     local_processes: true,
+                    ..Default::default()
                 },
                 BTreeMap::new(),
                 std::env::vars().collect(),
@@ -339,6 +342,7 @@ async fn legacy_verdict_survives_reconnect_and_failed_initialize_but_changes_wit
         let connections = McpConnections::new(
             HostCapabilities {
                 local_processes: true,
+                ..Default::default()
             },
             BTreeMap::new(),
             std::env::vars().collect(),
@@ -398,6 +402,7 @@ async fn legacy_initialize_versions_keep_negotiated_headers_and_stdio_routing() 
             let connections = McpConnections::new(
                 HostCapabilities {
                     local_processes: true,
+                    ..Default::default()
                 },
                 BTreeMap::new(),
                 std::env::vars().collect(),
@@ -644,6 +649,7 @@ async fn http_connection_falls_back_to_initialize_when_discover_is_rejected_over
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -674,6 +680,46 @@ async fn http_connection_falls_back_to_initialize_when_discover_is_rejected_over
 }
 
 #[tokio::test]
+async fn legacy_http_connection_accepts_empty_sse_priming_for_initialize_and_directories() {
+    let server = McpService::start().await;
+    server.set_discover_replies(vec![(
+        422,
+        json!({"id":null,"error":{"code":-32602,"message":"not initialized"}}),
+    )]);
+    server.prime_sse_with_empty_data();
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+    server.set_resources(json!([{"uri":"fixture://guide","name":"guide"}]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections
+        .reconcile(vec![http_config("legacy", &server)])
+        .await;
+    settled(&connections).await;
+    let snapshot = connections.snapshot();
+    assert_eq!(snapshot[0].state, McpServerState::Connected);
+    assert_eq!(snapshot[0].tools.len(), 1);
+    assert_eq!(snapshot[0].tools[0].name, "mcp__legacy__probe");
+    assert_eq!(
+        snapshot[0].resources,
+        vec![json!({"uri":"fixture://guide","name":"guide"})]
+    );
+    assert_eq!(
+        server.methods(),
+        [
+            "server/discover",
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "resources/list",
+        ]
+    );
+    connections.shutdown().await;
+}
+
+#[tokio::test]
 async fn http_connection_discovers_and_calls_the_original_tool() {
     let server = McpService::start().await;
     server.set_tools(
@@ -687,6 +733,7 @@ async fn http_connection_discovers_and_calls_the_original_tool() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -747,6 +794,7 @@ async fn schema_unions_are_flattened_and_ambiguous_tools_are_withdrawn() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -786,12 +834,14 @@ async fn stdio_connection_refreshes_notified_tools_and_shuts_down() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         std::env::vars().collect(),
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -854,6 +904,7 @@ async fn third_party_tools_go_to_auto_review_without_trusting_read_only_annotati
     server.set_tools(json!([{"name":"read","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]));
     server.set_result(json!({"content":[{"type":"text","text":"approved result"}]}));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),
@@ -945,6 +996,7 @@ async fn resources_and_unknown_call_outcomes_remain_bound_to_the_server() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -999,6 +1051,7 @@ async fn expired_session_is_not_dispatched_and_the_server_reconnects() {
         BTreeMap::new(),
     );
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),
@@ -1066,6 +1119,7 @@ async fn text_embedded_resources_and_images_reach_the_host_result() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -1110,6 +1164,7 @@ async fn large_results_keep_both_ends_and_save_full_text_in_family_temporary_sto
     let full = format!("START{}END", "中".repeat(8000));
     server.set_result(json!({"content":[{"type":"text","text":full}]}));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),
@@ -1198,6 +1253,7 @@ async fn normalized_tool_names_are_unique_across_server_boundaries() {
     connections
         .reconcile(vec![
             McpServerConfig {
+                unruled: Default::default(),
                 exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
                 tool_exposure: Vec::new(),
                 description: String::new(),
@@ -1213,6 +1269,7 @@ async fn normalized_tool_names_are_unique_across_server_boundaries() {
                 timeout_ms: 1000,
             },
             McpServerConfig {
+                unruled: Default::default(),
                 exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
                 tool_exposure: Vec::new(),
                 description: String::new(),
@@ -1265,7 +1322,7 @@ async fn credentials_are_removed_from_catalogs_and_encoded_result_text() {
         json!({"content":[{"type":"text","text":"private/token+value private%2Ftoken%2Bvalue"}]}),
     );
     let credentials = Arc::new(InMemoryCredentials::default());
-    credentials.replace(Some(tickloop_harness_runtime::mcp::ConnectorCredential {
+    credentials.replace(Some(tickloop_harness_runtime::mcp::ConnectorCredential { login: None,
         server_url:server.url(),
         registration:tickloop_harness_connector::ClientRegistration {authorization_server:server.url(),client_id:"fixture".into(),redirect_uri:"http://localhost/callback".into()},
         resource:None,
@@ -1281,6 +1338,7 @@ async fn credentials_are_removed_from_catalogs_and_encoded_result_text() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -1327,6 +1385,7 @@ async fn a_resource_404_cannot_reclassify_a_later_timed_out_mutation() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -1393,6 +1452,7 @@ async fn resource_uri_collisions_do_not_redirect_to_another_provider() {
     };
     let server = McpService::start().await;
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),
@@ -1486,12 +1546,14 @@ for line in sys.stdin:
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         std::env::vars().collect(),
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -1557,12 +1619,14 @@ async fn bearer_scheme_spelling_and_stdio_arguments_do_not_expose_tokens() {
         let connections = McpConnections::new(
             HostCapabilities {
                 local_processes: true,
+                ..Default::default()
             },
             BTreeMap::new(),
             std::env::vars().collect(),
         );
         connections
             .reconcile(vec![McpServerConfig {
+                unruled: Default::default(),
                 exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
                 tool_exposure: Vec::new(),
                 description: String::new(),
@@ -1601,7 +1665,7 @@ async fn credential_renewal_does_not_block_background_connection_startup() {
         std::future::pending::<()>().await;
     });
     let credentials = Arc::new(InMemoryCredentials::default());
-    credentials.replace(Some(tickloop_harness_runtime::mcp::ConnectorCredential {
+    credentials.replace(Some(tickloop_harness_runtime::mcp::ConnectorCredential { login: None,
         server_url:server.url(),
         registration:tickloop_harness_connector::ClientRegistration {authorization_server:endpoint.clone(),client_id:"fixture".into(),redirect_uri:"http://localhost/callback".into()},
         resource:None,
@@ -1618,6 +1682,7 @@ async fn credential_renewal_does_not_block_background_connection_startup() {
     let started = tokio::time::timeout(
         Duration::from_millis(500),
         connections.reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -1656,6 +1721,7 @@ async fn list_change_withdraws_old_tools_while_the_new_directory_is_loading() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -1702,6 +1768,7 @@ async fn insufficient_scope_withdraws_tools_and_stops_connection_retries() {
     let server = McpService::start().await;
     server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),
@@ -1770,6 +1837,7 @@ async fn oauth_login_renews_rejected_and_expiring_tokens_and_stops_after_invalid
     server.require_bearer("access-2");
     server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),
@@ -1878,6 +1946,7 @@ async fn settled(connections: &McpConnections) {
 async fn resource_authentication_failure_requires_login_before_more_requests() {
     let server = McpService::start().await;
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),
@@ -1983,6 +2052,7 @@ async fn oauth_secrets_stay_redacted_in_sdk_logs_and_after_invalidation() {
         token.refresh_token.as_ref().unwrap()
     ));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),
@@ -2062,11 +2132,12 @@ async fn renewal_timing_out_at_the_connection_deadline_requires_login() {
     }
     let server = McpService::start().await;
     let credentials = Arc::new(StalledCredentials::default());
-    credentials.inner.replace(Some(ConnectorCredential {
+    credentials.inner.replace(Some(ConnectorCredential { login: None,
         server_url:server.url(), registration:tickloop_harness_connector::ClientRegistration {authorization_server:server.url(),client_id:"client".into(),redirect_uri:"http://localhost/callback".into()}, resource:None,
         token:Some(serde_json::from_value(json!({"access_token":"expired-access","refresh_token":"expired-refresh","token_type":"Bearer","issuer":server.url(),"expires_at":0,"client_id":"client","token_endpoint":server.url()})).unwrap()),
     }));
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),
@@ -2110,7 +2181,7 @@ async fn shutdown_releases_host_credentials_and_numeric_credentials_preserve_rpc
     server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}},{"name":"v1_probe","inputSchema":{"type":"object"}}]));
     let credentials = Arc::new(InMemoryCredentials::default());
     let released = Arc::downgrade(&credentials);
-    credentials.replace(Some(tickloop_harness_connector::ConnectorCredential {
+    credentials.replace(Some(tickloop_harness_connector::ConnectorCredential { login: None,
         server_url:server.url(), resource:None,
         registration:tickloop_harness_connector::ClientRegistration{authorization_server:server.url(),client_id:"client".into(),redirect_uri:"http://localhost/callback".into()},
         token:Some(serde_json::from_value(json!({"access_token":"1","token_type":"Bearer","issuer":server.url(),"expires_at":u64::MAX,"client_id":"client","token_endpoint":server.url()})).unwrap()),
@@ -2125,6 +2196,7 @@ async fn shutdown_releases_host_credentials_and_numeric_credentials_preserve_rpc
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -2176,6 +2248,7 @@ async fn http_private_configuration_preserves_protocol_flags_and_original_schema
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -2224,6 +2297,7 @@ async fn http_private_configuration_preserves_protocol_flags_and_original_schema
 #[tokio::test]
 async fn a_resumed_directory_keeps_the_original_schema_for_validation() {
     let server = McpService::start().await;
+    server.prime_sse_with_empty_data();
     server.resume_tool_directory_once();
     server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object","properties":{"pin":{"type":"number","minimum":839271}}}}]));
     let connections = McpConnections::new(
@@ -2233,6 +2307,7 @@ async fn a_resumed_directory_keeps_the_original_schema_for_validation() {
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),
@@ -2250,6 +2325,10 @@ async fn a_resumed_directory_keeps_the_original_schema_for_validation() {
         .await;
     settled(&connections).await;
     assert_eq!(server.directory_resumes(), 1);
+    assert_eq!(
+        server.directory_resume_id().as_deref(),
+        Some("directory-cut")
+    );
     assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
     assert_eq!(connections.snapshot()[0].tools.len(), 1);
     assert!(matches!(
@@ -2278,6 +2357,7 @@ async fn a_resumed_directory_keeps_the_original_schema_for_validation() {
 
 fn http_config(name: &str, server: &McpService) -> McpServerConfig {
     McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),
@@ -2320,6 +2400,7 @@ async fn service_instructions_and_summary_redact_secrets_through_the_host_provid
             let connections = McpConnections::new(
                 HostCapabilities {
                     local_processes: true,
+                    ..Default::default()
                 },
                 BTreeMap::new(),
                 BTreeMap::new(),
@@ -2361,6 +2442,7 @@ async fn service_instructions_redact_secrets_before_the_length_limit() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -2401,6 +2483,7 @@ async fn tool_descriptions_redact_secrets_before_the_length_limit() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -2478,6 +2561,7 @@ async fn discovery_resources_and_failures_redact_server_text() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         BTreeMap::new(),
@@ -2643,11 +2727,13 @@ async fn reading_states_leaves_a_failed_server_failed_with_its_reason() {
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         BTreeMap::new(),
     );
     let configs = vec![McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),
@@ -2800,12 +2886,14 @@ async fn stdio_secrets_stay_redacted_before_sdk_logging_without_weakening_valida
     let connections = McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         Default::default(),
         std::env::vars().collect(),
     );
     connections
         .reconcile(vec![McpServerConfig {
+            unruled: Default::default(),
             name: "local".into(),
             source: "global".into(),
             transport: McpTransport::Stdio {
@@ -3128,7 +3216,7 @@ async fn mcp_catalog_performance_scenario() {
         preparation.iter().max().unwrap()
     );
     let secret = "replacement/token+value".repeat(75);
-    let credential = tickloop_harness_runtime::mcp::ConnectorCredential {
+    let credential = tickloop_harness_runtime::mcp::ConnectorCredential { login: None,
         server_url: server.url(),
         registration: tickloop_harness_connector::ClientRegistration {
             authorization_server: server.url(), client_id: "fixture".into(), redirect_uri: "http://localhost/callback".into(),
@@ -3182,7 +3270,7 @@ async fn catalog_notifications_and_credentials_rebuild_only_the_changed_server()
     unchanged.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
     let credentials = Arc::new(InMemoryCredentials::default());
     let saved = |secret: &str| {
-        tickloop_harness_runtime::mcp::ConnectorCredential {
+        tickloop_harness_runtime::mcp::ConnectorCredential { login: None,
         server_url: server.url(),
         registration: tickloop_harness_connector::ClientRegistration { authorization_server: server.url(), client_id: "fixture".into(), redirect_uri: "http://localhost/callback".into() },
         resource: None,
@@ -3435,4 +3523,330 @@ async fn model_requests_and_tick_artifact_mcp_calls_reuse_third_party_catalogs()
     assert_eq!(native.0.load(Ordering::SeqCst), 31);
     assert_eq!(agent.mcp_performance_counts(), before);
     agent.shutdown().await;
+}
+
+/// How a login saved before logins were named meets the server at first connect.
+#[derive(Clone, Copy, Debug)]
+enum LegacyLogin {
+    /// Its token has expired.
+    Expired,
+    /// The server rejects its token.
+    Rejected,
+    /// Its token, like every one the authorization server issues, lasts 20 seconds, inside the
+    /// renewal window.
+    ShortLived,
+}
+
+/// A login saved before logins were named connects at its first attempt: the renewal names it,
+/// and the connection takes the named login up, without another attempt or a loop.
+#[tokio::test]
+async fn a_legacy_saved_login_connects_at_its_first_attempt() {
+    use tick_oauth_test_server::{AuthorizationServer, METADATA_PATH, TOKEN_PATH};
+    use tickloop_harness_connector::{Connector, OAuthSettings};
+    use tickloop_harness_runtime::mcp::ConnectionEvent;
+    for legacy in [
+        LegacyLogin::Expired,
+        LegacyLogin::Rejected,
+        LegacyLogin::ShortLived,
+    ] {
+        let server = McpService::start().await;
+        let authorization = AuthorizationServer::start();
+        let credentials = Arc::new(InMemoryCredentials::default());
+        let cancel = CancellationToken::new();
+        let metadata = format!("{}{METADATA_PATH}", authorization.issuer());
+        if matches!(legacy, LegacyLogin::ShortLived) {
+            authorization.issue_tokens_lasting(20);
+        }
+        let connector = Connector::new(
+            &server.url(),
+            OAuthSettings {
+                authorization_server_metadata_url: Some(metadata.clone()),
+                ..Default::default()
+            },
+            credentials.clone(),
+        )
+        .unwrap();
+        let login = connector.start_login(None, &cancel).await.unwrap();
+        login
+            .paste()
+            .submit(&authorization.approve(login.authorization_url()))
+            .unwrap();
+        login.finish(&cancel).await.unwrap();
+        let mut saved = credentials.current().unwrap();
+        saved.login = None;
+        if matches!(legacy, LegacyLogin::Expired) {
+            saved.token.as_mut().unwrap().expires_at = 0;
+        }
+        credentials.replace(Some(saved));
+        // Short-lived tokens are renewed at each connection, so no single one is required.
+        if !matches!(legacy, LegacyLogin::ShortLived) {
+            server.require_bearer("access-2");
+        }
+        server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+        let configs = vec![McpServerConfig {
+            unruled: Default::default(),
+            exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
+            tool_exposure: Vec::new(),
+            description: String::new(),
+            sensitive_values: Vec::new(),
+            disabled: false,
+            name: "remote".into(),
+            source: "global".into(),
+            transport: McpTransport::Http {
+                url: server.url(),
+                headers: Default::default(),
+            },
+            timeout_ms: 1000,
+            oauth: tickloop_harness_protocol::mcp::McpOAuthConfig {
+                authorization_server_metadata_url: Some(metadata),
+                ..Default::default()
+            },
+        }];
+        let connections = McpConnections::new(
+            HostCapabilities::default(),
+            BTreeMap::from([(
+                "remote".into(),
+                credentials.clone() as Arc<dyn tickloop_harness_connector::ConnectorCredentials>,
+            )]),
+            Default::default(),
+        );
+        connections.reconcile(configs).await;
+        wait_for_state(&connections, "remote", McpServerState::Connected).await;
+        // Long enough for another round of connection attempts to show.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let attempts = connections
+            .connection_events("remote")
+            .iter()
+            .filter(|(event, _)| *event == ConnectionEvent::Attempt)
+            .count();
+        assert_eq!(attempts, 1, "{legacy:?}: connected at the first attempt");
+        assert_eq!(
+            connections.snapshot()[0].state,
+            McpServerState::Connected,
+            "{legacy:?}"
+        );
+        assert!(
+            credentials.current().unwrap().login.is_some(),
+            "{legacy:?}: the renewal names the login"
+        );
+        let renewals = authorization.requests_to(TOKEN_PATH).len() - 1;
+        let most = if matches!(legacy, LegacyLogin::ShortLived) {
+            2
+        } else {
+            1
+        };
+        assert!(
+            renewals <= most,
+            "{legacy:?}: {renewals} renewals, not a loop of them"
+        );
+        assert!(matches!(
+            connections
+                .call("mcp__remote__probe", json!({}), cancel.clone())
+                .await,
+            HostCallResult::Completed(_)
+        ));
+        connections.shutdown().await;
+    }
+}
+
+/// An MCP tool's optional arguments left `null` or `""` where its schema cannot take them are
+/// not sent; a refused argument is named with why, and never dispatched.
+#[tokio::test]
+async fn mcp_calls_drop_unset_optional_arguments_and_name_refused_ones() {
+    use tickloop_harness_protocol::{EventKind, ExecutionMode};
+    use tickloop_harness_runtime::{Agent, mcp::McpToolProvider};
+    use tickloop_harness_test_support::{ScriptedModel, call, config, text};
+
+    let server = McpService::start().await;
+    server.set_tools(json!([{
+        "name":"search",
+        "inputSchema":{
+            "type":"object",
+            "properties":{
+                "query":{"type":"string"},
+                "limit":{"type":"integer"},
+                "mode":{"type":"string","enum":["fast","full"]},
+                "note":{"type":"string"}
+            },
+            "required":["query"],
+            "additionalProperties":false
+        }
+    }]));
+    server.set_result(json!({"content":[{"type":"text","text":"SEARCHED"}]}));
+    let configuration = http_config("schema", &server);
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections.reconcile(vec![configuration.clone()]).await;
+    wait_for_state(&connections, "schema", McpServerState::Connected).await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "refused",
+            "mcp__schema__search",
+            json!({"query":"q","limit":"ten"}),
+        ),
+        call(
+            "filled",
+            "mcp__schema__search",
+            json!({"query":"q","limit":null,"mode":"","note":""}),
+        ),
+        text("done"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_host_tools(Arc::new(McpToolProvider::new(
+            connections,
+            Arc::new(move || vec![configuration.clone()]),
+        )))
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "Search once".into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap().kind {
+                EventKind::PermissionRequested { request } => {
+                    assert_eq!(request.input, json!({"query":"q","note":""}));
+                    agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    agent.shutdown().await;
+    assert_eq!(server.calls().len(), 1);
+    assert_eq!(
+        server.calls()[0]["params"]["arguments"],
+        json!({"query":"q","note":""})
+    );
+    let requests = model.requests.lock().unwrap();
+    let final_messages = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+    assert!(final_messages.contains("SEARCHED"));
+    assert!(
+        final_messages.contains(
+            r#"invalid mcp__schema__search input at /limit: \"ten\" is not of type \"integer\""#
+        ),
+        "{final_messages}"
+    );
+}
+
+/// A server that says its tools changed and then fails to list them keeps showing the tools it
+/// listed before, but no call of them is sent: not a call made while the listing ran, nor one
+/// made after it failed. Once the server connects again and lists them, calls are sent again.
+#[tokio::test]
+async fn tools_that_could_not_be_listed_again_are_not_called_until_listed() {
+    let server = McpService::start().await;
+    server.set_tools(json!([
+        {"name":"old","inputSchema":{"type":"object"}},
+        {"name":"ping","inputSchema":{"type":"object"}},
+    ]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let config = McpServerConfig {
+        unruled: Default::default(),
+        exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
+        tool_exposure: Vec::new(),
+        description: String::new(),
+        sensitive_values: Vec::new(),
+        disabled: false,
+        name: "unlisted".into(),
+        source: "global".into(),
+        transport: McpTransport::Http {
+            url: server.url(),
+            headers: BTreeMap::new(),
+        },
+        oauth: Default::default(),
+        timeout_ms: 5000,
+    };
+    connections.reconcile(vec![config.clone()]).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.snapshot()[0].state != McpServerState::Connected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let lists = || {
+        server
+            .methods()
+            .iter()
+            .filter(|method| *method == "tools/list")
+            .count()
+    };
+    let calls_of = |name: &str| {
+        server
+            .calls()
+            .iter()
+            .filter(|call| call["params"]["name"] == name)
+            .count()
+    };
+    let refused = |result: HostCallResult| match result {
+        HostCallResult::NotDispatched(reason) => reason.contains("could not be listed again"),
+        _ => false,
+    };
+
+    server.set_directory_error(Some(json!({"code": -32603, "message": "listing broke"})));
+    server.notify_tools_changed();
+    let before = lists();
+    assert!(matches!(
+        connections
+            .call("mcp__unlisted__ping", json!({}), CancellationToken::new())
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    // A call made while the listing runs waits for it, and is refused when it fails.
+    assert!(refused(
+        connections
+            .call("mcp__unlisted__old", json!({}), CancellationToken::new())
+            .await
+    ));
+    assert!(lists() > before);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A call made once the listing failed is refused too.
+    assert!(refused(
+        connections
+            .call("mcp__unlisted__old", json!({}), CancellationToken::new())
+            .await
+    ));
+    assert_eq!(calls_of("old"), 0);
+
+    // Connecting again lists the tools afresh, and their calls are sent again.
+    server.set_directory_error(None);
+    assert!(
+        connections
+            .reconnect(vec![config.clone()], "unlisted")
+            .await
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connections.snapshot()[0].state != McpServerState::Connected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        connections
+            .call("mcp__unlisted__old", json!({}), CancellationToken::new())
+            .await,
+        HostCallResult::Completed(_)
+    ));
+    assert_eq!(calls_of("old"), 1);
+    connections.shutdown().await;
 }

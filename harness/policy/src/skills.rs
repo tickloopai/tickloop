@@ -1,3 +1,5 @@
+mod commands;
+pub use commands::{CommandDocument, SkillShellCommand};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -9,13 +11,12 @@ use tickloop_harness_protocol::{InvokedSkill, RemoteSkillDefinition, SkillSource
 
 use crate::loop_skill::{self, LoopInstructionSource, MaintenanceInstructions};
 
-pub const TICKLOOP_SKILL: &str = include_str!("../skills/tickloop/SKILL.md");
 /// `/slides`: only the user invokes it, and its body guides only the run it starts.
 pub const SLIDES_SKILL: &str = include_str!("../skills/slides/SKILL.md");
 /// `/loop`: its expansion carries the host's reading of the arguments, see [`loop_skill`].
 pub const LOOP_SKILL: &str = include_str!("../skills/loop/SKILL.md");
 pub const LOOP_SKILL_NAME: &str = "loop";
-pub const BUILTIN_SKILLS: [&str; 3] = [TICKLOOP_SKILL, SLIDES_SKILL, LOOP_SKILL];
+pub const BUILTIN_SKILLS: [&str; 2] = [SLIDES_SKILL, LOOP_SKILL];
 pub const SKILL_TOOL_NAME: &str = "Skill";
 /// In the body of a Tick package's Skill, the directory the package is installed in.
 pub const PACKAGE_ROOT_VARIABLE: &str = "${TICK_PACKAGE_ROOT}";
@@ -45,20 +46,25 @@ enum SkillContext {
 pub struct SkillDefinition {
     pub name: String,
     pub description: String,
+    pub argument_hint: Option<String>,
     pub source: SkillSource,
     body: String,
     allowed_tools: Vec<String>,
     user_invocable: bool,
     disable_model_invocation: bool,
     context: SkillContext,
+    command: Option<commands::CommandOptions>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SkillExpansion {
     pub name: String,
     pub content: String,
     pub source: SkillSource,
     pub allowed_tools: Vec<String>,
+    pub shell_commands: Vec<SkillShellCommand>,
+    #[serde(default)]
+    pub shell_preprocessing: Option<bool>,
 }
 
 impl SkillDefinition {
@@ -70,14 +76,16 @@ impl TryFrom<SkillExpansion> for InvokedSkill {
     type Error = SkillError;
 
     fn try_from(expansion: SkillExpansion) -> Result<Self, Self::Error> {
-        if !expansion.allowed_tools.is_empty() {
-            return Err(SkillError::AllowedToolsUnsupported(expansion.name));
+        if !expansion.shell_commands.is_empty() {
+            return Err(SkillError::ShellExecutionRequired(expansion.name));
         }
+        expansion.validate()?;
         Ok(Self {
             name: expansion.name,
             content: expansion.content,
             source: expansion.source,
             run_id: None,
+            shell_preprocessing: expansion.shell_preprocessing,
         })
     }
 }
@@ -93,6 +101,7 @@ pub struct SkillRegistry {
     skills: BTreeMap<String, SkillDefinition>,
     remote: BTreeMap<String, SkillDefinition>,
     warnings: Vec<String>,
+    discovery_incomplete: bool,
     loop_files: Arc<dyn LoopInstructionSource>,
 }
 
@@ -109,6 +118,8 @@ pub struct SkillCatalog {
 pub enum SkillError {
     #[error("unknown skill: {0}")]
     Unknown(String),
+    #[error("skill `{0}` requires Shell preprocessing through the runtime")]
+    ShellExecutionRequired(String),
     #[error("ambiguous skill `{name}`; use one of: {candidates}")]
     Ambiguous { name: String, candidates: String },
     #[error("skill `{0}` cannot be invoked by the model")]
@@ -152,10 +163,6 @@ impl SkillRegistry {
         Self::with_builtins(BUILTIN_SKILLS)
     }
 
-    pub fn builtin_without_ticks() -> Self {
-        Self::with_builtins([SLIDES_SKILL, LOOP_SKILL])
-    }
-
     pub fn with_builtins<'a>(builtins: impl IntoIterator<Item = &'a str>) -> Self {
         let mut registry = Self::default();
         for markdown in builtins {
@@ -169,7 +176,16 @@ impl SkillRegistry {
     }
 
     pub fn warn(&mut self, warning: String) {
+        self.discovery_incomplete = true;
         self.warnings.push(warning);
+    }
+
+    fn warn_compatibility(&mut self, warning: String) {
+        self.warnings.push(warning);
+    }
+
+    pub fn needs_discovery_retry(&self) -> bool {
+        self.discovery_incomplete
     }
 
     /// Registers the Skill in `markdown`. A Tick package's or a plugin's Skill is named
@@ -253,6 +269,10 @@ impl SkillRegistry {
         self.skills.values().filter(|skill| skill.user_invocable)
     }
 
+    pub fn is_plugin_command(&self, name: &str) -> Option<bool> {
+        self.skills.get(name).map(|skill| skill.command.is_some())
+    }
+
     /// Whether the Skill named `name` disables model invocation, so only the user invokes it.
     pub fn is_user_only(&self, name: &str) -> bool {
         self.skills
@@ -282,7 +302,13 @@ impl SkillRegistry {
         let mut capped_descriptions = Vec::new();
         let mut entries = self
             .definitions()
-            .filter(|skill| !skill.disable_model_invocation)
+            .filter(|skill| {
+                !skill.disable_model_invocation
+                    && skill
+                        .command
+                        .as_ref()
+                        .is_none_or(|command| command.model_listed)
+            })
             .map(|skill| {
                 let mut description = skill
                     .description
@@ -351,12 +377,14 @@ impl SkillRegistry {
                     SkillDefinition {
                         name: definition.name,
                         description: definition.description,
+                        argument_hint: None,
                         source: definition.source,
                         body: String::new(),
                         allowed_tools: Vec::new(),
                         user_invocable: false,
                         disable_model_invocation: false,
                         context: SkillContext::Inline,
+                        command: None,
                     },
                 )
             })
@@ -395,7 +423,7 @@ When a listed Skill matches the user's task, invoke {SKILL_TOOL_NAME} before sub
 
 - Use the exact catalog name; the listing contains metadata, and invocation loads the full instructions.
 - Pass args only when the Skill needs task arguments.
-- Skill loads SKILL.md only. Read supporting local files with Read; read remote references with ReadMcpResourceTool using the server and resource URI supplied in the loaded guidance.
+- Skill loads Skill or plugin Command instructions. Command shell blocks run through normal Bash approval before activation. Read supporting local files with Read; read remote references with ReadMcpResourceTool using the server and resource URI supplied in the loaded guidance.
 - Reuse verified guidance that the host marks active in the current context. Historical loading records alone do not establish current activation.
 - Follow the current source, account and version checks for remote guidance. Report an unavailable or failed load accurately.
 - Skill instructions and references operate within existing user authorization and tool permissions.
@@ -449,7 +477,9 @@ Available Skills:
             return Err(SkillError::ForkUnsupported(name.to_owned()));
         }
         let arguments = arguments.trim();
-        let content = if skill.source == SkillSource::BuiltIn && skill.name == LOOP_SKILL_NAME {
+        let content = if let Some(command) = &skill.command {
+            command.expand(&skill.body, arguments)?
+        } else if skill.source == SkillSource::BuiltIn && skill.name == LOOP_SKILL_NAME {
             loop_skill::expand(&skill.body, arguments, self.loop_files.as_ref())?
         } else if skill.body.contains("$ARGUMENTS") {
             skill.body.replace("$ARGUMENTS", arguments)
@@ -458,21 +488,41 @@ Available Skills:
         } else {
             format!("{}\n\nArguments:\n{arguments}", skill.body)
         };
-        let content = match &skill.source {
-            SkillSource::User { path }
-            | SkillSource::Project { path }
-            | SkillSource::TickPackage { path, .. }
-            | SkillSource::Plugin { path, .. } => format!(
-                "Base directory for this skill: {}\nResolve relative supporting-file paths against this directory and read their absolute paths with Read.\n\n{content}",
-                path.parent().unwrap_or(path).display()
-            ),
-            _ => content,
+        let mut shell_commands = if skill.command.is_some() {
+            commands::shell_commands(&content)?
+        } else {
+            Vec::new()
         };
+        let body_length = content.len();
+        let content = if let Some(command) = &skill.command {
+            format!(
+                "Base directory for this skill: {}\nResolve supporting-file paths against this directory. @file references are text, not attachments; read them using Read with normal permissions.\n\n{content}",
+                command.base_directory.display()
+            )
+        } else {
+            match &skill.source {
+                SkillSource::User { path }
+                | SkillSource::Project { path }
+                | SkillSource::TickPackage { path, .. }
+                | SkillSource::Plugin { path, .. } => format!(
+                    "Base directory for this skill: {}\nResolve relative supporting-file paths against this directory and read their absolute paths with Read.\n\n{content}",
+                    path.parent().unwrap_or(path).display()
+                ),
+                _ => content,
+            }
+        };
+        let prefix_length = content.len() - body_length;
+        for shell in &mut shell_commands {
+            shell.range.start += prefix_length;
+            shell.range.end += prefix_length;
+        }
         Ok(SkillExpansion {
             name: skill.name.clone(),
             content,
             source: skill.source.clone(),
             allowed_tools: skill.allowed_tools.clone(),
+            shell_preprocessing: skill.command.as_ref().map(|_| !shell_commands.is_empty()),
+            shell_commands,
         })
     }
 
@@ -482,7 +532,7 @@ Available Skills:
 
     fn register(&mut self, parsed: Result<SkillDefinition, SkillError>, path: Option<&Path>) {
         match parsed {
-            Ok(skill) if self.skills.contains_key(&skill.name) => self.warnings.push(format!(
+            Ok(skill) if self.skills.contains_key(&skill.name) => self.warn(format!(
                 "Skill `{}` from {} is ignored because that name is already registered",
                 skill.name,
                 display_source(path)
@@ -490,9 +540,7 @@ Available Skills:
             Ok(skill) => {
                 self.skills.insert(skill.name.clone(), skill);
             }
-            Err(error) => self
-                .warnings
-                .push(format!("{} is ignored: {error}", display_source(path))),
+            Err(error) => self.warn(format!("{} is ignored: {error}", display_source(path))),
         }
     }
 }
@@ -537,6 +585,7 @@ pub fn expand_remote(
         content,
         source: definition.source.clone(),
         run_id: None,
+        shell_preprocessing: None,
     })
 }
 
@@ -576,12 +625,14 @@ fn parse_skill(markdown: &str, source: SkillSource) -> Result<SkillDefinition, S
     Ok(SkillDefinition {
         name: frontmatter.name,
         description: frontmatter.description,
+        argument_hint: None,
         source,
         body,
         allowed_tools,
         user_invocable: frontmatter.user_invocable,
         disable_model_invocation: frontmatter.disable_model_invocation,
         context: frontmatter.context,
+        command: None,
     })
 }
 
@@ -673,6 +724,7 @@ impl Default for SkillRegistry {
             skills: BTreeMap::new(),
             remote: BTreeMap::new(),
             warnings: Vec::new(),
+            discovery_incomplete: false,
             loop_files: Arc::new(MaintenanceInstructions),
         }
     }

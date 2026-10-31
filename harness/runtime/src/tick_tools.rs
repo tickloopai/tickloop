@@ -161,16 +161,16 @@ pub fn definitions() -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: TICK_READ.into(),
-        description: "Read a Tick this Chat opened using its complete hosted: instance identity. Extension Ticks return their state (seq, at, and data, which is null until the Tick has content: a Tick just opened may still be loading, so read it again shortly) only. Use TickDescribe for capabilities and the tool catalog. Terminal Ticks return their screen as plain text (data.text, at most 200 lines and 64 KiB) and data.exit, null while the program runs and its exit code or signal once it ended. Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.".into(),
+        description: "Read a Tick this Chat opened using its complete hosted: instance identity. Extension Ticks return their state (seq, at, and data, which is null until the Tick has content: a Tick just opened may still be loading, so read it again shortly) only. Use TickDescribe for capabilities and the tool catalog. Terminal Ticks return their screen as plain text (data.text, at most 200 lines and 64 KiB) and data.exit, null while the program runs and its exit code or signal once it ended. Reading never subscribes. Verify changes by reading the same instance again. A connecting Tick may report data.connection: retrying keeps retrying its error; not_authorized requires the user to log in again in /ticks; failed reports a failure that reopening with the same arguments will not fix. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.".into(),
         input_schema: json!({"type":"object","properties":target,"required":["tick_instance_id"],"additionalProperties":false}),
     });
     let mut call_properties = target.clone();
     call_properties["tool"] = json!({"type":"string","minLength":1});
-    call_properties["args"] = json!({"type":"object"});
+    call_properties["args"] = json!({"type":"object","description":"The tool's arguments; omit or pass {} for a tool that takes none."});
     definitions.push(ToolDefinition {
         name: TICK_CALL.into(),
-        description: "Call one tool declared by an extension Tick using its complete hosted: instance identity. Use TickDescribe for that Tick's catalog first; query tools read content, while modifying tools require permission. Use ArtifactRead/ArtifactEdit/ArtifactComment for artifacts and Bash/Read/TaskStop for Shell tasks.".into(),
-        input_schema: json!({"type":"object","properties":call_properties,"required":["tick_instance_id","tool","args"],"additionalProperties":false}),
+        description: "Call one tool declared by an extension Tick using its complete hosted: instance identity. Use TickDescribe for that Tick's catalog first; query tools read content, while modifying tools require permission. If the catalog revision changed after approval, describe it again before preparing a new call; verify a successful change with TickRead on the same instance. Use ArtifactRead/ArtifactEdit/ArtifactComment for artifacts and Bash/Read/TaskStop for Shell tasks.".into(),
+        input_schema: json!({"type":"object","properties":call_properties,"required":["tick_instance_id","tool"],"additionalProperties":false}),
     });
     definitions.push(ToolDefinition {
         name: TICK_MANAGE.into(),
@@ -187,9 +187,10 @@ fn tick_manage_description() -> String {
             "send_input types text, then logical keys ({}), into a terminal Tick, at most {TERMINAL_INPUT_BYTES} bytes; an extension Tick is operated with TickCall.",
             crate::terminal_input::KEY_NAMES
         ),
-        "close ends the Tick's process.".to_owned(),
-        "reopen starts a new instance from the recorded program of one lost with its Tickhost; it needs approval again, gets a new identity, and no subscription follows it.".to_owned(),
-        "Omitted cwd uses the Agent file work directory. A bare command[0] is found as the program of an installed Tick package (command[0]='tick-<package>'), then on PATH. Results report only verified facts: the instance. Users need not say Tick: a request to see what an installed plugin shows asks for its Tick. Before opening an installed plugin's program, load the tickloop Skill and that plugin's <package>:usage Skill.".to_owned(),
+        "Prefer an existing matching instance unless the user asks for a new one; a text-only request needs no Tick. After opening, read the returned instance to verify its content before reporting it; tell the user it shows as a card in this Chat's Monitor, not a separate window. An unknown open outcome may already have started the Tick: inspect the existing state instead of opening another. Hosted Ticks do not use the Shell sandbox; never use them or a multiplexer to bypass a blocked Shell command.".to_owned(),
+        "close ends the Tick's process; hiding or leaving its card does not. A program the user started in a terminal is not a Tick this Chat can read or operate.".to_owned(),
+        "reopen starts a new instance from the recorded program of one lost with its Tickhost; it needs approval again, gets a new identity, and no subscription follows it. Reopen only when the user asks.".to_owned(),
+        "Omitted cwd uses the Agent file work directory. A bare command[0] is found as the program of an installed Tick package (command[0]='tick-<package>'), then on PATH. Results report only verified facts: the instance. Users need not say Tick: a request to see what an installed plugin shows asks for its Tick. Before opening an installed plugin's program, load that plugin's <package>:usage Skill and follow its launch arguments. Check workspace_host.tickhost and workspace_host.plugins for availability; do not infer it from the repository or an installed multiplexer. If the plugin is missing or disabled, ask the user to install or enable it in /ticks, not build a launcher from project source. Follow plugin_login diagnostics from open; when a Tick refuses authorization, even without plugin_login, ask the user to log in to the plugin in /ticks and wait for their confirmation before opening again.".to_owned(),
     ]
     .join(" ")
 }
@@ -204,6 +205,10 @@ struct Form {
 }
 
 impl Form {
+    fn takes(&self, field: &str) -> bool {
+        self.required.contains(&field) || self.optional.contains(&field)
+    }
+
     fn choice(&self) -> String {
         match self.required {
             [] => self.name.to_owned(),
@@ -237,11 +242,10 @@ impl Form {
         {
             return Err(format!("{label} requires {missing}"));
         }
-        if let Some(extra) = fields.keys().find(|field| {
-            *field != selector
-                && !self.required.contains(&field.as_str())
-                && !self.optional.contains(&field.as_str())
-        }) {
+        if let Some(extra) = fields
+            .keys()
+            .find(|field| *field != selector && !self.takes(field))
+        {
             return Err(format!(
                 "{extra} is not allowed for {label}; {label} takes {}",
                 self.fields()
@@ -273,6 +277,53 @@ const REOPEN: Form = Form {
 };
 
 const TICK_MANAGE_FORMS: [Form; 4] = [OPEN, SEND_INPUT, CLOSE, REOPEN];
+
+/// The subscription actions, which a Chat offering Tick Subscriptions merges into TickManage.
+const SUBSCRIBE: Form = Form {
+    name: "subscribe",
+    required: &["tick_instance_id"],
+    optional: &["frequency"],
+};
+const UNSUBSCRIBE: Form = Form {
+    name: "unsubscribe",
+    required: &["subscription"],
+    optional: &[],
+};
+
+/// Every action TickManage may offer, the host's and the subscription ones.
+const ALL_TICK_MANAGE_ACTIONS: [Form; 6] =
+    [OPEN, SEND_INPUT, CLOSE, REOPEN, SUBSCRIBE, UNSUBSCRIBE];
+
+/// TickManage `input` as it is prepared, approved, executed and recorded: models fill the flat
+/// schema's fields that the action does not take, empty or with placeholder content, and those
+/// fields are dropped whatever they hold. Keys no action takes and input without a known action
+/// are left to the strict checks.
+pub(crate) fn prepared_manage_input(mut input: Value) -> Value {
+    let actions = &ALL_TICK_MANAGE_ACTIONS;
+    let Some(action) = input
+        .get("action")
+        .and_then(Value::as_str)
+        .and_then(|name| actions.iter().find(|form| form.name == name))
+    else {
+        return input;
+    };
+    if let Some(fields) = input.as_object_mut() {
+        fields.retain(|field, _| {
+            action.takes(field) || !actions.iter().any(|form| form.takes(field))
+        });
+    }
+    input
+}
+
+/// TickCall `input` with `args` an empty object when the model left it out.
+pub(crate) fn prepared_call_input(mut input: Value) -> Value {
+    if let Some(fields) = input.as_object_mut()
+        && fields.get("args").is_none_or(Value::is_null)
+    {
+        fields.insert("args".into(), json!({}));
+    }
+    input
+}
 
 /// Which forms require or accept `field`, leading its description so the model knows when to
 /// pass it without a schema variant per form.
@@ -352,6 +403,113 @@ fn tick_manage_schema() -> Value {
 mod tests {
     use super::*;
     use tick_protocol::{HostedRunId, ShellTaskId};
+
+    #[test]
+    fn tick_tools_require_only_the_plugins_usage_skill() {
+        let manage = definitions()
+            .into_iter()
+            .find(|definition| definition.name == TICK_MANAGE)
+            .unwrap();
+        assert!(manage.description.contains("<package>:usage"));
+        assert!(!manage.description.contains("load the tickloop Skill"));
+        assert!(
+            manage
+                .description
+                .contains("Prefer an existing matching instance")
+        );
+    }
+
+    /// The subscription forms name exactly the fields of the subscription TickManage schema.
+    #[test]
+    fn subscription_forms_match_the_subscription_schema() {
+        let definitions = crate::tick_subscriptions::definitions();
+        let properties = definitions[0].input_schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|field| *field != "action")
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let forms = [SUBSCRIBE, UNSUBSCRIBE];
+        let fields = forms
+            .iter()
+            .flat_map(|form| form.required.iter().chain(form.optional))
+            .map(|field| (*field).to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(fields, properties);
+        let actions = definitions[0].input_schema["properties"]["action"]["enum"].clone();
+        assert_eq!(actions, json!(forms.map(|form| form.name)));
+    }
+
+    /// Fields only other actions take are dropped whatever they hold; the action's own fields,
+    /// keys no action takes and input without a known action reach the strict checks as written.
+    #[test]
+    fn tick_manage_drops_fields_of_other_actions() {
+        let filled = json!({"action":"open","command":["tick-x"],"cwd":"","protocol":false,
+            "tick_instance_id":"","text":"","keys":[],"frequency":"high","subscription":""});
+        assert_eq!(
+            prepared_manage_input(filled),
+            json!({"action":"open","command":["tick-x"],"cwd":"","protocol":false})
+        );
+        assert_eq!(
+            prepared_manage_input(
+                json!({"action":"subscribe","tick_instance_id":"shell:x","command":[],"cwd":"","protocol":false,"text":"","keys":[],"subscription":""})
+            ),
+            json!({"action":"subscribe","tick_instance_id":"shell:x"})
+        );
+        assert_eq!(
+            prepared_manage_input(
+                json!({"action":"close","tick_instance_id":"hosted:1","frequency":null,"text":"x"})
+            ),
+            json!({"action":"close","tick_instance_id":"hosted:1"})
+        );
+        for unchanged in [
+            json!({"action":"close","placement":{"type":"current_tab"}}),
+            json!({"action":"move","command":["x"],"tick_instance_id":"hosted:1"}),
+            json!({"command":["x"],"subscription":"s"}),
+            json!({"action":"send_input","tick_instance_id":"hosted:1","text":"","keys":["Enter"]}),
+        ] {
+            assert_eq!(prepared_manage_input(unchanged.clone()), unchanged);
+        }
+        assert!(
+            validate_input(
+                TICK_MANAGE,
+                &tick_manage_schema(),
+                &prepared_manage_input(
+                    json!({"action":"close","tick_instance_id":"hosted:1","command":["x"],"cwd":"/"})
+                ),
+            )
+            .is_ok()
+        );
+        let subscribed = crate::tick_subscriptions::subscription_request(&prepared_manage_input(
+            json!({"action":"subscribe","tick_instance_id":"shell:0190d0c4-6b7a-7c3e-9f00-0123456789ab","command":[],"text":"","subscription":""}),
+        ));
+        assert!(subscribed.is_ok(), "{subscribed:?}");
+    }
+
+    /// TickCall takes no `args` as no arguments, and keeps the arguments it is given.
+    #[test]
+    fn tick_call_args_default_to_an_empty_object() {
+        let call = definitions()
+            .into_iter()
+            .find(|definition| definition.name == TICK_CALL)
+            .unwrap();
+        assert_eq!(
+            call.input_schema["required"],
+            json!(["tick_instance_id", "tool"])
+        );
+        for missing in [
+            json!({"tick_instance_id":"hosted:1","tool":"t"}),
+            json!({"tick_instance_id":"hosted:1","tool":"t","args":null}),
+        ] {
+            assert_eq!(
+                prepared_call_input(missing),
+                json!({"tick_instance_id":"hosted:1","tool":"t","args":{}})
+            );
+        }
+        let given = json!({"tick_instance_id":"hosted:1","tool":"t","args":{"amount":2}});
+        assert_eq!(prepared_call_input(given.clone()), given);
+    }
 
     /// A Shell task reaches TickManage as `shell:` and its id in either form, or as the id alone;
     /// a hosted Tick as `hosted:` and its id in either form. Each is stored as a UUID.

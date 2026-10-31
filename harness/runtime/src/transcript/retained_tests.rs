@@ -1,7 +1,8 @@
 //! Loading from a retained snapshot gives what loading every retained Line gives: random
 //! sequences of every kind of Line, with snapshots written where the recorder writes them and at
-//! random places besides, load the same conversation, metadata, file history, content
-//! replacements, lifecycle records and display projection as the same Lines without snapshots.
+//! random places besides, load the same conversation, metadata, file history, task board
+//! checkpoints, content replacements, lifecycle records and display projection as the same Lines
+//! without snapshots.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -294,7 +295,7 @@ impl Generator {
     fn retained(&mut self) -> Line {
         let chat = self.chat;
         let n = self.next();
-        match self.random.u8(..17) {
+        match self.random.u8(..18) {
             0 => parse(
                 json!({"type": "custom-title", "chatId": chat, "customTitle": format!("title {n}")}),
             ),
@@ -416,6 +417,20 @@ impl Generator {
                     "kind": {"kind": "question", "request": {"id": id, "chat_id": chat, "loop_id": chat, "run_id": id, "call_id": "q", "questions": []}, "operationId": id},
                     "resume": {"kind": "inBatch", "assistantMessage": id, "callId": "q"}, "timestamp": TIMESTAMP, "state": state}),
                 )
+            }
+            15 => {
+                let leaf = self
+                    .pick(&self.entries.clone())
+                    .unwrap_or_else(Uuid::new_v4);
+                let board = tickloop_harness_protocol::TaskBoard {
+                    revision: n,
+                    ..tickloop_harness_protocol::TaskBoard::new(chat.into(), chat.into())
+                };
+                Line::TaskBoardCheckpoint(tickloop_harness_transcript::TaskBoardCheckpointEntry {
+                    chat_id: chat,
+                    leaf,
+                    boards: BTreeMap::from([(chat, board)]),
+                })
             }
             _ => {
                 let kind = ["future-a", "future-b"][self.random.usize(..2)];
@@ -561,6 +576,19 @@ fn a_load_from_a_snapshot_equals_a_load_of_every_retained_line() {
             file_history(&folded),
             file_history(&full),
             "seed {seed}: file history"
+        );
+        let task_boards = |loaded: &super::super::LoadedTranscript| {
+            loaded
+                .task_board_checkpoints
+                .iter()
+                .filter(|(leaf, _)| chain_entries.contains(leaf))
+                .map(|(leaf, entry)| (*leaf, serde_json::to_string(entry).unwrap()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            task_boards(&folded),
+            task_boards(&full),
+            "seed {seed}: task board checkpoints"
         );
         let tool_results = full
             .chain
@@ -827,4 +855,46 @@ fn a_snapshot_leaves_the_goal_to_its_own_records() {
             .iter()
             .any(|line| matches!(line, Line::Goal(_)))
     );
+}
+
+#[test]
+fn command_input_records_follow_original_identity_through_retained_snapshots() {
+    let mut generator = Generator::new(0);
+    let original = Uuid::new_v4();
+    let physical = Uuid::new_v4();
+    let input = parse(json!({
+        "type":"user", "uuid":physical, "originalMessageId":original, "parentUuid":null,
+        "chatId":generator.chat, "timestamp":TIMESTAMP, "version":"test",
+        "message":{"role":"user","content":[{"type":"text","text":"/demo:check"}]}
+    }));
+    let operation = Line::NestedCall(tickloop_harness_transcript::NestedCallEntry {
+        chat_id: generator.chat,
+        operation: serde_json::from_value(json!({
+            "input_message_id": original, "id":Uuid::new_v4(), "loop_id":Uuid::new_v4(), "run_id":Uuid::new_v4(),
+            "call_id":"prepare", "name":"Bash", "input":{"command":"printf prepared"}, "state":"Completed",
+            "result":{"content":"prepared","is_error":false}
+        })).unwrap(),
+        status: None,
+        images: Vec::new(),
+        sources: Vec::new(),
+    });
+    let mut fold = RetainedFold::default();
+    fold.apply(&input);
+    fold.apply(&operation);
+    let chat_id = generator.chat;
+    let has_operation = |fold: &RetainedFold| {
+        let Line::RetainedSnapshot(snapshot) = fold.snapshot(chat_id) else {
+            unreachable!()
+        };
+        snapshot
+            .lines
+            .iter()
+            .any(|line| matches!(line, Line::NestedCall(_)))
+    };
+    assert!(has_operation(&fold));
+    let retained = fold.snapshot(generator.chat);
+    fold.apply(&retained);
+    assert!(has_operation(&fold));
+    fold.apply(&generator.boundary());
+    assert!(!has_operation(&fold));
 }

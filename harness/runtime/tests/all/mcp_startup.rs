@@ -182,6 +182,7 @@ impl Fixture {
 
 fn http_server(name: &str, server: &McpService, exposure: ToolExposure) -> McpServerConfig {
     McpServerConfig {
+        unruled: Default::default(),
         name: name.into(),
         source: "global".into(),
         transport: McpTransport::Http {
@@ -432,6 +433,7 @@ async fn failed_servers_do_not_hold_the_first_request_and_are_reported_failed() 
         vec![text("first")],
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
     )
     .await;
@@ -506,6 +508,7 @@ async fn a_local_server_that_exits_starts_once_until_reconnected() {
         (0..10).map(|_| text("ok")).collect(),
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
     )
     .await;

@@ -125,7 +125,7 @@ Custom rules and group replacements stay independent; users who replace the buil
 
 ## Third-party MCP tools
 
-`mcp__<server>__<tool>` uses `HostToolPermission::ThirdParty`. Following Claude Code (`permissions.ts`: MCP tools are not on the safe-tool allowlist, so Auto sends them to `classifyYoloAction`), without a user rule Ask requires human confirmation, Auto sends the call to Auto review, and Full Access allows it. Plan decides the call as the mode it was entered from (Claude Code's `prePlanMode`; see Plan with Auto below): Auto review after Auto, Allow after Full Access, and human confirmation after Ask, when that mode is unknown (a Chat that starts in Plan, or after a load, rewind or Branch switch) and, with `useAutoModeDuringPlan` off, after Auto too. The Plan reminder tells the model to call only read-only MCP tools. Other tools with side effects keep their existing Plan handling. Server annotations never grant permission or skip review. User service names containing `__` are rejected by settings resolution and `mcp add`; plugin names and normalized name components collapse underscore runs, with duplicate resolved plugin names skipped and warned. Hashing preserves the `mcp__<server>__<tool>` separators. Consequently a bare service rule cannot also be a tool name; rules need no extra scope field. Explicit Ask and Deny still take precedence over Allow and over Auto review: an explicit Ask is never approved by the reviewer. An Allow rule admits the call in Plan as well, as in Claude Code. The user can save `mcp__<server>` (equivalently `mcp__<server>__*`) or `mcp__<server>__<tool>` in the current directory partition of their own settings. These MCP Allow rules remain effective in Auto; a broad `*` Allow still follows the existing Auto filtering. Service rules use the prepared call’s resolved service, including when the model name was hashed. Plugin approval fields and server annotations cannot create grants. Children share the connection but intersect their own rules with the frozen delegation ceiling and current parent restrictions.
+`mcp__<server>__<tool>` uses `HostToolPermission::ThirdParty`. Following Claude Code (`permissions.ts`: MCP tools are not on the safe-tool allowlist, so Auto sends them to `classifyYoloAction`), without a user rule Ask requires human confirmation, Auto sends the call to Auto review, and Full Access allows it. Plan decides the call as the mode it was entered from (Claude Code's `prePlanMode`; see Plan with Auto below): Auto review after Auto, Allow after Full Access, and human confirmation after Ask, when that mode is unknown (a Chat that starts in Plan, or after a load, rewind or Branch switch) and, with `useAutoModeDuringPlan` off, after Auto too. The Plan reminder tells the model to call only read-only MCP tools. Other tools with side effects keep their existing Plan handling. Server annotations never grant permission or skip review. User service names containing `__` are rejected by settings resolution and `mcp add`; plugin names and normalized name components collapse underscore runs, with duplicate resolved plugin names skipped and warned. Hashing preserves the `mcp__<server>__<tool>` separators. Consequently a bare service rule cannot also be a tool name; rules need no extra scope field. Explicit Ask and Deny still take precedence over Allow and over Auto review: an explicit Ask is never approved by the reviewer. An Allow rule admits the call in Plan as well, as in Claude Code. The user can save `mcp__<server>` (equivalently `mcp__<server>__*`) or `mcp__<server>__<tool>` in the current directory partition of their own settings. These MCP Allow rules remain effective in Auto; a broad `*` Allow still follows the existing Auto filtering. Service rules use the prepared call’s resolved service, including when the model name was hashed. Plugin approval fields and server annotations cannot create grants. The one exception is a host's own choice under Durable Approval (`McpServerConfig.unruled = AllowReadOnly`): a call no rule decides runs without a person when the declaration of the tool it was prepared against says `readOnlyHint: true`. Rules still decide first, and the declaration is part of what the call is bound to, so a server that changes it after the call was decided never has the call sent; the call made again is decided under the new declaration. Without that host choice annotations grant nothing. Children share the connection but intersect their own rules with the frozen delegation ceiling and current parent restrictions.
 
 | Tool | Permission and Auto handling | Authorization boundary |
 | --- | --- | --- |
@@ -162,6 +162,30 @@ Claude Code 2.1.302 has a linked-worktree Accept Edits fast path behind a flag t
 
 Calls that still reach the reviewer, such as `cd <worktree> && …` compounds, carry `same_repository_worktrees` in the approval context (version `trusted-approval-v11`) so the reviewer can tell those checkouts from other repositories. No rule text changes: the 82-rule policy and eight inapplicable native entries remain unchanged.
 
+## Bash Deny and Ask rules
+
+Explicit Deny and Ask Permission Rules are decided before Auto's fast paths and the reviewer, and a
+reviewer can never clear them, so their Bash content matching fails closed
+(`harness/tools/src/permissions.rs`, the same function a hook's `if` uses). A compound command
+matches when any of its commands does, each also seen without leading variable assignments,
+reserved words such as `if` or `!`, wrappers (`env`, `command`, `exec`, `time`, `nohup`, `nice`,
+`timeout`, `stdbuf`, `sudo`, `xargs`, `builtin`, `noglob`) with their options, quotes around the
+program and the program's directory. A command whose commands cannot be told apart (a `$(…)` or
+backtick substitution, a subshell, process substitution or an unclosed quote) matches when the
+rule's command could start anywhere in it, quoted or not, or when a program named by an expansion
+or a substitution followed by the rule's arguments would match. Unlike a hook's `if`, such a command
+does not match unrelated rules, so `echo "$(date)"` or a commit message built with `$(cat <<'EOF' …)`
+still reaches the fast paths and the reviewer under `Bash(git push*)`. Claude Code 2.1.302 strips
+all leading assignments and its wrapper list for Deny and Ask and checks the commands its parser
+finds inside substitutions for Deny, but does not look past program paths, and outside its sandbox
+fast path asks about every such command; Tickloop's Deny and Ask see past paths too. Allow rules
+keep their conservative matching: every command of a compound must match as written, and a command
+whose commands cannot be told apart is allowed only by a rule naming it exactly or the whole tool. No rules are added, removed or remapped: **15 Soft allow, 65 Soft deny, 2 Hard
+deny, 82 total**, eight inapplicable native entries, and policy and built-in group version **10** are
+unchanged. `harness/runtime/tests/all/wrapped_command_rules.rs` covers the routing with the reference
+Execution Environment and a reviewer double, including ordinary commands that unrelated rules leave
+to the reviewer.
+
 ## Commands outside the sandbox
 
 Bash's per-call escape request uses ordinary command approval; it does not add a callback tool or grant a proxy domain.
@@ -196,6 +220,18 @@ Both verify admission and rejection, including normally safe commands. This is r
 not semantic acceptance by a real review model. The conditional escape hint is appended by Code
 using frozen preparation state; the Tickhost policy wire shape remains compatible with 10.1.
 
+## PreToolUse hooks
+
+Claude Code–compatible `command` hooks are not model tools, so this mapping adds no rule. A call's `PreToolUse` hooks run before it is prepared, and their merged answer (deny over ask over allow) changes only how the call reaches the steps below; `harness/runtime/src/hooks/` holds the engine and `harness/runtime/tests/all/tool_hooks.rs` the routing tests with the reference Execution Environment and a reviewer double.
+
+- **deny** (a `permissionDecision: "deny"`, `decision: "block"` or exit status 2, from any source) refuses the call unprepared: no Permission Rule, review or prompt is consulted, and the model reads the hook's reason.
+- **ask** (from any source) sends the call to a person in every mode, Auto included, without the reviewer; the request carries the approval source `hook`, and like an explicit Ask the answer covers that one call and saves no rule. An explicit Deny rule or Plan's side-effect refusal still refuses first. An Unrestricted host still asks; a host that cannot ask refuses.
+- **allow** counts only from a hook in the user's own `settings.json`. It admits the call after the deterministic checks and before the reviewer, as a user Allow rule does and as Claude Code does: explicit Ask and Deny rules, sensitive-path safety checks, Plan's side-effect refusal, approval the Execution Environment requires, a host tool's required confirmation, the delegation ceiling and final admission all still apply. Classified host tools whose Allow rules do not skip review (Subagent, the scheduled task tools) are still reviewed, as they are under a user Allow rule. The reviewer and therefore the frozen rules, Hard deny included, are not consulted for that call. Its approval record is `Direct` with the optional reason `hook`. The allow covers only input the user's hooks saw or wrote: when a plugin or repository hook's `updatedInput` is the final input, the allow is dropped and the call is decided as if no hook had allowed it. A plugin's or the repository's own allow is recorded as ignored and the call is decided as if the hook had not answered, so such hooks can never widen what runs.
+- **if** narrows a hook to the calls a Permission Rule such as `Bash(git push*)` may match, judged as Deny and Ask rules judge calls and failing closed so guard hooks never miss a call: a compound command matches when any of its commands does, with redirections set aside; a command whose commands cannot be told apart, an `if` that is not a rule, and content no Permission Rule can match (such as file path patterns) all let the hook run. A tool call's rewrite cannot change a Tick call's `action`, which chose its route.
+- **updatedInput** replaces the call's input before its single preparation; approval, review and execution all see the final input, the conversation keeps the input as the model wrote it, and the hook run record keeps the rewrite.
+
+Unconfirmed or modified plugin and repository hooks never run, so they cannot affect any decision. Hooks that do not answer leave the ordinary routing unchanged. No rules are added, removed or remapped: **15 Soft allow, 65 Soft deny, 2 Hard deny, 82 total**, eight inapplicable native entries, and policy and built-in group version **10** are unchanged.
+
 ## Sandboxed Bash
 
 Following Claude Code's `autoAllowBashIfSandboxed` (`checkSandboxAutoAllow` in `bashPermissions.ts`),
@@ -227,3 +263,13 @@ eight inapplicable native entries, and policy and built-in group version **10** 
 `harness/runtime/tests/all/sandbox_auto_approval.rs` covers the routing with the reference
 Execution Environment and a reviewer double; `code/local-environment/tests/all/sandbox.rs` covers
 the setting and actual macOS execution.
+
+## Plugin Commands loaded by Skill
+
+Skill remains ReadOnly guidance loading. A plugin Command's shell blocks become separate Bash
+calls after argument expansion, each using the existing prepare, admission and execution path.
+The Skill call's admission and its `allowed-tools` metadata grant no permission to these calls.
+Auto uses the same frozen Bash rules, explicit Ask/Deny rules and sandbox admission as an ordinary
+Bash call; Plan and the delegation ceiling still apply. Discovery and completion execute nothing.
+User slash invocations with Shell preparation wait for their own turn; those Shell blocks cannot
+execute inside another turn. Ordinary Skill guidance keeps its existing tool-boundary merging. No default rule or count changes.

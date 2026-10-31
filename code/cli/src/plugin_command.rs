@@ -3,14 +3,14 @@
 //! and removes them. Only `tick` logs in, and only `plugin` manages marketplaces and checks a
 //! plugin directory.
 
-use std::{ffi::OsString, path::Path};
+use std::{collections::BTreeSet, ffi::OsString, path::Path};
 
 use tick_packages::LoginState;
 use tick_plugins::{
-    Component, InstallOutcome, Installation, InstalledPlugin, InstalledPlugins, PluginError,
-    PluginManifest, PluginStore,
+    Component, HookSupport, InstallOutcome, Installation, InstalledPlugin, InstalledPlugins,
+    PluginError, PluginManifest, PluginStore,
 };
-use tickloop_code_console::terminal::safe_line;
+use tickloop_code_console::terminal::{hooks_to_confirm_summary, safe_line};
 use tickloop_tick_installer::{PluginKind, login_label};
 
 const TICK_USAGE: &str = "Usage: tickloop tick install TICK[@MARKETPLACE]
@@ -48,12 +48,12 @@ const PLUGIN_USAGE: &str = "Usage: tickloop plugin install PLUGIN[@MARKETPLACE]
        tickloop plugin marketplace remove MARKETPLACE";
 const PLUGIN_GUIDE: &str = "Manage the plugins without a Tick program in ~/.tickloop/plugins, or in TICKLOOP_CONFIG_DIR/plugins when it is set; tickloop tick manages Ticks, the plugins that carry one. A plugin is a directory with a .tickloop-plugin/plugin.json, a .claude-plugin/plugin.json or a tick-package.json manifest, or none, when it is named after its directory.
 install PLUGIN installs the plugin of that name from the one marketplace that offers it, or from the one it is installed from; when several offer it, it lists them, and PLUGIN@MARKETPLACE chooses. A marketplace is read as last fetched; marketplace update reads it again. A plugin cannot take the name of an installed plugin from another marketplace.
-install --path installs a plugin directory or its .tar.gz archive from the local marketplace, replacing the installed plugin of that name even at the same version, and lists the components Tickloop does not use yet.
+install --path installs a plugin directory or its .tar.gz archive from the local marketplace, replacing the installed plugin of that name even at the same version, and lists the components Tickloop does not use yet and how many of its hooks need confirming.
 update reads the plugin's marketplace again and installs what it offers now, unless that is installed already: the same version, or for Git sources the same commit. Without PLUGIN it updates every plugin except those installed with --path.
-uninstall removes a plugin and its data directory; --keep-data keeps the data.
+uninstall removes a plugin, its data directory and the trust records of its hooks; --keep-data keeps the data.
 enable and disable turn a plugin on and off without uninstalling it; a disabled plugin stays disabled when it is installed again. Its Skills, named PLUGIN:SKILL, load or stop loading from the Agent's next request.
-list shows the installed plugins: their marketplace, version, whether they are enabled, their login state and the components Tickloop does not use yet. list --available shows what every marketplace offers: its latest version, what is installed and why a plugin cannot be installed. A marketplace that cannot be read is reported and the others are shown.
-validate shows what Tickloop reads from a plugin directory: its manifest, Skills, the components it does not use yet, and what it ignores. --name uses a marketplace entry name as the installation identity and keeps the declared name for display.
+list shows the installed plugins: their marketplace, version, whether they are enabled, their login state, the components Tickloop does not use yet and how many of their hooks need confirming. list --available shows what every marketplace offers: its latest version, what is installed and why a plugin cannot be installed. A marketplace that cannot be read is reported and the others are shown.
+validate shows what Tickloop reads from a plugin directory: its manifest, Skills, the hook events, types and fields it runs and those it does not, the components it does not use yet, and what it ignores. --name uses a marketplace entry name as the installation identity and keeps the declared name for display.
 marketplace add registers a marketplace from a GitHub OWNER/REPO[#REF], a Git URL (https, ssh or file), a local directory, or an https URL of a marketplace.json; it takes the name its marketplace file gives. marketplace list shows them, marketplace update reads one or every one again, and marketplace remove unregisters one and keeps the plugins installed from it. The built-in tickloop marketplace cannot be removed; it is read on every use (TICKLOOP_TICK_MARKETPLACE overrides its URL or file). claude-plugins-official is registered by default and fetched with git on first use. Its removal is remembered across restarts; add it back with tickloop plugin marketplace add anthropics/claude-plugins-official. Both names remain reserved for their official sources.
 Installing runs nothing in the plugin, and a plugin's Skills grant no tools; tools still ask as usual.
   -h, --help  Show this help.";
@@ -405,14 +405,14 @@ fn install_path(
     let installation = store
         .install_path(path)
         .map_err(|error| format!("cannot install {}: {error}", path.display()))?;
-    report(&installation, kind);
+    report(store, &installation, kind);
     super::plugin_config::configure(store, &installation.plugin, false)?;
     Ok(())
 }
 
 /// Reports what installing did; `kind` is the command that installed it, so a plugin that turns
 /// out to be of the other kind says which command manages it.
-pub(super) fn report(installation: &Installation, kind: PluginKind) {
+pub(super) fn report(store: &PluginStore, installation: &Installation, kind: PluginKind) {
     let plugin = &installation.plugin;
     let id = plugin.id();
     let version = &plugin.version;
@@ -430,7 +430,7 @@ pub(super) fn report(installation: &Installation, kind: PluginKind) {
             actual.label()
         ),
     }
-    report_notes(plugin);
+    report_notes(store, plugin);
     if actual != kind {
         let what = match actual {
             PluginKind::Tick => "It carries a Tick program, so tickloop tick and /ticks manage it.",
@@ -442,9 +442,9 @@ pub(super) fn report(installation: &Installation, kind: PluginKind) {
     }
 }
 
-/// The name its manifest gives `plugin`, whether it stays disabled, that its program runs as the user, and what its manifest
-/// leaves unused.
-pub(super) fn report_notes(plugin: &InstalledPlugin) {
+/// The name its manifest gives `plugin`, whether it stays disabled, that its program runs as the
+/// user, what its manifest leaves unused and how many of its hooks need confirming.
+pub(super) fn report_notes(store: &PluginStore, plugin: &InstalledPlugin) {
     if let Some(display_name) = &plugin.manifest.display_name {
         println!("Its manifest calls it {}.", safe_line(display_name));
     }
@@ -458,12 +458,15 @@ pub(super) fn report_notes(plugin: &InstalledPlugin) {
     if plugin.manifest.tick.is_some() {
         println!("When opened, its Tick program runs as your user. Installing runs nothing.");
     }
-    report_manifest_notes(&plugin.manifest);
+    report_unsupported(&plugin.manifest);
+    if let Some(hooks) = hooks_to_confirm(store, plugin) {
+        println!("{hooks}.");
+    }
+    report_warnings(&plugin.manifest);
     super::plugin_mcp::installed(plugin);
 }
 
-/// Prints the components Tickloop does not use yet and what it ignored in the manifest.
-fn report_manifest_notes(manifest: &PluginManifest) {
+fn report_unsupported(manifest: &PluginManifest) {
     let unsupported = manifest.unsupported();
     if !unsupported.is_empty() {
         println!(
@@ -471,8 +474,49 @@ fn report_manifest_notes(manifest: &PluginManifest) {
             component_labels(&unsupported)
         );
     }
+}
+
+fn report_warnings(manifest: &PluginManifest) {
     for warning in &manifest.warnings {
         println!("Warning: {}", safe_line(warning));
+    }
+}
+
+/// How many of the plugin's hooks wait for the user to confirm them, when any do.
+fn hooks_to_confirm(store: &PluginStore, plugin: &InstalledPlugin) -> Option<String> {
+    hooks_to_confirm_summary(
+        tickloop_code_settings::UserSettings::in_root(store.config_root())
+            .plugin_hooks_to_confirm(plugin),
+    )
+}
+
+/// The hook events, types and fields the manifest uses, split into those Tickloop runs and those
+/// it does not.
+fn report_hook_support(support: &HookSupport) {
+    if support.runnable == 0 && !support.has_unsupported() {
+        return;
+    }
+    let names = |names: &BTreeSet<String>| {
+        if names.is_empty() {
+            "none".to_owned()
+        } else {
+            safe_line(&names.iter().cloned().collect::<Vec<_>>().join(", "))
+        }
+    };
+    println!(
+        "Hooks: {} supported | events: {} | types: {} | fields: {}",
+        support.runnable,
+        names(&support.events),
+        names(&support.types),
+        names(&support.fields)
+    );
+    if support.has_unsupported() {
+        println!(
+            "Hooks not supported yet: events: {} | types: {} | fields: {}",
+            names(&support.unsupported_events),
+            names(&support.unsupported_types),
+            names(&support.unsupported_fields)
+        );
     }
 }
 
@@ -501,13 +545,15 @@ fn uninstall(
         uninstalled.version
     );
     let id = format!("{}@{}", uninstalled.name, uninstalled.marketplace);
-    if let Err(error) =
-        tickloop_code_settings::UserSettings::in_root(store.config_root()).forget_plugin_hooks(&id)
+    match tickloop_code_settings::UserSettings::in_root(store.config_root())
+        .forget_plugin_hooks(&id)
     {
-        eprintln!(
+        Ok(true) => println!("Its hook trust records were removed."),
+        Ok(false) => {}
+        Err(error) => eprintln!(
             "Warning: its hook trust records were not removed: {}",
             safe_line(&error.to_string())
-        );
+        ),
     }
     if let Some(data) = uninstalled.data {
         println!(
@@ -579,6 +625,8 @@ fn list(store: &PluginStore, kind: PluginKind) -> Result<(), String> {
                     (!unsupported.is_empty())
                         .then(|| format!("not supported yet: {}", component_labels(&unsupported))),
                 )
+                .chain(hooks_to_confirm(store, plugin))
+                .chain(plugin.manifest.hook_support.warnings())
                 .collect::<Vec<_>>();
             [
                 plugin.id(),
@@ -662,6 +710,39 @@ fn validate(path: &Path, marketplace_name: Option<&str>) -> Result<(), String> {
     } else {
         println!("Skills: {}", skills.join(", "));
     }
+    let commands = tick_plugins::discover_commands(&root, &manifest);
+    let mut registry = tickloop_code_settings::skills::SkillRegistry::default();
+    for command in commands.commands {
+        registry.register_command(
+            tickloop_code_settings::skills::CommandDocument {
+                name: command.name,
+                markdown: command.markdown,
+                source: tickloop_harness::protocol::SkillSource::Plugin {
+                    plugin: manifest.name.clone(),
+                    path: command.path,
+                },
+                base_directory: command.base_directory,
+                metadata: command.metadata,
+                public_config: Default::default(),
+            },
+            &[],
+        );
+    }
+    let names = registry
+        .definitions()
+        .map(|command| safe_line(&command.name))
+        .collect::<Vec<_>>();
+    println!(
+        "Commands: {}",
+        if names.is_empty() {
+            "none".into()
+        } else {
+            names.join(", ")
+        }
+    );
+    for warning in commands.warnings.iter().chain(registry.warnings()) {
+        println!("Warning: {}", safe_line(warning));
+    }
     if let Some(tick) = &manifest.tick {
         let protocol = if tick.protocol {
             "speaks the Tick protocol"
@@ -673,7 +754,9 @@ fn validate(path: &Path, marketplace_name: Option<&str>) -> Result<(), String> {
             safe_line(&tick.executable.display().to_string())
         );
     }
-    report_manifest_notes(&manifest);
+    report_unsupported(&manifest);
+    report_hook_support(&manifest.hook_support);
+    report_warnings(&manifest);
     super::plugin_mcp::validate(&manifest, &root);
     Ok(())
 }

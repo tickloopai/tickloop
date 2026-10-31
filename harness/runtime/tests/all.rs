@@ -17,6 +17,9 @@ mod durable_queue;
 #[path = "all/durable_waits.rs"]
 mod durable_waits;
 
+#[path = "all/durable_approval.rs"]
+mod durable_approval;
+
 #[path = "all/model_ids.rs"]
 mod model_ids;
 #[path = "all/retained_budget.rs"]
@@ -27,6 +30,9 @@ mod response_lifecycle;
 
 #[path = "all/approval_budget.rs"]
 mod approval_budget;
+
+#[path = "all/background_hooks.rs"]
+mod background_hooks;
 
 #[path = "all/artifact_real_service.rs"]
 mod artifact_real_service;
@@ -85,6 +91,8 @@ mod prompt_cache_wire;
 #[path = "all/output_limit_recovery.rs"]
 mod output_limit_recovery;
 
+#[path = "all/tick_changes.rs"]
+mod tick_changes;
 #[path = "all/tool_batches.rs"]
 mod tool_batches;
 
@@ -103,6 +111,9 @@ mod native_task_auto;
 #[path = "all/mcp_servers.rs"]
 mod mcp_servers;
 
+#[path = "all/mcp_host_logins.rs"]
+mod mcp_host_logins;
+
 #[path = "all/third_party_approval.rs"]
 mod third_party_approval;
 
@@ -114,6 +125,9 @@ mod tool_list_stability;
 
 #[path = "all/launch_rules.rs"]
 mod launch_rules;
+
+#[path = "all/wrapped_command_rules.rs"]
+mod wrapped_command_rules;
 
 #[path = "all/environment_approval.rs"]
 mod environment_approval;
@@ -128,3 +142,12 @@ mod sandbox_auto_approval;
 
 #[path = "all/file_environment.rs"]
 mod file_environment;
+
+#[path = "all/tool_hooks.rs"]
+mod tool_hooks;
+
+#[path = "all/session_hooks.rs"]
+mod session_hooks;
+
+#[path = "all/command_skills.rs"]
+mod command_skills;

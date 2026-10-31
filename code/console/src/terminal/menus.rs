@@ -44,10 +44,10 @@ use tickloop_code_access::{ConfigurationChange, DisplayedView, ExecutionRef};
 use tickloop_harness::model::{ModelConfigExt, ReasoningEffortExt};
 use tickloop_harness::protocol::{
     AutoReviewerPreference, ChatSnapshot, ChatStatus, CounterSummary, CounterTotal,
-    DirectedSummaryRequest, ExecutionMode, ModelConfig, ModelRequestKind, PermissionApprovalSource,
-    PermissionChange, PermissionRequest, PermissionScope, Protocol, ProtocolFailure,
-    QuestionRequest, ReasoningEffort, Receipt, RequestFailure, RequestOutcome, ResponseRejection,
-    RewindMode, RewindOutcome, SummaryDirection, UsageCounter, UsageCoverage, UsageSummary,
+    DirectedSummaryRequest, ExecutionMode, ModelConfig, ModelRequestKind, PermissionChange,
+    PermissionRequest, PermissionScope, Protocol, ProtocolFailure, QuestionRequest,
+    ReasoningEffort, Receipt, RequestFailure, RequestOutcome, ResponseRejection, RewindMode,
+    RewindOutcome, SummaryDirection, UsageCounter, UsageCoverage, UsageSummary,
 };
 
 const SHIFT_TAB_MODES_SETTING_INDEX: usize = 4;
@@ -589,6 +589,7 @@ impl Menus {
                 tickloop_harness::protocol::DenialPersistence::Disabled
             },
             load_warning: None,
+            hook_runs: Vec::new(),
         };
         console.show_permissions(page, Ok(history), return_to_settings, auto_page)
     }
@@ -2191,7 +2192,7 @@ impl Menus {
                 title: "Permissions · Choose mode".into(),
                 context: vec![
                     context.into(),
-                    format!("{sandbox_status} · 用 /sandbox 修改"),
+                    format!("{sandbox_status} · change with /sandbox"),
                 ],
                 markdown: None,
                 options,
@@ -2446,7 +2447,7 @@ impl Menus {
         if review.is_none() || request.parent_call.is_some() {
             context.extend(permission_context(request));
         }
-        let explicit_ask = request.approval_source == PermissionApprovalSource::ExplicitAsk;
+        let explicit_ask = request.approval_source.is_single_use();
         let rule_candidates = permission_rule_candidates(&request.name, &request.input);
         let persistent_option = rule_candidates.first().map_or_else(
             || "Yes, and don't ask again".into(),
@@ -2534,7 +2535,7 @@ impl Menus {
         if *active_id != menu_id
             || index != 2
             || !*persistent
-            || request.approval_source == PermissionApprovalSource::ExplicitAsk
+            || request.approval_source.is_single_use()
         {
             return Err("this menu option cannot be expanded".into());
         }
@@ -2744,7 +2745,7 @@ impl Menus {
                 persistent,
                 ..
             } => Box::pin(async move {
-                let explicit_ask = request.approval_source == PermissionApprovalSource::ExplicitAsk;
+                let explicit_ask = request.approval_source.is_single_use();
                 if !explicit_ask
                     && persistent
                     && let Some(server) = &request.mcp_server

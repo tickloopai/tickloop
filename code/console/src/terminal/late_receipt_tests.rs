@@ -13,6 +13,7 @@ use std::{
 };
 use tickloop_code_daemon::EmbeddedAgentAccess;
 use tickloop_code_local_environment::AgentLocalExt;
+use tickloop_code_settings::local_agent::LocalAgent;
 use uuid::Uuid;
 
 use tickloop_code_access::{
@@ -260,17 +261,25 @@ fn late_receipt_pty_fixture() {
 
 async fn run_late_receipt_fixture() {
     let directory = PathBuf::from(std::env::var_os(DIRECTORY_VARIABLE).unwrap());
+    let skill_directory = directory.join(".tickloop/skills/guide");
+    std::fs::create_dir_all(&skill_directory).unwrap();
+    std::fs::write(
+        skill_directory.join("SKILL.md"),
+        "---\nname: guide\ndescription: Test guidance\n---\nGuide $ARGUMENTS",
+    )
+    .unwrap();
     let model = Arc::new(tickloop_harness::test_support::ScriptedModel::new(vec![
         tickloop_harness::test_support::text("late reply"),
         tickloop_harness::test_support::text("edited reply"),
         tickloop_harness::test_support::text("command reply"),
     ]));
-    let core = tickloop_harness::runtime::Agent::new_embedded(
+    let core = tickloop_harness::runtime::Agent::new_with_user_settings_embedded(
         tickloop_harness::test_support::config(),
         Arc::new(HeldWhileFlagged {
             model: model.clone(),
             flag: directory.join("hold-model"),
         }),
+        tickloop_code_settings::UserSettings::in_root(&directory),
     );
     core.install_own_tickhost();
     let workdir = std::env::current_dir().unwrap();
@@ -974,7 +983,7 @@ fn an_edited_shell_command_held_behind_an_unknown_input_is_shown_only_once_it_ru
 #[test]
 fn a_busy_command_held_behind_an_unknown_input_is_queued_and_shown_once() {
     const FIRST: &str = "unknown busy input";
-    const COMMAND: &str = "/tickloop check the busy work";
+    const COMMAND: &str = "/guide check the busy work";
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let flag = |name: &str| directory.path().join(name);
     let mut view = start_view(directory.path(), false);
@@ -1107,7 +1116,7 @@ fn start_held_turn(view: &mut LateReceiptPty, directory: &std::path::Path, input
 fn inputs_sent_while_a_turn_works_wait_only_in_the_queue_until_a_turn_takes_them() {
     const FIRST: &str = "first idle input";
     const MESSAGE: &str = "message sent while working";
-    const COMMAND: &str = "/tickloop check the waiting work";
+    const COMMAND: &str = "/guide check the waiting work";
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let flag = |name: &str| directory.path().join(name);
     let mut view = start_view(directory.path(), false);

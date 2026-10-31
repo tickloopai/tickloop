@@ -8,27 +8,27 @@ const TASK_TITLE: &str = "Inspect the shared task panel";
 const TASK_REPLY: &str = "SHARED-TASK-READY";
 const TASK_DRAFT: &str = "literal-jk-shared-draft";
 const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(20);
-/// How much of a Shell's command the first line of its card shows whole.
+/// How much of a Shell's command the first line of its screen shows whole.
 const SHELL_COMMAND_START: usize = 24;
 
-/// Waits until the Shell's card headed by `command` no longer has the focus.
+/// Waits until the Shell's screen headed by `command` gave the terminal back.
 async fn shell_view_closed(pty: &PtyView, command: &str) {
     tokio::time::timeout(UI_TIMEOUT, async {
-        while card_focused(&terminal_screen(pty)) {
+        while full_screen(&terminal_screen(pty)) {
             tokio::time::sleep(SHELL_POLL_INTERVAL).await;
         }
     })
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "the {command:?} card kept the focus:\n{}",
+            "the {command:?} screen kept the terminal:\n{}",
             terminal_screen(pty)
         )
     });
 }
 
-/// Waits until a Shell's card has the focus and shows the start of its command, its output and
-/// its status; a 40-column card wraps the rest of a long command.
+/// Waits until a Shell's screen has the whole terminal and shows the start of its command, its
+/// output and its status.
 async fn shell_view_shows(pty: &PtyView, command: &str, output: &str, status: &str) {
     let start: String = command.chars().take(SHELL_COMMAND_START).collect();
     view_shows(pty, &[&format!("$ {start}"), output, status]).await;
@@ -380,20 +380,31 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         frame.contains("Shells (2)")
     })
     .await;
-    // Rows keep the order they joined: Shift+Down selects the older Shell, `j` the newer one.
+    // The Shell that joined last is listed first: Shift+Down selects it, `j` the older one.
+    let selected = |command: &'static str| {
+        move |frame: &str| {
+            frame
+                .lines()
+                .any(|line| line.contains(SELECTED_MARK) && line.contains(command))
+        }
+    };
     pty.send(b"\x1b[1;2B");
-    pty.wait_for("the older Shell selected first", |frame| {
-        frame.lines().any(|line| {
-            line.contains(SELECTED_MARK) && line.contains("while [ ! -f first-finish ]")
-        })
-    })
+    pty.wait_for(
+        "the newer Shell selected first",
+        selected("while [ ! -f second-finish ]"),
+    )
     .await;
     pty.send(b"j");
-    pty.wait_for("newest exact Shell selected", |frame| {
-        frame.lines().any(|line| {
-            line.contains(SELECTED_MARK) && line.contains("while [ ! -f second-finish ]")
-        })
-    })
+    pty.wait_for(
+        "the older Shell below it",
+        selected("while [ ! -f first-finish ]"),
+    )
+    .await;
+    pty.send(b"k");
+    pty.wait_for(
+        "newest exact Shell selected",
+        selected("while [ ! -f second-finish ]"),
+    )
     .await;
     pty.send(b"\r");
     shell_view_shows(

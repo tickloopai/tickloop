@@ -3,6 +3,9 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{ChatId, LoopId, RunId};
 
 /// The Claude Code hook events Tickloop runs; hooks for any other event are skipped with a warning.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -53,6 +56,14 @@ impl HookEvent {
         Self::ALL.into_iter().find(|event| event.name() == name)
     }
 
+    /// Whether the event is about one tool call, which a hook's `if` can then narrow.
+    pub fn is_tool_event(self) -> bool {
+        matches!(
+            self,
+            Self::PreToolUse | Self::PostToolUse | Self::PostToolUseFailure
+        )
+    }
+
     /// Whether a matcher selects this event's hooks: the tool name for tool events, the source for
     /// `SessionStart` and the trigger for `PreCompact`. Other events ignore any matcher.
     pub fn uses_matcher(self) -> bool {
@@ -100,6 +111,28 @@ pub struct HookPluginDirectories {
     pub data: PathBuf,
 }
 
+/// How a hook runs apart from the event that starts it, as Claude Code's `async` and
+/// `asyncRewake` declare: in the background, without holding up the event, with any decision it
+/// prints ignored.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HookBackground {
+    /// `async`: its `systemMessage` and `additionalContext` reach the model's next request.
+    Async,
+    /// `asyncRewake`: exit status 2 notifies the Loop with its output, waking it when idle.
+    AsyncRewake {
+        /// Claude Code's `rewakeMessage`: what the model reads before the output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// Claude Code's `rewakeSummary`: the one line the user sees.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+}
+
+/// What stands in for a sensitive value a view must not show.
+const REDACTED_VALUE: &str = "[redacted]";
+
 /// One `command` hook as configured for a Folder.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConfiguredHook {
@@ -116,7 +149,19 @@ pub struct ConfiguredHook {
     /// The command to run, with a plugin's placeholders substituted; `None` while it refers to a
     /// plugin user configuration value that is not set.
     pub resolved_command: Option<String>,
+    /// The plugin's sensitive user configuration values `resolved_command` contains. The host
+    /// removes them from what the hook prints before the model, a view or a record sees it, and
+    /// views get the hook [`ConfiguredHook::for_views`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sensitive_values: Vec<String>,
+    /// Claude Code's `if`: a Permission Rule such as `Bash(git push*)` the tool call must also
+    /// match, after the matcher. A hook of an event without tool calls that has one never runs.
+    #[serde(default, rename = "if", skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
     pub timeout_secs: u64,
+    /// `None` for a hook its event waits for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<HookBackground>,
     pub plugin: Option<HookPluginDirectories>,
     /// What a trust record must match: the declaration with the plugin's whole content, or with
     /// the Folder's `.claude/hooks/` directory. `None` for user hooks.
@@ -125,6 +170,20 @@ pub struct ConfiguredHook {
 }
 
 impl ConfiguredHook {
+    /// The hook as a view may show it: each sensitive value in the command it runs replaced
+    /// with `[redacted]`, and the values themselves left out.
+    pub fn for_views(mut self) -> Self {
+        let mut secrets = std::mem::take(&mut self.sensitive_values);
+        secrets.retain(|secret| !secret.is_empty());
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        if let Some(command) = &mut self.resolved_command {
+            for secret in &secrets {
+                *command = command.replace(secret.as_str(), REDACTED_VALUE);
+            }
+        }
+        self
+    }
+
     pub fn needs_configuration(&self) -> bool {
         self.resolved_command.is_none()
     }
@@ -162,4 +221,97 @@ pub struct HookTrustChange {
     pub source: HookSource,
     pub key: String,
     pub action: HookTrustAction,
+}
+
+/// How one hook run ended.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookRunOutcome {
+    /// It exited 0 with output the host could read.
+    Success,
+    /// It exited 2, or its output blocked or denied.
+    Blocking,
+    /// It exited with another status, or its output could not be read: only the user is told.
+    NonBlockingError,
+    /// Its timeout passed and the environment ended it.
+    TimedOut,
+    /// The turn was interrupted or stopped while it ran.
+    Cancelled,
+    /// The environment could not start it.
+    NotRun,
+}
+
+/// What a hook's output decided.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookDecision {
+    Allow,
+    Ask,
+    Deny,
+    /// A `decision: "block"` outside `PreToolUse`, or an exit status 2.
+    Block,
+    /// An `allow` from a plugin or repository hook, which may not admit a tool call.
+    IgnoredAllow,
+}
+
+/// Which end of a background hook's run a record is.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookBackgroundPhase {
+    /// It started and its event went on without it; the record's outcome is `Success`.
+    Started,
+    /// It ended; any decision it printed was ignored.
+    Ended,
+}
+
+/// One hook run as the Chat's activity history keeps it. It never reaches the model.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HookRunRecord {
+    pub id: Uuid,
+    pub chat_id: ChatId,
+    pub loop_id: LoopId,
+    pub run_id: RunId,
+    pub at_ms: u64,
+    pub event: HookEvent,
+    pub source: HookSource,
+    /// The command as declared, without a plugin's substituted values.
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub duration_ms: u64,
+    pub outcome: HookRunOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<HookDecision>,
+    /// Why it decided, blocked or failed, shortened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The `systemMessage` it showed the user, shortened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<String>,
+    /// The `updatedInput` it gave a `PreToolUse` call, shortened; the call's own input stays in
+    /// the conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_input: Option<String>,
+    /// Its standard output and error, shortened; empty when it asked to suppress its output.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output: String,
+    /// `None` for a run its event waited for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<HookBackgroundPhase>,
+}
+
+/// Hooks an event matched that did not run because they may not run yet.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HookSkipNotice {
+    pub event: HookEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Plugin and repository hooks the user has not confirmed, or whose content changed since.
+    pub unconfirmed: usize,
+    /// Plugin hooks that refer to a user configuration value that is not set.
+    pub unconfigured: usize,
 }

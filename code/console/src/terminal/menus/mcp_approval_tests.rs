@@ -26,6 +26,7 @@ async fn mcp_confirmation_choices_save_the_displayed_scope_in_user_settings() {
         service.set_tools(json!([{"name":"read","inputSchema":{"type":"object","properties":{}}}]));
         service.set_result(json!({"content":[{"type":"text","text":"OK"}]}));
         let configs = vec![McpServerConfig {
+            unruled: Default::default(),
             exposure: tickloop_harness::protocol::mcp::ToolExposure::Direct,
             tool_exposure: Vec::new(),
             description: String::new(),

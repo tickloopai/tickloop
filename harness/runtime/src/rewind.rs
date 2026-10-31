@@ -17,6 +17,7 @@ use super::{Agent, AgentError, Chat, ChatBookkeeping};
 use crate::file_history::{
     FileHistoryError, FileHistorySnapshot, FileRestoreReport, create_first_backup,
 };
+use crate::task_board_history::{ConversationChange, LiveRuns, follow_conversation};
 use crate::transcript::{private_project_temp_directory, private_temp_root};
 use tickloop_harness_base::private_fs::PrivateDirectory;
 use tickloop_harness_protocol::local_messages::LocalMessage;
@@ -86,12 +87,18 @@ impl Agent {
             };
             let result = {
                 let mut chats = agent.inner.chats.lock().await;
+                let live = crate::shared_tasks::live_runs(chats.values());
                 let Some(chat) = chats.get_mut(&chat_id) else {
                     let _ = sender.send(Err(AgentError::NotFound));
                     return;
                 };
                 chat.active = None;
-                agent.finish_rewind(chat, point, mode, restored)
+                let loop_id = chat.snapshot.chat_loop.id;
+                let result = agent.finish_rewind(chat, point, mode, restored, &live);
+                if let Ok((_, true)) = &result {
+                    agent.publish_task_board(&mut chats, chat_id, loop_id);
+                }
+                result.map(|(outcome, _)| outcome)
             };
             let next = agent.next_run(chat_id).await;
             let (result, mut next) = match (result, next) {
@@ -153,16 +160,59 @@ impl Agent {
         }))
     }
 
+    /// Takes the prompt at message `index` that a `UserPromptSubmit` hook blocked, with what
+    /// follows it, back out of the conversation, as [`Agent::take_back_interrupted_prompt`]
+    /// does: the model never reads it, and the Transcript keeps it as an abandoned branch.
+    /// `run_id` is the Run the prompt started or the queued input it came as. Views redraw the
+    /// conversation only when `is_shown`; a queued prompt taken back as it joins never was.
+    pub(super) fn take_back_blocked_prompt(
+        &self,
+        chat: &mut Chat,
+        run_id: RunId,
+        index: usize,
+        is_shown: bool,
+    ) {
+        if chat.snapshot.message_runs.get(&index) != Some(&run_id) {
+            return;
+        }
+        let Some(point) = chat.snapshot.rewind_point_at(index) else {
+            return;
+        };
+        match conversation_before(
+            &chat.snapshot,
+            &chat.bookkeeping,
+            point.message_index,
+            Some(point.execution_mode),
+        ) {
+            Ok(candidate) => {
+                if is_shown {
+                    self.replace_conversation(
+                        chat,
+                        point.message_index,
+                        point.message_id,
+                        candidate,
+                    );
+                } else {
+                    self.swap_conversation(chat, point.message_index, candidate);
+                }
+                self.save(&chat.snapshot);
+            }
+            Err(error) => tracing::warn!("cannot take back a prompt a hook blocked: {error}"),
+        }
+    }
+
     /// Third stage of rewind: truncates the conversation according to the file restore result and
     /// the mode. The conversation is recomputed from the snapshot at the end of the occupation,
-    /// keeping changes such as input queued during it.
+    /// keeping changes such as input queued during it. The task board follows the conversation;
+    /// also tells whether it changed.
     fn finish_rewind(
         &self,
         chat: &mut Chat,
         point: RewindPoint,
         mode: RewindMode,
         restored: Option<Result<Result<FileRestoreReport, FileHistoryError>, JoinError>>,
-    ) -> Result<RewindOutcome, AgentError> {
+        live: &LiveRuns,
+    ) -> Result<(RewindOutcome, bool), AgentError> {
         let code = match restored {
             None => None,
             Some(Err(error)) => {
@@ -181,29 +231,47 @@ impl Agent {
                 ..CodeRewind::default()
             }),
         };
-        let draft = if mode.restores_conversation() {
-            let candidate = conversation_before(
+        let (draft, board_moved) = if mode.restores_conversation() {
+            let (mut snapshot, mut bookkeeping) = conversation_before(
                 &chat.snapshot,
                 &chat.bookkeeping,
                 point.message_index,
                 Some(point.execution_mode),
             )?;
-            self.replace_conversation(chat, point.message_index, point.message_id, candidate);
-            Some(RewindDraft {
+            let board_moved = follow_conversation(
+                &mut snapshot,
+                &mut bookkeeping,
+                point.message_index,
+                ConversationChange::Moved,
+                live,
+            )
+            .map_err(AgentError::Invalid)?;
+            self.replace_conversation(
+                chat,
+                point.message_index,
+                point.message_id,
+                (snapshot, bookkeeping),
+            );
+            if board_moved {
+                self.queue_task_boards(chat);
+            }
+            let draft = RewindDraft {
                 prompt: point.prompt,
                 contexts: point.contexts,
-            })
+            };
+            (Some(draft), board_moved)
         } else {
-            None
+            (None, false)
         };
         self.save(&chat.snapshot);
-        Ok(RewindOutcome {
+        let outcome = RewindOutcome {
             snapshot: chat.snapshot.clone(),
             mode,
             code,
             conversation_restored: draft.is_some(),
             draft,
-        })
+        };
+        Ok((outcome, board_moved))
     }
 
     /// Files that restoring to the target prompt would change, without changing any. Returns
@@ -236,6 +304,18 @@ impl Agent {
         chat: &mut Chat,
         index: usize,
         message_id: Uuid,
+        candidate: (ChatSnapshot, ChatBookkeeping),
+    ) {
+        self.swap_conversation(chat, index, candidate);
+        self.emit_conversation_rewound(chat, message_id);
+    }
+
+    /// Switches to the conversation truncated before message `index` without telling views,
+    /// for a tail none of them was shown.
+    fn swap_conversation(
+        &self,
+        chat: &mut Chat,
+        index: usize,
         (candidate, mut candidate_bookkeeping): (ChatSnapshot, ChatBookkeeping),
     ) {
         if let Some(recorder) = &self.inner.recorder {
@@ -245,7 +325,6 @@ impl Agent {
         chat.replace_snapshot(candidate);
         chat.bookkeeping = candidate_bookkeeping;
         self.inner.ledger_changes.send_replace(());
-        self.emit_conversation_rewound(chat, message_id);
     }
 
     pub(super) fn emit_conversation_rewound(&self, chat: &mut Chat, message_id: Uuid) {
@@ -415,7 +494,7 @@ pub(super) fn conversation_before(
     candidate.operations = std::mem::take(&mut candidate.operations)
         .into_iter()
         .filter(|operation| {
-            operation.parent_call_id.is_none()
+            (operation.parent_call_id.is_none() && operation.input_message_id.is_none())
                 || super::nested_calls::parent_on_chain(&candidate, operation)
         })
         .collect();
@@ -425,6 +504,9 @@ pub(super) fn conversation_before(
     candidate_bookkeeping.loop_state_views.split_off(&index);
     candidate_bookkeeping.later_provenance.split_off(&index);
     candidate_bookkeeping.message_responses.split_off(&index);
+    candidate_bookkeeping
+        .task_board_checkpoints
+        .split_off(&index);
     candidate_bookkeeping.lifecycle.restart_claims_at(index);
     candidate_bookkeeping.lifecycle.forget_tail_answer();
     candidate.message_ids.split_off(&index);

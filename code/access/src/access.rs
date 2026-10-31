@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{AccessLimits, FEED_CAPACITY, FEED_CHANGE_BYTES, FEED_MAX_BYTES};
+use tickloop_harness::protocol::hooks::{HookList, HookTrustChange};
 use tickloop_harness::protocol::{
     AccountModelDirectory, AgentHostOptions, ApprovalHistoryView, ArtifactTick,
     BranchSessionPermissionRegistration, ChatSnapshot, ChatStatus, ChatStatusInput, CodeRewind,
@@ -102,10 +103,20 @@ use tickloop_harness::protocol::{
 /// 36.0 adds an ended root Agent whose last turn had finished (`EndedOutcome::Completed`,
 /// `EndReason::Finished`), which older readers reject as unknown, and whether an Agent summary
 /// still has work pending while its Loop is idle.
-/// 37.0 adds managed ACP and Print executions (profiles, control leases, settlement and
+/// 36.1 adds reading the hooks configured for the Folder a launch starts in, with their trust,
+/// and changing their trust records.
+/// 37.0 adds the hook run and skipped hook events, the hook approval source and direct approval
+/// reason, which older readers reject as unknown, and the hook runs of the approval history.
+/// 37.1 adds how a configured hook runs in the background (`async`, `asyncRewake`) and which end
+/// of a background run a hook run record is.
+/// 38.0 adds the host note carrying what a hook gave the model, which older readers reject as
+/// unknown in the Chat snapshot's host notes, and a launch that starts its Agent after `/clear`.
+/// 39.0 lets a task notification come from a hook that ran in the background: its Shell task
+/// moves under `shell`, which such a notification leaves empty and older readers reject.
+/// 40.0 adds managed ACP and Print executions (profiles, control leases, settlement and
 /// session loading), resource and image input contexts and recorded-edit replay, which older
 /// readers reject as unknown.
-pub const PROTOCOL_MAJOR: u16 = 37;
+pub const PROTOCOL_MAJOR: u16 = 40;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MANAGED_LEASE_SECONDS: u64 = 45;
 
@@ -306,6 +317,9 @@ pub struct LaunchSpec {
     pub exact_chat: Option<Uuid>,
     pub environment: Vec<EnvironmentValue>,
     pub host_work_context: Option<HostWorkContext>,
+    /// The Agent starts the session `/clear` began: its `SessionStart` hooks read `clear`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_clear: bool,
     /// Invocation-private descriptors. Never persisted in transcript metadata.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_mcp_servers: Vec<tickloop_harness::protocol::SessionMcpServer>,
@@ -324,6 +338,7 @@ impl LaunchSpec {
             exact_chat: None,
             environment: Vec::new(),
             host_work_context: None,
+            after_clear: false,
             session_mcp_servers: Vec::new(),
         }
     }
@@ -353,6 +368,11 @@ pub struct ManagedSkillInfo {
 pub struct ManagedModelInfo {
     pub id: String,
     pub name: String,
+    /// The provider a client may group models under, and its distinguishing display name.
+    #[serde(default)]
+    pub provider_id: String,
+    #[serde(default)]
+    pub provider_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -606,6 +626,16 @@ pub enum AgentCommand {
     },
     TrustWorkingDirectory {
         folder: PathBuf,
+    },
+    /// Changes the trust records of hooks configured for the Folder `launch` starts in, in the
+    /// configuration root it names, and answers with the hooks as they then stand. With
+    /// `expected_revision`, the change applies only while the records are still at the
+    /// [`HookList::revision`] the user reviewed.
+    WriteHookTrust {
+        launch: Box<LaunchSpec>,
+        changes: Vec<HookTrustChange>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_revision: Option<String>,
     },
     FlushTranscripts,
     UpgradeRuntime {
@@ -979,6 +1009,11 @@ pub enum ObservationRequest {
     EndedAgents {
         store_root: Option<PathBuf>,
     },
+    /// The hooks configured for the Folder `launch` starts in, from the configuration root it
+    /// names, each with its trust; read alike before and after an Agent starts there.
+    Hooks {
+        launch: Box<LaunchSpec>,
+    },
 }
 
 /// A running Tickhost of another build than the daemon's, which the daemon keeps until the user
@@ -1325,6 +1360,7 @@ pub enum ObservationValue {
     OtherTickhost(Option<OtherTickhost>),
     RuntimeVersion(Box<crate::RuntimeVersion>),
     PlanFile(Option<PathBuf>),
+    Hooks(Box<HookList>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1469,6 +1505,7 @@ pub enum CommandResult {
         snapshot: Box<LiveChatSnapshot>,
         draft: TakenBackPrompt,
     },
+    Hooks(Box<HookList>),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -25,13 +25,16 @@ mod handover;
 pub use handover::HandOver;
 mod harness;
 pub use citations::{CitationQueryError, VisibleCitations, visible_citations_at};
+use task_board_history::ConversationChange;
+pub use task_board_history::{TaskBoardQueryError, task_boards_at};
 
 pub use harness::{
-    CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, PersonWait, PersonWaitKind,
-    Quiescence, SearchDefaults, SubagentLaunch, ToolPolicy, WaitHosting, Waits,
+    AutoReviewModel, CitationStyle, DeliveryBinding, HarnessOptions, HarnessSeams, PersonWait,
+    PersonWaitKind, Quiescence, SearchDefaults, SubagentLaunch, ToolPolicy, WaitHosting, Waits,
     durable_chat_host_rules,
 };
 mod hook_transcript;
+mod hooks;
 mod host_context;
 mod host_notes;
 pub mod host_tools;
@@ -51,6 +54,7 @@ mod model_request;
 mod persistence;
 mod remote_skills;
 mod scheduled_tasks;
+mod secret_redaction;
 mod timing;
 pub use scheduled_tasks::{NewScheduledTask, ScheduledTaskEdit};
 pub mod session_mcp;
@@ -101,18 +105,22 @@ mod shell_description;
 mod shell_task_center;
 mod suspension;
 mod system_prompt;
+mod tick_changes;
 mod tool_batch;
 mod tool_execution;
 pub mod tool_exposure;
+mod tool_input;
 mod tool_results;
 pub mod upgrade;
 mod web_fetch;
 use tool_batch::{BatchExit, RunStart, ToolBatch};
 use tool_execution::{ToolCallOutcome, ToolInvocation, ToolRegistry};
+mod command_skills;
 mod commands;
 mod permission_management;
 mod plan;
 mod shared_tasks;
+mod task_board_history;
 mod tick_content;
 mod tick_subscriptions;
 mod tick_trim;
@@ -124,8 +132,8 @@ pub use wakeup::{TestSourceState, trigger_pauses};
 mod web_provenance;
 pub use event_sources::ExternalDelivery;
 pub use turn::{
-    Delivery, MessageId, ParentSelection, QuestionReply, SkillInvocation, Turn, TurnOp,
-    TurnOutcome, TurnRequest, TurnWait, UserMessage,
+    Delivery, MessageId, ParentSelection, PermissionReply, QuestionReply, SkillInvocation, Turn,
+    TurnOp, TurnOutcome, TurnRequest, TurnWait, UserMessage,
 };
 mod user_shell;
 #[cfg(test)]
@@ -154,6 +162,7 @@ use tickloop_harness_base::output_style::OutputStyle;
 use tickloop_harness_model::{
     ModelClient, ModelConfigExt, ModelError, ModelFailureKind, ModelRequest, ModelResponseRejection,
 };
+use tickloop_harness_protocol::ToolResult;
 use tickloop_harness_protocol::local_messages;
 use tickloop_harness_protocol::{
     AgentHostOptions, AgentMessageSource, ApprovalAssessmentDetails, ApprovalFailureKind,
@@ -165,8 +174,9 @@ use tickloop_harness_protocol::{
     OperationState, PendingCommand, PendingInput, PermissionApprovalSource, PermissionExecution,
     PermissionPolicy, PermissionRequest, PermissionRule, PermissionScope, PromptPolicy,
     QueuedInput, QueuedInputKind, ReasoningEffort, Receipt, RequestOutcome, RequestUsageLedger,
-    ResponseRejection, Role, RunId, SubagentRegistration, TaskNotification, TriggerSource, Usage,
-    UserShellRecord, UserShellState, VerdictEvidence, projection,
+    ResponseRejection, Role, RunId, SUBAGENT_HANDBACK_TOOL_NAME, SubagentRegistration,
+    TaskNotification, TriggerSource, Usage, UserShellRecord, UserShellState, VerdictEvidence,
+    projection,
 };
 use tickloop_harness_tools::permissions::SessionPermissionDecision;
 use tickloop_harness_tools::{
@@ -181,6 +191,9 @@ const MAX_RESPONSE_CONTINUATIONS: usize = 3;
 const OUTPUT_LIMIT_CONTINUATION_PROMPT: &str = "Output token limit hit. Continue directly from the unfinished response without repeating or summarizing it. Break the remaining work into smaller pieces.";
 const STREAM_INTERRUPTION_CONTINUATION_PROMPT: &str = "The response stream was interrupted. Continue directly from the unfinished response without repeating or summarizing it.";
 const SHELL_STATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+/// A Session grant lives only in the process that records it, so a durable wait refuses one.
+const DURABLE_PERMISSION_SCOPES: &str =
+    "a permission a Run waits on durably is allowed once or persistently";
 
 pub use agent_messages::LIST_SUBAGENTS_TOOL_NAME;
 pub use delegation::MAX_SUBAGENT_HANDLE_CHARACTERS;
@@ -391,6 +404,7 @@ struct Inner {
     environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
     tool_policy: ToolPolicy,
     citation_style: CitationStyle,
+    auto_review_model: AutoReviewModel,
     host_rules: Vec<PermissionRule>,
     /// The host's own section of every conversation's system prompt.
     system_prompt_addition: Option<String>,
@@ -446,10 +460,20 @@ struct ChatBookkeeping {
     /// records for a load to restore.
     #[serde(default)]
     loop_state_views: BTreeMap<usize, serde_json::Value>,
+    /// Changes the user made to the Chat's hosted Ticks since the model was last told.
+    #[serde(default)]
+    user_tick_changes: Vec<tick_changes::UserTickChange>,
+    /// How each hosted Tick the Chat opened stood when the model last knew it.
+    #[serde(default)]
+    told_tick_states: BTreeMap<tick_protocol::InstanceRef, tick_changes::ToldTickState>,
     /// The model and private history source of each assistant message that a later version
     /// recorded with values this version does not know, kept as written for its entry.
     #[serde(default)]
     later_provenance: BTreeMap<usize, persistence::LaterProvenance>,
+    /// What each call of a batch that has not returned ended with, which a load restores from
+    /// the Transcript: the batch goes on after its Run waited without making them again.
+    #[serde(skip)]
+    nested_outcomes: nested_calls::RecordedNestedCalls,
     /// Project partition (normalized working directory) owning each persistent rule in the rule
     /// set; deletions and modifications are written back to that partition.
     persistent_rule_projects: BTreeMap<Uuid, PathBuf>,
@@ -471,6 +495,14 @@ struct ChatBookkeeping {
     lifecycle: lifecycle::Lifecycle,
     /// The answer each message is part of.
     message_responses: BTreeMap<usize, tickloop_harness_protocol::ResponseId>,
+    /// The root Chat's task boards as they stood at the end of each message they were recorded
+    /// at, which its Transcript keeps as task board checkpoints.
+    #[serde(default)]
+    task_board_checkpoints: BTreeMap<usize, task_board_history::TaskBoards>,
+    /// Whether the Chat's Transcript records task board checkpoints; one from before them keeps
+    /// its board when the conversation moves.
+    #[serde(default)]
+    has_task_board_checkpoints: bool,
 }
 
 /// What a Subagent's Chat takes from its parent's.
@@ -512,6 +544,9 @@ struct Chat {
     /// Run leaves this instance without writing anything; it goes on wherever the Chat loads next.
     releases: HashMap<RunId, CancellationToken>,
     ready_runs: VecDeque<RunId>,
+    /// The calls a person allowed while their rebuilt Run waited durably, by Run and call: the
+    /// Run prepares each again where it waited, and the same call runs without asking again.
+    permission_grants: HashMap<(RunId, String), suspension::PermissionGrant>,
     client: Arc<dyn ModelClient>,
     pending_client: Option<Arc<dyn ModelClient>>,
     pending_model_thinking: Option<PendingModelThinking>,
@@ -525,6 +560,7 @@ struct Chat {
     /// Shared with the tool registry of each model request, whose Skill calls expand against the
     /// listing that request sent even when the Chat's Skills are read again meanwhile.
     skills: Arc<tickloop_harness_policy::skills::SkillRegistry>,
+    user_skill_preparations: HashMap<RunId, command_skills::UserSkillPreparation>,
     /// Following Claude Code, replacement decisions are kept only at runtime and rebuilt from
     /// content replacement entries in the Transcript on resume.
     content_replacements: tool_results::ContentReplacementState,
@@ -572,6 +608,8 @@ struct Chat {
     goal_clock_ms: u64,
     /// What keeps this Chat's prompt cache prefix stable, kept only in this process.
     cache_prefix: cache_prefix::CachePrefixState,
+    /// What the hook engine keeps for the Chat in this process.
+    hook_state: hooks::ChatHookState,
 }
 
 enum RunAdmission {
@@ -610,7 +648,7 @@ struct SubmissionOptions {
     trigger_lease: Option<(loop_lease::LeaseHolding, loop_lease::TriggerBoundary)>,
     /// The source's own change for the delivery, made as it is accepted.
     trigger_commit: Option<wakeup::SourceCommit>,
-    invoked_skill: Option<tickloop_harness_protocol::InvokedSkill>,
+    invoked_skill: Option<tickloop_harness_policy::skills::SkillExpansion>,
     /// What the user's `/loop` schedules, when the input is one.
     user_loop: Option<tickloop_harness_policy::loop_skill::LoopSchedule>,
     /// The Run the input is answered by, when its caller chose it ahead.
@@ -687,11 +725,78 @@ fn taken_elsewhere(chat: &Chat, pending: &PendingInput) -> Option<TriggerTake> {
         .then_some(TriggerTake::Waits)
 }
 
+/// The user's text in input order, excluding the material attached to the prompt.
+fn user_prompt_text(pending: &PendingInput) -> String {
+    std::iter::once(pending.input.as_str())
+        .chain(pending.contexts.iter().filter_map(|context| match context {
+            InputContext::PromptText { text } => Some(text.as_str()),
+            _ => None,
+        }))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The input queued to the Run `active`'s Loop that joins its conversation before the next model
+/// request, in queue order. Trigger input waits for the turn to end, user input queued behind a
+/// `!` command or slash command waits for it, and so do prompts a `UserPromptSubmit` hook held
+/// and the prompts queued after them.
+fn mergeable_inputs<'chat>(chat: &'chat Chat, active: &Receipt) -> Vec<&'chat PendingInput> {
+    let snapshot = &chat.snapshot;
+    let queue_barrier = snapshot
+        .user_shells
+        .iter()
+        .filter(|record| record.state == UserShellState::Queued && record.armed)
+        .map(|record| record.queued_sequence)
+        .chain(
+            snapshot
+                .pending_commands
+                .iter()
+                .map(|command| command.queued_sequence),
+        )
+        .min();
+    let mut is_behind_held_prompt = false;
+    let mut mergeable = Vec::new();
+    for pending in &snapshot.pending_inputs {
+        if !pending.armed
+            || pending.trigger_source.is_some()
+            || pending.receipt.loop_id != active.loop_id
+            || (pending.agent_message.is_none()
+                && queue_barrier.is_some_and(|sequence| pending.queued_sequence >= sequence))
+        {
+            continue;
+        }
+        if pending.is_skill_invocation
+            && match chat.user_skill_preparations.get(&pending.receipt.run_id) {
+                Some(command_skills::UserSkillPreparation::Pending(expansion)) => {
+                    !expansion.shell_commands.is_empty()
+                }
+                Some(command_skills::UserSkillPreparation::Started) => true,
+                Some(command_skills::UserSkillPreparation::Complete) => false,
+                None => {
+                    !command_skills::user_skill_prepared_without_shell(chat, pending.receipt.run_id)
+                }
+            }
+        {
+            is_behind_held_prompt = true;
+        }
+        if hooks::is_user_prompt(pending) {
+            is_behind_held_prompt |= chat.hook_state.session.holds_prompt(pending.receipt.run_id);
+            if is_behind_held_prompt {
+                continue;
+            }
+        }
+        mergeable.push(pending);
+    }
+    mergeable
+}
+
 /// Queues a Run that continues the conversation without a message of its own.
 fn queue_continuation(chat: &mut Chat, receipt: Receipt) {
     chat.snapshot.last_queue_sequence += 1;
     let queued_sequence = chat.snapshot.last_queue_sequence;
     chat.snapshot.pending_inputs.push(PendingInput {
+        skill_guidance: None,
         receipt,
         input: String::new(),
         contexts: Vec::new(),
@@ -745,12 +850,18 @@ struct PermissionPrompt {
     source: PermissionApprovalSource,
     reason: Option<String>,
     mcp_server: Option<String>,
+    /// What the call reaches, which an approval given for it is bound to.
+    target: Option<String>,
+    /// What the call's `PreToolUse` hooks decided, which its wait keeps.
+    hooks: Option<tickloop_harness_transcript::HookPreparation>,
 }
 
 struct PendingApproval {
     sender: oneshot::Sender<PermissionAnswer>,
     owner: PermissionOwner,
-    operation: SessionPermissionOperation,
+    /// What a Session grant covers; `None` for a permission a rebuilt Run waits on, whose call is
+    /// prepared again only once the person allowed it.
+    operation: Option<SessionPermissionOperation>,
 }
 
 #[derive(Clone, Debug)]
@@ -1193,13 +1304,7 @@ impl Agent {
         folder: Option<&Path>,
     ) -> Arc<tickloop_harness_policy::skills::SkillRegistry> {
         Arc::new(self.inner.settings.as_ref().map_or_else(
-            || {
-                if folder.is_some() {
-                    tickloop_harness_policy::skills::SkillRegistry::builtin()
-                } else {
-                    tickloop_harness_policy::skills::SkillRegistry::builtin_without_ticks()
-                }
-            },
+            tickloop_harness_policy::skills::SkillRegistry::builtin,
             |settings| settings.skills(folder),
         ))
     }
@@ -1330,43 +1435,91 @@ impl Agent {
         &self,
         receipt: &Receipt,
         skills: &tickloop_harness_policy::skills::SkillRegistry,
-        input: &serde_json::Value,
-    ) -> Result<tickloop_harness_protocol::ToolResult, String> {
-        #[derive(Deserialize)]
+        operation: &OperationRecord,
+        assistant_message_id: Uuid,
+        cancel: CancellationToken,
+    ) -> Result<ToolResult, String> {
+        #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct SkillInput {
             skill: String,
             args: Option<String>,
         }
-
-        let input = serde_json::from_value::<SkillInput>(input.clone()).map_err(|error| {
-            format!(
-                "invalid {} input: {error}",
-                tickloop_harness_policy::skills::SKILL_TOOL_NAME
-            )
-        })?;
+        let input: SkillInput = serde_json::from_value(operation.input.clone())
+            .map_err(|error| format!("invalid Skill input: {error}"))?;
         if input.skill.starts_with("tickloop-artifacts:") {
             return self
                 .remote_skill_tool(receipt, &input.skill, input.args.as_deref().unwrap_or(""))
                 .await;
         }
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats
-            .get_mut(&receipt.chat_id)
-            .ok_or_else(|| "chat is unavailable".to_string())?;
-        let invoked = skills
+        let mut expanded = skills
             .expand(
                 &input.skill,
                 input.args.as_deref().unwrap_or(""),
                 tickloop_harness_policy::skills::SkillCaller::Model,
             )
-            .and_then(tickloop_harness_protocol::InvokedSkill::try_from)
+            .map_err(|error| error.to_string())?;
+        if !expanded.shell_commands.is_empty() {
+            let scope = self
+                .nested_calls(
+                    receipt,
+                    assistant_message_id,
+                    operation.call_id.clone(),
+                    false,
+                    &cancel,
+                )
+                .await?;
+            let mut outputs = Vec::new();
+            let mut failure = None;
+            for (index, shell) in expanded.shell_commands.iter().enumerate() {
+                let child = cancel.child_token();
+                let outcome = scope
+                    .execute(
+                        index,
+                        "Bash".into(),
+                        command_skills::shell_input(&expanded.name, &shell.command),
+                        child.clone(),
+                    )
+                    .await
+                    .map_err(|error| error.message)?;
+                let result = self
+                    .skill_shell_output(receipt, &outcome.call_id, &outcome.result)
+                    .await;
+                if outcome.status != tickloop_harness_transcript::NestedCallStatus::Completed
+                    || result.is_err()
+                {
+                    child.cancel();
+                    failure = Some(
+                        result
+                            .err()
+                            .unwrap_or_else(|| outcome.result.content.clone()),
+                    );
+                    break;
+                }
+                outputs.push(result.unwrap());
+            }
+            scope.finish().await;
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            expanded
+                .complete_shells(&outputs)
+                .map_err(|error| error.to_string())?;
+        }
+        let invoked = tickloop_harness_protocol::InvokedSkill::try_from(expanded)
             .map_err(|error| error.to_string())?;
         let name = invoked.name.clone();
         let origin = invoked.source.display_label();
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats
+            .get_mut(&receipt.chat_id)
+            .ok_or("chat is unavailable")?;
+        if cancel.is_cancelled() {
+            return Err("Skill preparation cancelled; guidance was not activated".into());
+        }
         let changed = record_invoked_skill(chat, invoked);
         self.save(&chat.snapshot);
-        Ok(tickloop_harness_protocol::ToolResult {
+        Ok(ToolResult {
             content: if changed {
                 format!("Launching skill: {name} [{origin}]")
             } else {
@@ -1472,7 +1625,7 @@ impl Agent {
                         .is_some_and(|provider| provider.remote_skill_is_current(&skill.source))
                 }
                 tickloop_harness_protocol::SkillSource::BuiltIn
-                    if skill.name == "artifact-draft" =>
+                    if matches!(skill.name.as_str(), "artifact-draft" | "tickloop") =>
                 {
                     false
                 }
@@ -1524,10 +1677,13 @@ impl Agent {
         prepared_facts: Option<tickloop_harness_protocol::PreparedApprovalFacts>,
         cancel: CancellationToken,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
-        self.review_operation(receipt, operation, prepared_facts, cancel, true)
+        self.review_operation(receipt, operation, prepared_facts, cancel, true, false)
             .await
     }
 
+    /// Reviews `operation` in the Chat's Folder, or, for a `remote` call, without one when the
+    /// Chat has none: the context then names no working directory, and Auto policy entries
+    /// scoped to a directory do not apply.
     async fn review_operation(
         &self,
         receipt: &Receipt,
@@ -1535,6 +1691,7 @@ impl Agent {
         prepared_facts: Option<tickloop_harness_protocol::PreparedApprovalFacts>,
         cancel: CancellationToken,
         emit_permission: bool,
+        remote: bool,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
         let (snapshot, bookkeeping, chat_client, boundary_id, root_goal, local_folder) = {
             let chats = self.inner.chats.lock().await;
@@ -1618,7 +1775,8 @@ impl Agent {
         };
         // The review reads the Folder's context on this machine, which a Folder only in the
         // Execution Environment does not have.
-        let Some(folder) = local_folder else {
+        let folder = local_folder;
+        if folder.is_none() && !remote {
             let reason =
                 "This Chat has no Folder to review this action in; review it manually.".to_owned();
             if emit_permission {
@@ -1633,7 +1791,7 @@ impl Agent {
                     failure: ApprovalFailureKind::Configuration,
                 },
             ));
-        };
+        }
         let ids = self.chat_ids(snapshot.id).await;
         let context = approval_context::capture(
             &ids,
@@ -1642,8 +1800,11 @@ impl Agent {
             operation,
             root_goal.as_ref(),
             legacy,
-            &folder,
-            auto_settings.policy_for_directory(&folder),
+            folder.as_deref(),
+            match &folder {
+                Some(folder) => auto_settings.policy_for_directory(folder),
+                None => auto_settings.policy(),
+            },
         );
         let mut context = match context {
             Ok(context) => context,
@@ -1715,7 +1876,12 @@ impl Agent {
             facts
         });
         let preferred = auto_settings.reviewer;
-        let configured_reviewer = self.inner.auto_reviewer.lock().await.clone();
+        // The Chat's own model reviews in place of any other when the host chose it, with the
+        // client this review captured from the Chat: whatever model the Chat uses now.
+        let configured_reviewer = match self.inner.auto_review_model {
+            AutoReviewModel::Configured => self.inner.auto_reviewer.lock().await.clone(),
+            AutoReviewModel::ChatModel => Some(chat_client.clone()),
+        };
         let has_isolated_reviewer = configured_reviewer.is_some();
         let has_judgment_adapter = self.inner.judgment.lock().await.is_some();
         let llm_client = if let Some(client) = configured_reviewer {
@@ -1743,8 +1909,11 @@ impl Agent {
                 crate::context::context_window(&snapshot),
             )
         };
-        let use_jev = preferred == tickloop_harness_protocol::AutoReviewerPreference::Jev
-            || (has_judgment_adapter && !has_isolated_reviewer);
+        // The Chat's own model is the only reviewer the host chose: Jev is neither bound, asked
+        // nor fallen back from.
+        let use_jev = self.inner.auto_review_model == AutoReviewModel::Configured
+            && (preferred == tickloop_harness_protocol::AutoReviewerPreference::Jev
+                || (has_judgment_adapter && !has_isolated_reviewer));
         let assess = |run: auto_approval::ReviewerRun,
                       fallback_from: Option<ApprovalReviewerKind>,
                       fallback_failure: Option<ApprovalFailureKind>,
@@ -1950,6 +2119,22 @@ impl Agent {
         let operations = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+            if let Some(run) = chat.active_run
+                && chat.hook_state.session.preparing_inputs.contains_key(&run)
+            {
+                for pending in &mut chat.snapshot.pending_inputs {
+                    if pending.receipt.loop_id == chat.snapshot.chat_loop.id
+                        && hooks::is_user_prompt(pending)
+                    {
+                        pending.armed = false;
+                        chat.bookkeeping
+                            .lifecycle
+                            .set_queued_armed(pending.receipt.run_id, false);
+                    }
+                }
+                chat.hook_state.session.paused_preparations.insert(run);
+                self.save(&chat.snapshot);
+            }
             chat.interrupt()
         };
         self.pause_goal(chat_id, goal::state::GoalEvent::Interrupted)
@@ -1973,7 +2158,15 @@ impl Agent {
             queued.id == run_id && queued.armed && queued.kind == QueuedInputKind::Message
         });
         let has_work_ahead = chat.active.is_some() || !chat.parked.is_empty();
-        if !is_queued_message || !has_work_ahead {
+        let is_preparing = chat.active_run.is_some_and(|active| {
+            chat.hook_state
+                .session
+                .preparing_inputs
+                .get(&active)
+                .is_some_and(|inputs| inputs.contains(&run_id))
+        });
+        if !is_queued_message || !has_work_ahead || chat.active_run == Some(run_id) || is_preparing
+        {
             return Ok(Vec::new());
         }
         Ok(chat.interrupt())
@@ -2042,7 +2235,11 @@ impl Agent {
             .lock()
             .await
             .values()
-            .map(|chat| chat.snapshot.clone())
+            .map(|chat| {
+                let mut snapshot = chat.snapshot.clone();
+                chat.project_pending_input_eligibility(&mut snapshot.pending_inputs);
+                snapshot
+            })
             .collect()
     }
 
@@ -2132,6 +2329,7 @@ impl Agent {
             waits,
             system_prompt_addition,
             citation_style,
+            auto_review_model,
             request_gates,
             time_zone,
             scheduled_task_expiry,
@@ -2201,6 +2399,7 @@ impl Agent {
                 environment,
                 tool_policy,
                 citation_style,
+                auto_review_model,
                 host_rules,
                 system_prompt_addition,
                 web_search_settings,
@@ -2267,28 +2466,51 @@ impl Agent {
         })
     }
 
-    fn apply_prompt_policy(&self, decision: Decision) -> Decision {
-        match (self.inner.host_options.prompt_policy, decision) {
+    /// The prompt policy a model tool call's approval is decided under. A call an `ExecuteTools`
+    /// batch makes waits durably as any call does: the batch makes its calls one at a time, so
+    /// one that waits suspends the whole Run at its place in the batch. Any other call made
+    /// inside another call, or while a user's command prepares its input, has no place in a
+    /// tool batch to go on from, so it cannot wait durably: its approval is denied as on a host
+    /// that denies whatever would prompt.
+    fn tool_prompt_policy(&self) -> PromptPolicy {
+        let has_no_batch_place = nested_calls::is_nested() && !nested_calls::waits_durably()
+            || command_skills::input_message_id().is_some();
+        match self.inner.host_options.prompt_policy {
+            PromptPolicy::DurableApproval if has_no_batch_place => PromptPolicy::DenyOnPrompt,
+            policy => policy,
+        }
+    }
+
+    /// The prompt policy of every prompt other than a model tool call's approval.
+    fn other_prompt_policy(&self) -> PromptPolicy {
+        self.inner
+            .host_options
+            .prompt_policy
+            .without_durable_approval()
+    }
+
+    fn apply_prompt_policy(policy: PromptPolicy, decision: Decision) -> Decision {
+        match (policy, decision) {
             (PromptPolicy::DenyOnPrompt, Decision::Ask) => Decision::Deny,
             (PromptPolicy::Unrestricted, Decision::Ask | Decision::Check) => Decision::Allow,
             _ => decision,
         }
     }
 
-    /// `apply_prompt_policy`, except that an Unrestricted host cannot waive a person or a reviewer
-    /// that an explicit Ask rule or the tool's own permission class requires.
+    /// `apply_prompt_policy` under `policy`, except that an Unrestricted host cannot waive a person
+    /// or a reviewer that an explicit Ask rule or the tool's own permission class requires.
     fn apply_prompt_policy_keeping_required_approval(
-        &self,
+        policy: PromptPolicy,
         decision: Decision,
         is_approval_required: bool,
     ) -> Decision {
         if is_approval_required
             && matches!(decision, Decision::Ask | Decision::Check)
-            && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted
+            && policy == PromptPolicy::Unrestricted
         {
             decision
         } else {
-            self.apply_prompt_policy(decision)
+            Self::apply_prompt_policy(policy, decision)
         }
     }
 
@@ -2296,7 +2518,7 @@ impl Agent {
     /// host that cannot ask. Review runs under an Unrestricted host only for calls that host
     /// cannot waive, so their escalation still reaches a person.
     fn review_escalation(&self) -> Decision {
-        if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt {
+        if self.tool_prompt_policy() == PromptPolicy::DenyOnPrompt {
             Decision::Deny
         } else {
             Decision::Ask
@@ -2584,6 +2806,7 @@ impl Agent {
             self.record_delegation(id, metadata.clone(), snapshot.search_config.clone());
         }
         self.save(&snapshot);
+        let is_root = snapshot.delegation.is_none();
         chats.insert(
             id,
             NewChat {
@@ -2601,7 +2824,27 @@ impl Agent {
             }
             .into_chat(),
         );
+        if let Some(chat) = chats.get_mut(&id) {
+            chat.hook_state =
+                hooks::ChatHookState::starting_session(is_root, hooks::SessionSource::Startup);
+        }
         Ok(id)
+    }
+
+    /// Marks the new root Chat `chat_id` as started by `/clear`: its first model request runs
+    /// the `SessionStart` hooks for `clear` instead of `startup`.
+    pub async fn start_session_after_clear(&self, chat_id: ChatId) -> Result<(), AgentError> {
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        if chat.snapshot.delegation.is_some() {
+            return Err(AgentError::Invalid(
+                "only a root Chat starts a session".into(),
+            ));
+        }
+        chat.hook_state
+            .session
+            .start_session(hooks::SessionSource::Clear);
+        Ok(())
     }
 
     pub async fn submit(&self, chat_id: ChatId, input: String) -> Result<Receipt, AgentError> {
@@ -2672,7 +2915,10 @@ impl Agent {
                     &skill.arguments,
                     tickloop_harness_policy::skills::SkillCaller::User,
                 )
-                .and_then(tickloop_harness_protocol::InvokedSkill::try_from)
+                .and_then(|expanded| {
+                    expanded.validate()?;
+                    Ok(expanded)
+                })
                 .map_err(|error| AgentError::Invalid(error.to_string()))?
         };
         let input = if skill.arguments.trim().is_empty() {
@@ -2781,7 +3027,10 @@ impl Agent {
             arguments,
             tickloop_harness_policy::skills::SkillCaller::User,
         )
-        .and_then(tickloop_harness_protocol::InvokedSkill::try_from)
+        .and_then(|expanded| {
+            expanded.validate()?;
+            Ok(expanded)
+        })
         .map(|_| ())
         .map_err(|error| AgentError::Invalid(error.to_string()))
     }
@@ -3067,6 +3316,11 @@ impl Agent {
                 "the goal's continuation waits for the Chat's background work".into(),
             ));
         }
+        let live = if turn.placement.is_some() || turn.branch.is_some() {
+            shared_tasks::live_runs(chats.values())
+        } else {
+            Default::default()
+        };
         let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         if original.family_stopping {
             return Err(AgentError::Invalid("Subagent subtree is stopping".into()));
@@ -3095,9 +3349,23 @@ impl Agent {
         let inherit_branch_session = continues_chat && base.snapshot.branch_origin.is_some();
         let mut candidate = base.clone();
         Self::prepare_cut(base, &mut candidate, cut)?;
-        let board_cleared = matches!(turn.placement, Some(turn::Placement::Replacing(_)))
-            && shared_tasks::clear_board_for_new_answer(&mut candidate)
-                .map_err(AgentError::Invalid)?;
+        let board_moved = if cut.is_some() || staged.is_some() {
+            let change = match turn.placement {
+                Some(turn::Placement::Replacing(_)) => ConversationChange::NewAnswer,
+                _ => ConversationChange::Moved,
+            };
+            let before = cut.map_or(candidate.snapshot.messages.len(), |(index, _)| index);
+            task_board_history::follow_conversation(
+                &mut candidate.snapshot,
+                &mut candidate.bookkeeping,
+                before,
+                change,
+                &live,
+            )
+            .map_err(AgentError::Invalid)?
+        } else {
+            false
+        };
         let chat = &mut candidate;
         let is_skill_invocation = invoked_skill.is_some();
         let loop_id = chat.snapshot.chat_loop.id;
@@ -3117,20 +3385,35 @@ impl Agent {
         if let Some(user_loop) = user_loop {
             chat.user_loops.insert(run_id.into(), user_loop);
         }
-        if let Some(mut invoked_skill) = invoked_skill {
+        let mut skill_guidance = None;
+        if let Some(invoked_skill) = invoked_skill {
             chat.snapshot.user_skill_invocations.insert(
                 run_id.into(),
                 tickloop_harness_protocol::UserSkillInvocation {
                     name: invoked_skill.name.clone(),
                     source: invoked_skill.source.clone(),
+                    prepared_without_shell: false,
                 },
             );
-            if invoked_skill.source == tickloop_harness_protocol::SkillSource::BuiltIn
-                && chat.skills.is_user_only(&invoked_skill.name)
-            {
-                invoked_skill.run_id = Some(run_id.into());
+            if invoked_skill.shell_commands.is_empty() {
+                let mut invoked = tickloop_harness_protocol::InvokedSkill::try_from(invoked_skill)
+                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
+                if invoked.source == tickloop_harness_protocol::SkillSource::BuiltIn
+                    && chat.skills.is_user_only(&invoked.name)
+                {
+                    invoked.run_id = Some(run_id.into());
+                }
+                skill_guidance = Some(invoked);
+                chat.user_skill_preparations.insert(
+                    run_id.into(),
+                    command_skills::UserSkillPreparation::Complete,
+                );
+            } else {
+                chat.user_skill_preparations.insert(
+                    run_id.into(),
+                    command_skills::UserSkillPreparation::Pending(Box::new(invoked_skill)),
+                );
             }
-            record_invoked_skill(chat, invoked_skill);
         } else if trigger_source.is_none() && agent_message.is_none() {
             carry_user_skills_past_sign_in(chat, loop_id, run_id.into());
         }
@@ -3140,7 +3423,6 @@ impl Agent {
             let execution = chat.execution.clone();
             recovery::before_resume(
                 &mut chat.snapshot,
-                loop_id,
                 self.inner.config_root.as_deref(),
                 &execution,
             )?;
@@ -3201,6 +3483,7 @@ impl Agent {
         let queued_sequence = chat.snapshot.last_queue_sequence;
         let directed_origin = directed_human.clone();
         let queued = PendingInput {
+            skill_guidance,
             receipt: receipt.clone(),
             input,
             contexts,
@@ -3214,6 +3497,9 @@ impl Agent {
             is_skill_invocation,
             attached_file_reads,
         };
+        if hooks::is_user_prompt(&queued) {
+            hooks::resume_prompt_inputs(chat, self.inner.waits);
+        }
         chat.bookkeeping.lifecycle.accept(&ledger, &queued);
         chat.snapshot.pending_inputs.insert(index, queued);
         if let Some(feedback_input) = feedback_input {
@@ -3251,7 +3537,7 @@ impl Agent {
         {
             self.emit_conversation_rewound(original, leaf);
         }
-        if board_cleared {
+        if board_moved {
             self.queue_task_boards(original);
         }
         if turn.send_now && (original.active.is_some() || !original.parked.is_empty()) {
@@ -3271,7 +3557,7 @@ impl Agent {
         if let (Some(mut context), Some(candidate)) = (session_context, session_candidate) {
             *context = candidate;
         }
-        if board_cleared {
+        if board_moved {
             self.publish_task_board(&mut chats, chat_id, loop_id);
         }
         drop(chats);
@@ -3407,14 +3693,25 @@ impl Agent {
                 )
             });
         let timing = timing::Phase::new("announce_loop_state");
-        Box::pin(self.announce_loop_state(receipt)).await?;
+        Box::pin(self.announce_loop_state(receipt, &cancel)).await?;
         drop(timing);
         let timing = timing::Phase::new("announce_guidance");
         Box::pin(self.announce_guidance(receipt)).await?;
         drop(timing);
+        if registry
+            .resolve(tickloop_harness_tools::BASH_TOOL_NAME)
+            .is_some()
+        {
+            let timing = timing::Phase::new("announce_environment_guidance");
+            Box::pin(self.announce_environment_guidance(receipt, &cancel)).await?;
+            drop(timing);
+        }
         let user_context = self.user_context(receipt.chat_id).await?;
         let timing = timing::Phase::new("announce_date_change");
         Box::pin(self.announce_date_change(receipt)).await?;
+        drop(timing);
+        let timing = timing::Phase::new("announce_session_start");
+        Box::pin(self.announce_session_start(receipt, &cancel)).await?;
         drop(timing);
         let prefix = {
             let mut chats = self.inner.chats.lock().await;
@@ -3601,60 +3898,77 @@ impl Agent {
         Ok(response.output)
     }
 
+    /// Takes the input queued to the Run `active`'s Loop into its conversation before its next
+    /// model request. Each prompt among it runs its `UserPromptSubmit` hooks first, outside the
+    /// Chat's lock: a blocked prompt is taken back out of the conversation as it joins, and a
+    /// held one waits for a turn of its own.
     async fn merge_queued_messages(&self, active: &Receipt) -> Result<(), AgentError> {
+        // Input queued before an interruption is answered by the run that follows it.
+        let takes_in_input = |chat: &Chat| {
+            chat.active_run == Some(active.run_id)
+                && !chat.user_cancelled_runs.contains(&active.run_id)
+        };
+        let mut chats = self.inner.chats.lock().await;
+        let (merging, prompts, cancel) = {
+            let chat = chats.get(&active.chat_id).ok_or(AgentError::NotFound)?;
+            if !takes_in_input(chat) {
+                return Ok(());
+            }
+            let merging = mergeable_inputs(chat, active);
+            if merging.is_empty() {
+                return Ok(());
+            }
+            let prompts = merging
+                .iter()
+                .filter(|pending| hooks::is_user_prompt(pending))
+                .map(|pending| (pending.receipt.run_id, user_prompt_text(pending)))
+                .collect::<Vec<_>>();
+            let merging = merging
+                .iter()
+                .map(|pending| pending.receipt.run_id)
+                .collect::<HashSet<_>>();
+            (merging, prompts, chat.run_cancel(active.run_id).cloned())
+        };
+        let mut checked = HashMap::new();
+        if !prompts.is_empty() {
+            drop(chats);
+            let Some(cancel) = cancel else {
+                return Ok(());
+            };
+            let Some(verdicts) = self.check_queued_prompts(active, prompts, &cancel).await else {
+                return Ok(());
+            };
+            checked = verdicts;
+            chats = self.inner.chats.lock().await;
+        }
         let events = {
-            let mut chats = self.inner.chats.lock().await;
             let original = chats.get_mut(&active.chat_id).ok_or(AgentError::NotFound)?;
-            // Input queued before an interruption is answered by the run that follows it.
-            if original.active_run != Some(active.run_id)
-                || original.user_cancelled_runs.contains(&active.run_id)
-            {
+            if !takes_in_input(original) {
                 return Ok(());
             }
             let mut candidate = original.clone();
-            let queue_barrier = candidate
-                .snapshot
-                .user_shells
-                .iter()
-                .filter(|record| record.state == UserShellState::Queued && record.armed)
-                .map(|record| record.queued_sequence)
-                .chain(
-                    candidate
-                        .snapshot
-                        .pending_commands
-                        .iter()
-                        .map(|command| command.queued_sequence),
-                )
-                .min();
-            let merge_indexes = candidate
-                .snapshot
-                .pending_inputs
-                .iter()
-                .enumerate()
-                .filter(|(_, pending)| {
-                    // Trigger input waits for the turn to end.
-                    pending.armed
-                        && pending.trigger_source.is_none()
-                        && pending.receipt.loop_id == active.loop_id
-                        && (pending.agent_message.is_some()
-                            || queue_barrier
-                                .is_none_or(|sequence| pending.queued_sequence < sequence))
-                })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            if merge_indexes.is_empty() {
+            let mut joining = Vec::new();
+            let mut blocked = Vec::new();
+            let mut retained = Vec::new();
+            for pending in std::mem::take(&mut candidate.snapshot.pending_inputs) {
+                if !merging.contains(&pending.receipt.run_id) {
+                    retained.push(pending);
+                } else if !hooks::is_user_prompt(&pending) {
+                    joining.push((pending, Vec::new()));
+                } else {
+                    match checked.remove(&pending.receipt.run_id) {
+                        Some(hooks::QueuedPrompt::Joins(notes)) => joining.push((pending, notes)),
+                        Some(hooks::QueuedPrompt::Blocked) => blocked.push(pending),
+                        None => retained.push(pending),
+                    }
+                }
+            }
+            candidate.snapshot.pending_inputs = retained;
+            if joining.is_empty() && blocked.is_empty() {
                 return Ok(());
             }
-            let merged = merge_indexes
-                .into_iter()
-                .rev()
-                .map(|index| candidate.snapshot.pending_inputs.remove(index))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>();
-            let mut events = Vec::with_capacity(merged.len());
-            for pending in merged {
+            let mut events = Vec::with_capacity(joining.len());
+            for (pending, notes) in joining {
                 let receipt = pending.receipt.clone();
                 if pending.agent_message.is_none() {
                     self.merge_host_context(active, &receipt);
@@ -3666,25 +3980,12 @@ impl Agent {
                         skill.run_id = Some(active.run_id);
                     }
                 }
-                let index = candidate.snapshot.messages.len();
-                self.append_input_message(&mut candidate, pending);
-                if let Some(response) = candidate
-                    .bookkeeping
-                    .lifecycle
-                    .active_response(active.run_id)
-                    && index < candidate.snapshot.messages.len()
-                {
-                    candidate
-                        .bookkeeping
-                        .message_responses
-                        .insert(index, response);
-                }
-                self.settle_input(
+                self.append_merged_input(&mut candidate, active, pending);
+                hooks::append_hook_notes(
                     &mut candidate,
-                    receipt.run_id,
-                    SettledOutcome::Merged {
-                        into: active.run_id.into(),
-                    },
+                    active,
+                    tickloop_harness_protocol::hooks::HookEvent::UserPromptSubmit,
+                    notes,
                 );
                 candidate.snapshot.last_sequence += 1;
                 let event = Event {
@@ -3699,18 +4000,57 @@ impl Agent {
                 candidate.snapshot.events.push(event.clone());
                 events.push(event);
             }
+            // Blocked prompts join last, so taking them back leaves the others in place.
+            let first_blocked = blocked
+                .first()
+                .map(|pending| (pending.receipt.run_id, candidate.snapshot.messages.len()));
+            for mut pending in blocked {
+                pending.skill_guidance = None;
+                pending.attached_file_reads.clear();
+                self.append_merged_input(&mut candidate, active, pending);
+            }
             while candidate.snapshot.events.len() > 1024 {
                 candidate.snapshot.events.remove(0);
             }
             self.save(&candidate.snapshot);
             *original = candidate;
+            if let Some((run, index)) = first_blocked {
+                self.take_back_blocked_prompt(original, run, index, false);
+            }
             events
         };
+        drop(chats);
         for event in events {
             let _ = self.inner.events.send(event);
         }
         self.flush_subagent_notifications(active.chat_id).await;
         Ok(())
+    }
+
+    /// Appends `pending`, queued to the Run `active`, to its conversation, answered by the Run's
+    /// response.
+    fn append_merged_input(&self, chat: &mut Chat, active: &Receipt, mut pending: PendingInput) {
+        let consumed = pending.receipt.run_id;
+        if let Some(skill) = &mut pending.skill_guidance
+            && skill.source == tickloop_harness_protocol::SkillSource::BuiltIn
+            && skill.run_id == Some(consumed)
+        {
+            skill.run_id = Some(active.run_id);
+        }
+        let index = chat.snapshot.messages.len();
+        self.append_input_message(chat, pending);
+        if let Some(response) = chat.bookkeeping.lifecycle.active_response(active.run_id)
+            && index < chat.snapshot.messages.len()
+        {
+            chat.bookkeeping.message_responses.insert(index, response);
+        }
+        self.settle_input(
+            chat,
+            consumed,
+            SettledOutcome::Merged {
+                into: active.run_id.into(),
+            },
+        );
     }
 
     async fn admit_host_operation(
@@ -3840,9 +4180,32 @@ impl Agent {
         is_awaiting_model: &mut bool,
     ) -> Result<Usage, String> {
         self.complete_file_history_snapshots(receipt.chat_id).await;
-        let mut used_calls = self.calls_on_chain(&receipt).await;
         let mut request = match start {
-            RunStart::Request(request) => request,
+            RunStart::Request(request) => {
+                Box::pin(self.checkpoint_pending_prompt(&receipt))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Box::pin(self.announce_session_start(&receipt, &cancel))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let prompt_gate = self
+                    .user_prompt_submit(&receipt, &cancel)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                self.complete_file_history_snapshots(receipt.chat_id).await;
+                if let hooks::PromptGate::End = prompt_gate {
+                    return Ok(Usage::default());
+                }
+                if Box::pin(self.prepare_user_skill(&receipt, &cancel, is_awaiting_model)).await? {
+                    if let Some(usage) = self.finish_tool_results(&receipt).await? {
+                        return Ok(usage);
+                    }
+                    let chats = self.inner.chats.lock().await;
+                    self.continuation_request(&chats[&receipt.chat_id])?
+                } else {
+                    request
+                }
+            }
             RunStart::Resume { at, result } => {
                 *is_awaiting_model = false;
                 match self.reenter_batch(&receipt, at, result, &cancel).await? {
@@ -3851,6 +4214,7 @@ impl Agent {
                 }
             }
         };
+        let mut used_calls = self.calls_on_chain(&receipt).await;
         loop {
             Box::pin(self.stop_at_safe_point(&receipt, None)).await?;
             self.checkpoint_feedback_inputs(receipt.chat_id).await?;
@@ -3884,9 +4248,14 @@ impl Agent {
                 {
                     return Err(Box::pin(self.leave_before_model_request(&receipt)).await);
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => {
+                    if let AgentError::Model(model_error) = &error {
+                        self.notify_stop_failure(&receipt, model_error, &cancel)
+                            .await;
+                    }
+                    return Err(error.to_string());
+                }
             };
-            *is_awaiting_model = false;
             let assistant_message_id = tickloop_ids::generate();
             let calls = tool_batch::batch_calls(&output.content);
             {
@@ -3921,6 +4290,12 @@ impl Agent {
                     content: output.content,
                 });
                 chat.snapshot.last_model_run = Some(receipt.run_id);
+                if calls
+                    .iter()
+                    .any(|call| call.name != SUBAGENT_HANDBACK_TOOL_NAME)
+                {
+                    chat.hook_state.session.note_tool_calls(receipt.run_id);
+                }
                 self.emit(
                     chat,
                     &receipt,
@@ -3935,6 +4310,10 @@ impl Agent {
                     request = continuation;
                     continue;
                 }
+                if let Some(continuation) = self.stop_turn_hooks(&receipt, &cancel).await? {
+                    request = continuation;
+                    continue;
+                }
                 let chats = self.inner.chats.lock().await;
                 return chats[&receipt.chat_id]
                     .snapshot
@@ -3942,6 +4321,7 @@ impl Agent {
                     .run_conversation_usage(receipt.run_id)
                     .map_err(|error| error.to_string());
             }
+            *is_awaiting_model = false;
             match self
                 .run_batch_from(
                     &receipt,
@@ -3977,6 +4357,32 @@ impl Agent {
             receipt.loop_id, chat.snapshot.chat_loop.id,
             "every run belongs to its Chat's one Loop"
         );
+        let preparing_inputs = chat
+            .hook_state
+            .session
+            .preparing_inputs
+            .remove(&receipt.run_id);
+        let was_unstarted = preparing_inputs.is_some();
+        let queue_already_paused = chat
+            .hook_state
+            .session
+            .paused_preparations
+            .remove(&receipt.run_id);
+        if let Some(inputs) = &preparing_inputs
+            && !queue_already_paused
+            && (chat.user_cancelled_runs.contains(&receipt.run_id)
+                || internal_failure
+                || (!cancel.is_cancelled() && result.is_err()))
+        {
+            for pending in &mut chat.snapshot.pending_inputs {
+                if inputs.contains(&pending.receipt.run_id) && hooks::is_user_prompt(pending) {
+                    pending.armed = false;
+                    chat.bookkeeping
+                        .lifecycle
+                        .set_queued_armed(pending.receipt.run_id, false);
+                }
+            }
+        }
         chat.family_finishing.insert(receipt.run_id);
         chat.feedback_inputs.remove(&receipt.run_id);
         run_supervision::clear_run_state(chat, receipt.run_id);
@@ -3993,7 +4399,11 @@ impl Agent {
             result = Err(error.to_string());
         }
         let is_user_cancelled = chat.user_cancelled_runs.remove(&receipt.run_id);
-        if cancel.is_cancelled() && is_user_cancelled && !self.inner.closed.load(Ordering::SeqCst) {
+        if !was_unstarted
+            && cancel.is_cancelled()
+            && is_user_cancelled
+            && !self.inner.closed.load(Ordering::SeqCst)
+        {
             chat.snapshot
                 .message_runs
                 .insert(chat.snapshot.messages.len(), receipt.run_id);
@@ -4052,12 +4462,15 @@ impl Agent {
         let goal_turn = self.goal_turn_events(chat, &receipt, goal_turn);
         // A durable host goes on with an answer whose host it lost: its input has not settled,
         // so its child run has no completion yet.
-        let is_settled = !(self.inner.waits == WaitHosting::Durable
-            && ending
-                == ResponseEnding::Interrupted {
-                    by: InterruptedBy::Host,
-                });
-        self.end_response(chat, receipt.run_id, ending, usage);
+        let is_settled = !was_unstarted
+            && !(self.inner.waits == WaitHosting::Durable
+                && ending
+                    == ResponseEnding::Interrupted {
+                        by: InterruptedBy::Host,
+                    });
+        if !was_unstarted {
+            self.end_response(chat, receipt.run_id, ending, usage);
+        }
         // An interrupted or failed turn does not hold back a Tick delivery that came due.
         let is_deliverable = matches!(
             chat.snapshot.chat_loop.state,
@@ -4244,6 +4657,23 @@ impl Agent {
                 .insert(pending.receipt.run_id, pending.receipt.loop_id);
             return;
         }
+        if let Some(skill) = pending.skill_guidance.take()
+            && skill.shell_preprocessing != Some(true)
+        {
+            chat.snapshot.user_skill_invocations.insert(
+                pending.receipt.run_id,
+                tickloop_harness_protocol::UserSkillInvocation {
+                    name: skill.name.clone(),
+                    source: skill.source.clone(),
+                    prepared_without_shell: true,
+                },
+            );
+            record_invoked_skill(chat, skill);
+            chat.user_skill_preparations.insert(
+                pending.receipt.run_id,
+                command_skills::UserSkillPreparation::Complete,
+            );
+        }
         let message_index = chat.snapshot.messages.len();
         chat.snapshot
             .message_runs
@@ -4320,11 +4750,18 @@ impl Agent {
                 if chat.family_stopping {
                     return Ok(None);
                 }
-                self.select_next_run(chat, None, background_work)?
+                let admission = self.select_next_run(chat, None, background_work)?;
+                self.take_due_task_checkpoint(chat).await;
+                admission
             };
             match admission {
                 RunAdmission::Idle => return Ok(None),
-                RunAdmission::Ready(receipt, request, cancel) => {
+                RunAdmission::Ready(receipt, mut request, cancel) => {
+                    if Box::pin(self.commit_unhooked_prompt(&receipt, &cancel)).await? {
+                        let chats = self.inner.chats.lock().await;
+                        let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
+                        (request.messages, request.history_sources) = context::model_history(chat)?;
+                    }
                     return Ok(Some((receipt, *request, cancel)));
                 }
                 RunAdmission::ValidateTrigger(pending) => {
@@ -4467,6 +4904,7 @@ impl Agent {
             chat.bookkeeping.lifecycle.take_start_back(pending);
             self.save(&chat.snapshot);
         }
+        self.take_due_task_checkpoint(chat).await;
         match admission {
             RunAdmission::Idle => Ok(TriggerTake::Waits),
             RunAdmission::ValidateTrigger(_) => Ok(TriggerTake::LookAgain),
@@ -4715,10 +5153,10 @@ impl Agent {
             let execution = candidate.execution.clone();
             recovery::before_resume(
                 &mut candidate.snapshot,
-                pending.receipt.loop_id,
                 self.inner.config_root.as_deref(),
                 &execution,
             )?;
+            let queued_before_hooks = candidate.snapshot.pending_inputs.clone();
             candidate.snapshot.pending_inputs.remove(index);
             let mut merged_inputs = Vec::new();
             if pending.agent_message.is_none()
@@ -4774,36 +5212,17 @@ impl Agent {
                 candidate.unsettled_runs.insert(pending.receipt.run_id);
             }
             let receipt = pending.receipt.clone();
-            self.mark_run_inputs_handled(&mut candidate, &pending);
-            candidate.bookkeeping.lifecycle.start_input(receipt.run_id);
-            self.append_input_message(&mut candidate, pending);
-            let mut merged_receipts = Vec::with_capacity(merged_inputs.len());
-            for queued in merged_inputs {
-                let consumed = queued.receipt.clone();
-                if queued.agent_message.is_none() {
-                    self.merge_host_context(&receipt, &consumed);
-                }
-                self.append_input_message(&mut candidate, queued);
-                self.settle_input(
-                    &mut candidate,
-                    consumed.run_id,
-                    SettledOutcome::Merged {
-                        into: receipt.run_id.into(),
-                    },
+            if hooks::is_user_prompt(&pending) {
+                candidate.hook_state.session.await_prompt_hooks(receipt.run_id);
+                candidate.hook_state.session.preparing_inputs.insert(
+                    receipt.run_id,
+                    std::iter::once(pending.receipt.run_id)
+                        .chain(merged_inputs.iter().map(|input| input.receipt.run_id))
+                        .collect(),
                 );
-                merged_receipts.push(consumed);
-            }
-            self.save(&candidate.snapshot);
-            self.start_response(&mut candidate, &receipt);
-            self.emit(&mut candidate, &receipt, EventKind::Started);
-            for consumed in merged_receipts {
-                self.emit(
-                    &mut candidate,
-                    &consumed,
-                    EventKind::InputMerged {
-                        into_run_id: receipt.run_id,
-                    },
-                );
+                candidate.snapshot.pending_inputs = queued_before_hooks;
+            } else {
+                self.commit_run_inputs(&mut candidate, pending, merged_inputs, Vec::new())?;
             }
             let (messages, history_sources) = context::model_history(&candidate)?;
             let request = ModelRequest {
@@ -4838,6 +5257,70 @@ impl Agent {
         Ok(RunAdmission::Idle)
     }
 
+    fn commit_run_inputs(
+        &self,
+        chat: &mut Chat,
+        pending: PendingInput,
+        merged_inputs: Vec<PendingInput>,
+        notes: Vec<String>,
+    ) -> Result<(), AgentError> {
+        let cleared_board = if hooks::is_user_prompt(&pending) {
+            shared_tasks::cleared_finished_board(&chat.snapshot).map_err(AgentError::Invalid)?
+        } else {
+            None
+        };
+        chat.snapshot.pending_inputs.retain(|input| {
+            input.receipt.run_id != pending.receipt.run_id
+                && !merged_inputs
+                    .iter()
+                    .any(|merged| merged.receipt.run_id == input.receipt.run_id)
+        });
+        let receipt = pending.receipt.clone();
+        self.mark_run_inputs_handled(chat, &pending);
+        chat.bookkeeping.lifecycle.start_input(receipt.run_id);
+        self.append_input_message(chat, pending);
+        let mut merged_receipts = Vec::with_capacity(merged_inputs.len());
+        for queued in merged_inputs {
+            let consumed = queued.receipt.clone();
+            if queued.agent_message.is_none() {
+                self.merge_host_context(&receipt, &consumed);
+            }
+            self.append_input_message(chat, queued);
+            self.settle_input(
+                chat,
+                consumed.run_id,
+                SettledOutcome::Merged {
+                    into: receipt.run_id.into(),
+                },
+            );
+            merged_receipts.push(consumed);
+        }
+        hooks::append_hook_notes(
+            chat,
+            &receipt,
+            tickloop_harness_protocol::hooks::HookEvent::UserPromptSubmit,
+            notes,
+        );
+        if let Some(board) = cleared_board {
+            let loop_id = chat.snapshot.chat_loop.id;
+            chat.snapshot.task_boards.insert(loop_id, board);
+            self.queue_task_boards(chat);
+        }
+        self.save(&chat.snapshot);
+        self.start_response(chat, &receipt);
+        self.emit(chat, &receipt, EventKind::Started);
+        for consumed in merged_receipts {
+            self.emit(
+                chat,
+                &consumed,
+                EventKind::InputMerged {
+                    into_run_id: receipt.run_id,
+                },
+            );
+        }
+        Ok(())
+    }
+
     async fn request_permission(
         &self,
         receipt: &Receipt,
@@ -4846,6 +5329,21 @@ impl Agent {
         prompt: PermissionPrompt,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
+        if let Some(revision) = self
+            .take_permission_grant(
+                receipt,
+                operation,
+                prompt.mcp_server.as_deref(),
+                prompt.target.as_deref(),
+            )
+            .await
+        {
+            return Ok(PermissionAnswer {
+                allow: true,
+                revision,
+                comment: None,
+            });
+        }
         let request = PermissionRequest {
             parent_call: nested_calls::parent_call().await,
             mcp_server: prompt.mcp_server,
@@ -4862,30 +5360,46 @@ impl Agent {
             approval_source: prompt.source,
         };
         nested_calls::register_permission(request.id);
-        self.wait_for_permission(receipt.chat_id, request, session_operation, cancel)
-            .await
+        self.wait_for_permission(
+            receipt.chat_id,
+            request,
+            session_operation,
+            prompt.target,
+            prompt.hooks,
+            cancel,
+        )
+        .await
     }
 
+    /// Waits for a person to answer `request`; a wait it records under Durable Approval binds
+    /// the answer to `target`, what the call reaches.
     async fn wait_for_permission(
         &self,
         chat_id: ChatId,
         request: PermissionRequest,
         session_operation: SessionPermissionOperation,
+        target: Option<String>,
+        hooks: Option<tickloop_harness_transcript::HookPreparation>,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
-        let nested = nested_calls::is_nested();
-        if !nested {
-            tool_batch::serialize_permission_prompt(&cancel).await?;
-        }
         let model_receipt = request.execution.run_id().map(|run_id| Receipt {
             chat_id,
             loop_id: request.loop_id,
             run_id,
         });
+        let waits_durably = model_receipt.is_some()
+            && self.tool_prompt_policy() == PromptPolicy::DurableApproval
+            && matches!(request.execution, PermissionExecution::ToolCall { .. });
+        // A call inside a batch waits alone, unless it waits durably: its Run then waits for it
+        // as for one of its own calls.
+        let waits_alone = nested_calls::is_nested() && !waits_durably;
+        if !waits_alone {
+            tool_batch::serialize_permission_prompt(&cancel).await?;
+        }
         let (sender, receiver) = oneshot::channel();
         let owner = PermissionOwner::new(chat_id.into(), request.loop_id.into())
             .map_err(|error| error.to_string())?;
-        {
+        let release = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats
                 .get_mut(&chat_id)
@@ -4901,7 +5415,7 @@ impl Agent {
                     .run_cancel(receipt.run_id)
                     .cloned()
                     .ok_or("permission Run is unavailable")?;
-                if !nested {
+                if !waits_alone {
                     self.park_run(chat, receipt, run_cancel)
                         .map_err(|error| error.to_string())?;
                 }
@@ -4914,12 +5428,21 @@ impl Agent {
             }
             chat.denial_window.remember_human_prompt(&request);
             chat.snapshot.permissions.push(request.clone());
+            let release = match &model_receipt {
+                Some(receipt) if waits_durably => {
+                    let release =
+                        self.suspend_for_permission(chat, receipt, &request, target, hooks);
+                    self.save_now(&chat.snapshot);
+                    release
+                }
+                _ => CancellationToken::new(),
+            };
             self.inner.approvals.lock().await.insert(
                 request.id,
                 PendingApproval {
                     sender,
                     owner,
-                    operation: session_operation,
+                    operation: Some(session_operation),
                 },
             );
             let receipt = model_receipt.clone().unwrap_or(Receipt {
@@ -4934,8 +5457,9 @@ impl Agent {
                     request: request.clone(),
                 },
             );
-        }
-        if !nested
+            release
+        };
+        if !waits_alone
             && model_receipt.is_some()
             && let Some(next) = self
                 .next_run(chat_id)
@@ -4944,10 +5468,10 @@ impl Agent {
         {
             self.run_task(next);
         }
-        let answer = tokio::select! {biased; _ = nested_calls::stopped() => Err("Nested execution stopped after Auto rejection; call not dispatched".into()), _ = cancel.cancelled() => Err("permission request cancelled".into()), answer = receiver => answer.map_err(|_| "permission request expired".to_owned())};
+        let answer = tokio::select! {biased; _ = release.cancelled() => return Err(suspension::RUN_RELEASED.into()), _ = nested_calls::stopped() => Err("Nested execution stopped after Auto rejection; call not dispatched".into()), _ = cancel.cancelled() => Err("permission request cancelled".into()), answer = receiver => answer.map_err(|_| "permission request expired".to_owned())};
         let resumed = if answer.is_ok() {
             if let Some(receipt) = &model_receipt
-                && !nested
+                && !waits_alone
             {
                 self.resume_parked_run(receipt, cancel.clone()).await
             } else {
@@ -4957,6 +5481,11 @@ impl Agent {
             Ok(())
         };
         let mut chats = self.inner.chats.lock().await;
+        // A Run released meanwhile leaves its wait, allowed or not, to the next host.
+        if release.is_cancelled() {
+            return Err(suspension::RUN_RELEASED.into());
+        }
+        let mut is_wait_ended = false;
         if let Some(chat) = chats.get_mut(&chat_id) {
             if answer.is_err() || resumed.is_err() {
                 chat.denial_window.human_prompts.retain(|(run, call, _)| {
@@ -4967,15 +5496,23 @@ impl Agent {
             chat.snapshot
                 .permissions
                 .retain(|permission| permission.id != request.id);
-            if nested
+            if waits_alone
                 && chat.snapshot.permissions.is_empty()
                 && chat.active_run == model_receipt.as_ref().map(|receipt| receipt.run_id)
             {
                 chat.snapshot.chat_loop.set_state(LoopState::Running);
             }
+            // An allowed call's durable wait ends before the call runs, so no host runs it again.
+            if resumed.is_ok() && answer.as_ref().is_ok_and(|answer| answer.allow) {
+                is_wait_ended = chat.bookkeeping.lifecycle.end_wait(request.id);
+            }
             self.save(&chat.snapshot);
         }
+        drop(chats);
         self.inner.approvals.lock().await.remove(&request.id);
+        if is_wait_ended {
+            self.commit_allowed_call(chat_id).await?;
+        }
         resumed?;
         answer
     }
@@ -5335,8 +5872,10 @@ impl Agent {
             PermissionScope::Persistent,
             None,
             Some(specifier),
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     pub async fn answer_permission_with_comment(
@@ -5347,10 +5886,16 @@ impl Agent {
         scope: PermissionScope,
         comment: Option<String>,
     ) -> Result<(), AgentError> {
-        self.answer_permission_scoped(chat_id, request_id, allow, scope, comment, None)
+        self.answer_permission_scoped(chat_id, request_id, allow, scope, comment, None, None)
             .await
+            .map(|_| ())
     }
 
+    /// Answers the permission `request_id`. A Run waiting on it durably has its wait end in the
+    /// Transcript first: allowed, so the Run runs the call, or resolved with the denial the model
+    /// reads; `ledger` is the input the answer came as, merged into that Run. Gives the answer's
+    /// receipt.
+    #[allow(clippy::too_many_arguments)]
     async fn answer_permission_scoped(
         &self,
         chat_id: ChatId,
@@ -5359,7 +5904,30 @@ impl Agent {
         scope: PermissionScope,
         comment: Option<String>,
         persistent_specifier: Option<String>,
-    ) -> Result<(), AgentError> {
+        ledger: Option<lifecycle::LedgerInput>,
+    ) -> Result<Receipt, AgentError> {
+        if let Some(input) = &ledger
+            && let Some(replayed) = self
+                .inner
+                .chats
+                .lock()
+                .await
+                .get(&chat_id)
+                .and_then(|chat| chat.bookkeeping.lifecycle.replay(chat_id, input))
+        {
+            return replayed;
+        }
+        if scope == PermissionScope::Session
+            && self
+                .inner
+                .chats
+                .lock()
+                .await
+                .get(&chat_id)
+                .is_some_and(|chat| suspension::open_permission_wait(chat, request_id).is_some())
+        {
+            return Err(AgentError::Invalid(DURABLE_PERMISSION_SCOPES.into()));
+        }
         if allow {
             let chats = self.inner.chats.lock().await;
             if chats.get(&chat_id).is_some_and(|chat| {
@@ -5386,9 +5954,14 @@ impl Agent {
                 .iter()
                 .find(|request| request.id == request_id)
                 .ok_or_else(|| AgentError::Invalid("permission request expired".into()))?;
-            if request.approval_source == PermissionApprovalSource::ExplicitAsk {
+            if request.approval_source.is_single_use() {
                 return Err(AgentError::Invalid(
-                    "explicit Ask requires approval for this action only".into(),
+                    if request.approval_source == PermissionApprovalSource::Hook {
+                        "a PreToolUse hook requires approval for this action only"
+                    } else {
+                        "explicit Ask requires approval for this action only"
+                    }
+                    .into(),
                 ));
             }
         }
@@ -5417,15 +5990,40 @@ impl Agent {
         };
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        answerable_permission_request(chat, request_id, allow)?;
+        // A repeated answer, even one racing the first, finds it in the ledger under this lock.
+        if let Some(replayed) = ledger
+            .as_ref()
+            .and_then(|input| chat.bookkeeping.lifecycle.replay(chat_id, input))
+        {
+            return replayed;
+        }
+        let request = answerable_permission_request(chat, request_id, allow)?;
         let mut approvals = self.inner.approvals.lock().await;
-        let (permission_owner, session_operation) = approvals
+        let (permission_owner, session_operation, is_closed) = approvals
             .get(&request_id)
-            .map(|pending| (pending.owner, pending.operation.clone()))
+            .map(|pending| {
+                (
+                    pending.owner,
+                    pending.operation.clone(),
+                    pending.sender.is_closed(),
+                )
+            })
             .ok_or_else(|| AgentError::Invalid("permission was already answered".into()))?;
+        let run = request.execution.run_id();
+        if ledger.is_some() && run.is_none() {
+            return Err(AgentError::Invalid(
+                "only a Run's permission is answered as an input".into(),
+            ));
+        }
+        // Nothing is recorded for a Run that no longer waits here, such as one just released.
+        if is_closed || run.is_some_and(|run| Self::release_of(chat, run).is_cancelled()) {
+            return Err(AgentError::Invalid("permission request expired".into()));
+        }
         let mut session_context = None;
         let mut session_candidate = None;
         if scope == PermissionScope::Session {
+            let session_operation = session_operation
+                .ok_or_else(|| AgentError::Invalid(DURABLE_PERMISSION_SCOPES.into()))?;
             let context = self.inner.session_permissions.lock().await;
             let mut candidate = context.clone();
             candidate
@@ -5441,6 +6039,33 @@ impl Agent {
                 .map_err(|error| AgentError::Invalid(error.to_string()))?;
             session_context = Some(context);
             session_candidate = Some(candidate);
+        }
+        let receipt = Receipt {
+            chat_id,
+            loop_id: request.loop_id,
+            run_id: tickloop_ids::generate().into(),
+        };
+        let by_input = ledger.as_ref().map(|input| input.id.into());
+        let lifecycle = &mut chat.bookkeeping.lifecycle;
+        if allow {
+            lifecycle.allow_wait(request_id, by_input);
+        } else {
+            lifecycle.resolve_wait(
+                request_id,
+                suspension::denied_permission_result(comment.as_deref()),
+                by_input,
+            );
+        }
+        if let Some(input) = &ledger
+            && let Some(run) = run
+        {
+            lifecycle.record_settled(
+                input,
+                &receipt,
+                SettledOutcome::Merged { into: run.into() },
+                None,
+            );
+            self.inner.ledger_changes.send_replace(());
         }
         let mut snapshot = chat.snapshot.clone();
         snapshot
@@ -5490,7 +6115,28 @@ impl Agent {
                 revision: answer_revision,
                 comment,
             })
-            .map_err(|_| AgentError::Invalid("permission request expired".into()))
+            .map_err(|_| AgentError::Invalid("permission request expired".into()))?;
+        Ok(receipt)
+    }
+
+    /// Answers the permission `request_id` a Run waits on under Durable Approval, as the user's
+    /// reply `reply`, recorded with the ledger input `ledger` it came as. Gives its receipt.
+    pub(crate) async fn reply_to_permission(
+        &self,
+        chat_id: ChatId,
+        request_id: Uuid,
+        reply: PermissionReply,
+        ledger: Option<lifecycle::LedgerInput>,
+    ) -> Result<Receipt, AgentError> {
+        let (allow, scope, comment, rule) = match reply {
+            PermissionReply::AllowOnce => (true, PermissionScope::Once, None, None),
+            PermissionReply::AllowAlways { rule } => {
+                (true, PermissionScope::Persistent, None, rule)
+            }
+            PermissionReply::Deny { comment } => (false, PermissionScope::Once, comment, None),
+        };
+        self.answer_permission_scoped(chat_id, request_id, allow, scope, comment, rule, ledger)
+            .await
     }
 
     pub async fn answer_permission(
@@ -5532,6 +6178,7 @@ impl Agent {
             .ok_or(AgentError::NotFound)?
             .snapshot
             .clone();
+        chats[&chat_id].project_pending_input_eligibility(&mut snapshot.pending_inputs);
         snapshot.approval_records = chats[&chat_id]
             .denial_window
             .records
@@ -5570,6 +6217,16 @@ impl Agent {
             }
             let mut candidate = original.clone();
             let ids = taken.iter().map(|entry| entry.id).collect::<HashSet<_>>();
+            if candidate.active_run.is_some_and(|run| {
+                ids.contains(&run.uuid())
+                    && candidate
+                        .hook_state
+                        .session
+                        .preparing_inputs
+                        .contains_key(&run)
+            }) {
+                candidate.interrupt();
+            }
             candidate.snapshot.pending_inputs.retain(|pending| {
                 pending.agent_message.is_some() || !ids.contains(&pending.receipt.run_id.uuid())
             });
@@ -5736,22 +6393,35 @@ impl Agent {
         self.flush_deferred_messages(chat, MessageBoundary::Idle)
     }
 
-    /// A background task notification may queue one continuation run. The caller starts it
-    /// after releasing the Chat lock.
+    /// Writes `message`, what a background task's end tells the model, and shows the Chat's
+    /// views its line at once; a view drawing the conversation again reads it from `message`.
+    fn show_task_notification(
+        &self,
+        chat: &mut Chat,
+        notification: TaskNotification,
+        message: Message,
+    ) -> Result<(), AgentError> {
+        self.append_local_messages(chat, [message])?;
+        let _ = self.inner.task_notifications.send(notification);
+        Ok(())
+    }
+
+    /// A background Shell task's notification may queue one continuation run. The caller starts
+    /// it after releasing the Chat lock.
     fn notify_task_completion(
         &self,
         chat: &mut Chat,
         loop_id: Option<LoopId>,
         notification: TaskNotification,
     ) -> Result<bool, AgentError> {
+        let Some(shell) = &notification.shell else {
+            return Ok(false);
+        };
         chat.bookkeeping
             .deferred_notifications
-            .push(tick_protocol::InstanceRef::shell(notification.task_id));
-        self.append_local_messages(
-            chat,
-            [local_messages::task_notification(&chat.ids, &notification)],
-        )?;
-        let _ = self.inner.task_notifications.send(notification);
+            .push(tick_protocol::InstanceRef::shell(shell.task_id));
+        let message = local_messages::task_notification(&chat.ids, shell, &notification.summary);
+        self.show_task_notification(chat, notification, message)?;
         Ok(self.queue_task_continuation(chat, loop_id))
     }
 
@@ -5863,6 +6533,7 @@ impl Agent {
                 cancel.cancel();
             }
         }
+        self.end_sessions().await;
         self.stop_transcript_flushing();
         self.discard_hook_transcripts();
         self.inner.tasks.close();
@@ -6101,12 +6772,14 @@ impl NewChat {
             parked: HashMap::new(),
             releases: HashMap::new(),
             ready_runs: VecDeque::new(),
+            permission_grants: HashMap::new(),
             client,
             pending_client: None,
             pending_model_thinking: None,
             tools,
             execution,
             skills,
+            user_skill_preparations: HashMap::new(),
             content_replacements: Default::default(),
             file_history,
             watching_commands: false,
@@ -6129,6 +6802,7 @@ impl NewChat {
             loaded_from_history: false,
             goal_clock_ms: 0,
             cache_prefix: Default::default(),
+            hook_state: Default::default(),
         }
     }
 }

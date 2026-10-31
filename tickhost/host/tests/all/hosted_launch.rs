@@ -453,7 +453,7 @@ async fn terminal_read_until(reader: &mut HostConnection, ready: impl Fn(&Value)
 /// A program that does not speak the Tick protocol runs directly on its terminal and is Live as
 /// soon as it starts: it describes what it runs, reads as its screen text, and is written to
 /// with input. Its exit is recorded with the screen it left, which stays readable and watched
-/// until the Tick is closed.
+/// until the Tick is closed; a view showing it as it exits is told how it ended.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminal_program_takes_input_shows_it_and_keeps_its_exit_code() {
     let fixture = Fixture::start().await;
@@ -483,6 +483,10 @@ async fn a_terminal_program_takes_input_shows_it_and_keeps_its_exit_code() {
         .await
         .unwrap();
     assert_eq!(watched["read"]["exit"], Value::Null, "{watched}");
+    let (mut live_view, _live_requests) =
+        attach(&fixture, &opened, json!({"rows":10,"columns":40}))
+            .await
+            .into_parts();
 
     let refused = reader
         .request(
@@ -529,7 +533,12 @@ async fn a_terminal_program_takes_input_shows_it_and_keeps_its_exit_code() {
         .await
         .unwrap_err();
     assert_eq!(refused.code, "ProgramExited");
-    // A view still shows the last screen, at its own size, and its keys go nowhere.
+    assert_eq!(
+        view_end(&mut live_view).await,
+        Some(json!({"event":"exited","exit":{"code":0,"signal":null}})),
+        "a view showing the program as it exits is told how it ended"
+    );
+    // A view attached later shows the last screen, at its own size, and its keys go nowhere.
     let (mut events, mut requests) = attach(&fixture, &opened, json!({"rows":10,"columns":40}))
         .await
         .into_parts();

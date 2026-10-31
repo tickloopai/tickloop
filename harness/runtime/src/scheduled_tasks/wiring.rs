@@ -654,7 +654,7 @@ impl Agent {
         Creation {
             creator,
             needs_confirmation: creator == ScheduledTaskCreator::Agent
-                && self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt
+                && self.other_prompt_policy() == PromptPolicy::DenyOnPrompt
                 && !self.inner.trust_model_scheduled_tasks,
         }
     }

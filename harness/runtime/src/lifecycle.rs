@@ -313,7 +313,11 @@ impl Lifecycle {
             .values()
             .filter(|input| input.record.state == InputState::Accepted)
             .filter_map(|input| {
-                serde_json::from_value::<PendingInput>(input.record.queued.clone()?).ok()
+                let mut pending =
+                    serde_json::from_value::<PendingInput>(input.record.queued.clone()?).ok()?;
+                // PendingInput omits live flags; the ledger retains the accepted invocation kind.
+                pending.is_skill_invocation = matches!(input.record.op, InputOp::Skill);
+                Some(pending)
             })
             // Another attempt at an answer is the continuation of its input, not a queued input.
             .filter(|pending| !pending.task_continuation)
@@ -537,6 +541,7 @@ impl Lifecycle {
         let response_id = self.active.get(&receipt.run_id)?.response_id;
         let wait_id = match &kind {
             WaitKind::Question { request, .. } => request.id,
+            WaitKind::Permission { request, .. } => request.id,
             WaitKind::Subagent { .. } | WaitKind::Children { .. } | WaitKind::Handover => {
                 tickloop_ids::generate()
             }
@@ -591,12 +596,19 @@ impl Lifecycle {
     }
 
     /// The wait `id`, which no call's result ends, is over: its answer goes on, in the same
-    /// change. `false` when the wait is not open.
+    /// change. An allowed call's wait ends this way just before the call runs, and a denied
+    /// call's inside a batch once the batch recorded the denial. `false` when the wait already
+    /// ended.
     pub(crate) fn end_wait(&mut self, id: Uuid) -> bool {
         let Some(response_id) = self
             .waits
             .get(&id)
-            .filter(|wait| matches!(wait.record.state, WaitState::Open))
+            .filter(|wait| {
+                matches!(
+                    wait.record.state,
+                    WaitState::Open | WaitState::Allowed { .. } | WaitState::Resolved { .. }
+                )
+            })
             .map(|wait| wait.record.response_id)
         else {
             return false;
@@ -645,6 +657,23 @@ impl Lifecycle {
         true
     }
 
+    /// A person allowed the call the open wait `id` is on; the answer stays suspended until the
+    /// Run runs the call. `false` when the wait is not open.
+    pub(crate) fn allow_wait(&mut self, id: Uuid, by_input: Option<Uuid>) -> bool {
+        let revision = self.next_revision();
+        let Some(wait) = self
+            .waits
+            .get_mut(&id)
+            .filter(|wait| matches!(wait.record.state, WaitState::Open))
+        else {
+            return false;
+        };
+        wait.record.state = WaitState::Allowed { by_input };
+        wait.record.timestamp = now();
+        wait.revision = revision;
+        true
+    }
+
     /// The result of the call `call_id` of `run` is on the chain: a wait on that call is done and
     /// its answer goes on, in the same change. A wait no reply ended was interrupted: its call
     /// reports the error it ended in. `false` when no wait of the Run is on that call.
@@ -656,7 +685,7 @@ impl Lifecycle {
                 wait.record.run_id == run
                     && matches!(
                         wait.record.state,
-                        WaitState::Open | WaitState::Resolved { .. }
+                        WaitState::Open | WaitState::Resolved { .. } | WaitState::Allowed { .. }
                     )
                     && wait.record.resume.call_id() == Some(call_id)
             })
@@ -687,7 +716,7 @@ impl Lifecycle {
                 wait.record.response_id == response_id
                     && matches!(
                         wait.record.state,
-                        WaitState::Open | WaitState::Resolved { .. }
+                        WaitState::Open | WaitState::Resolved { .. } | WaitState::Allowed { .. }
                     )
             })
             .map(|wait| wait.record.wait_id)
@@ -709,7 +738,7 @@ impl Lifecycle {
             .filter(|wait| {
                 matches!(
                     wait.record.state,
-                    WaitState::Open | WaitState::Resolved { .. }
+                    WaitState::Open | WaitState::Resolved { .. } | WaitState::Allowed { .. }
                 ) && self
                     .responses
                     .get(&tickloop_ids::Id::from(wait.record.response_id))
@@ -1138,7 +1167,8 @@ impl Agent {
     }
 
     /// Ends the Run's answer and settles the input it answered. An answer the host lost, or a
-    /// handover's host ended at its ceiling, leaves its input open for a continuation.
+    /// handover's host ended at its ceiling, leaves its input open for a continuation. A root
+    /// Chat's task boards are recorded where the answer ends.
     pub(crate) fn end_response(
         &self,
         chat: &mut Chat,
@@ -1146,6 +1176,7 @@ impl Agent {
         ending: ResponseEnding,
         usage: Usage,
     ) {
+        self.record_task_board_checkpoint(chat);
         let bookkeeping = &mut chat.bookkeeping;
         bookkeeping.lifecycle.end(
             &chat.snapshot,
@@ -1165,6 +1196,7 @@ impl Agent {
     }
 
     pub(crate) fn settle_input(&self, chat: &mut Chat, run: RunId, outcome: SettledOutcome) {
+        chat.user_skill_preparations.remove(&run);
         if chat.bookkeeping.lifecycle.settle(run, outcome) {
             self.inner.ledger_changes.send_replace(());
         }

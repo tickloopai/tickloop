@@ -85,6 +85,9 @@ pub struct OwnerListing {
 pub struct HostListing {
     pub epoch: Uuid,
     pub live: std::collections::HashSet<tick_protocol::InstanceRef>,
+    /// The terminal Ticks among `live` whose program exited; each keeps its last screen until
+    /// it is closed.
+    pub exited: std::collections::HashSet<tick_protocol::InstanceRef>,
 }
 
 struct ListedPage {
@@ -98,6 +101,12 @@ impl HostListing {
         let epoch = serde_json::from_value(page.get("epoch")?.clone()).ok()?;
         let page: tickhost_connect::page::Page<tickhost::host::TickRow> =
             serde_json::from_value(page.clone()).ok()?;
+        let exited = page
+            .items
+            .iter()
+            .filter(|row| row.state == tickhost::host::TickState::Exited)
+            .filter_map(|row| row.instance.clone())
+            .collect();
         Some(ListedPage {
             listing: HostListing {
                 epoch,
@@ -106,6 +115,7 @@ impl HostListing {
                     .into_iter()
                     .filter_map(|row| row.instance)
                     .collect(),
+                exited,
             },
             next: page.next,
         })
@@ -580,6 +590,7 @@ impl HostController {
                 None => listing = Some(page.listing),
                 Some(listing) if listing.epoch == page.listing.epoch => {
                     listing.live.extend(page.listing.live);
+                    listing.exited.extend(page.listing.exited);
                 }
                 Some(_) => {
                     return Err(HostError::before(

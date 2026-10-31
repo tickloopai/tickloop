@@ -365,3 +365,41 @@ async fn a_reopened_instance_keeps_the_place_the_lost_row_had_in_the_order() {
         "reopening a reopened Tick keeps the first row's place"
     );
 }
+
+#[tokio::test]
+async fn the_next_request_tells_the_model_which_instance_the_user_reopened() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![text("first"), text("second")]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, "start".into()).await.unwrap();
+    finish_run(&agent, chat, &mut events).await;
+
+    let ended = InstanceRef::hosted(uuid::Uuid::now_v7());
+    let reopened = InstanceRef::hosted(uuid::Uuid::now_v7());
+    agent
+        .record_reopened_tick(chat, &ended, reopened.clone())
+        .await
+        .unwrap();
+    agent.submit(chat, "go on".into()).await.unwrap();
+    finish_run(&agent, chat, &mut events).await;
+
+    let requests = model.requests.lock().unwrap().clone();
+    let texts = |index: usize| serde_json::to_string(&requests[index].messages).unwrap();
+    assert!(!texts(0).contains("was reopened by the user"));
+    let second = texts(1);
+    assert!(second.contains("was reopened by the user"), "{second}");
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(
+        snapshot
+            .messages
+            .iter()
+            .filter(|message| serde_json::to_string(message)
+                .unwrap()
+                .contains("was reopened by the user"))
+            .count(),
+        1,
+        "the model is told once"
+    );
+}

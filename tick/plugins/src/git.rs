@@ -80,7 +80,50 @@ impl GitClient {
         )
         .await?;
         let root = directory.path();
-        let target = if let Some(reference) = source.reference.as_deref() {
+        let target = if let Some(sha) = &source.sha {
+            let sha = sha.to_ascii_lowercase();
+            let initial_result = if sha.len() == 40 {
+                self.run(
+                    root,
+                    &["fetch", "--depth", "1", "--end-of-options", "origin", &sha],
+                )
+                .await
+            } else {
+                self.run(
+                    root,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        &format!("{sha}^{{commit}}"),
+                    ],
+                )
+                .await
+            };
+            if let Err(initial_error) = initial_result {
+                // Some servers refuse object-id fetches; abbreviated ids also need local history.
+                let mut arguments = vec![
+                    "fetch",
+                    "--unshallow",
+                    "--no-tags",
+                    "--end-of-options",
+                    "origin",
+                ];
+                if let Some(reference) = source.reference.as_deref() {
+                    arguments.push(reference);
+                } else {
+                    arguments.extend([REMOTE_BRANCHES, REMOTE_TAGS]);
+                }
+                self.run(root, &arguments).await.map_err(|fallback_error| {
+                    PluginError::Invalid(format!(
+                        "cannot fetch Git commit {sha}: initial attempt: {}; history fallback: {}",
+                        redacted_git_failure(&initial_error, &source.url),
+                        redacted_git_failure(&fallback_error, &source.url),
+                    ))
+                })?;
+            }
+            sha
+        } else if let Some(reference) = source.reference.as_deref() {
             self.run(
                 root,
                 &[
@@ -94,42 +137,6 @@ impl GitClient {
             )
             .await?;
             "FETCH_HEAD".to_owned()
-        } else if let Some(sha) = &source.sha {
-            let sha = sha.to_ascii_lowercase();
-            if sha.len() == 40 {
-                self.run(
-                    root,
-                    &["fetch", "--depth", "1", "--end-of-options", "origin", &sha],
-                )
-                .await?;
-                "FETCH_HEAD".to_owned()
-            } else {
-                let revision = format!("{sha}^{{commit}}");
-                if self
-                    .run(
-                        root,
-                        &["rev-parse", "--verify", "--end-of-options", &revision],
-                    )
-                    .await
-                    .is_err()
-                {
-                    // Servers cannot fetch an abbreviated object id; obtain history to resolve it locally.
-                    self.run(
-                        root,
-                        &[
-                            "fetch",
-                            "--unshallow",
-                            "--no-tags",
-                            "--end-of-options",
-                            "origin",
-                            REMOTE_BRANCHES,
-                            REMOTE_TAGS,
-                        ],
-                    )
-                    .await?;
-                }
-                sha
-            }
         } else {
             "HEAD".to_owned()
         };
@@ -143,7 +150,10 @@ impl GitClient {
                     &format!("{target}^{{commit}}"),
                 ],
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                PluginError::Invalid(format!("cannot resolve Git commit {target}: {error}"))
+            })?;
         if !valid_sha(&commit) {
             return Err(PluginError::Invalid(
                 "Git returned an invalid commit SHA".into(),
@@ -238,6 +248,24 @@ impl GitClient {
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
+}
+
+fn redacted_git_failure(error: &PluginError, source_url: &str) -> String {
+    const REDACTED_URL: &str = "[redacted Git URL]";
+    error
+        .to_string()
+        .replace(source_url, REDACTED_URL)
+        .split_whitespace()
+        .map(|word| {
+            // Git can normalize credentials or report a redirected URL instead of the source URL.
+            if word.contains("://") || word.contains("git@") {
+                REDACTED_URL
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn valid_sha(sha: &str) -> bool {

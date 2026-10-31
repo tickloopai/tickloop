@@ -15,6 +15,7 @@ use tickloop_code_daemon::{WORKER_ARGUMENT, daemon_control, run_daemon, run_work
 use tickloop_tick_installer::PluginKind;
 
 const TICK_COMMAND: &str = "tick";
+const ATTACH_COMMAND: &str = "attach";
 const PLUGIN_COMMAND: &str = "plugin";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +31,7 @@ pub enum ClientEntry {
 pub fn client_entry(arguments: &[OsString]) -> ClientEntry {
     match arguments.first().and_then(|arg| arg.to_str()) {
         Some("acp") => return ClientEntry::Acp,
-        Some("update" | "daemon" | "worker" | "tick" | "plugin" | "mcp") => {
+        Some("update" | "daemon" | "worker" | "tick" | "plugin" | "mcp" | ATTACH_COMMAND) => {
             return ClientEntry::Internal;
         }
         _ => {}
@@ -119,6 +120,9 @@ pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> 
         (DAEMON_COMMAND, Some(RUN_SUBCOMMAND)) => Some(run_daemon(&arguments[2..]).await),
         (DAEMON_COMMAND, _) => Some(daemon_control::run(&arguments[1..]).await),
         (WORKER_ARGUMENT, _) => Some(run_worker(&arguments[1..]).await),
+        (ATTACH_COMMAND, _) => {
+            Some(tickloop_code_console::terminal::attach_command::run(&arguments[1..]).await)
+        }
         (TICK_COMMAND, _) => Some(plugin_command::run(PluginKind::Tick, &arguments[1..]).await),
         ("mcp", _) => Some(mcp_command::run(&arguments[1..]).await),
         (PLUGIN_COMMAND, _) => Some(plugin_command::run(PluginKind::Plugin, &arguments[1..]).await),

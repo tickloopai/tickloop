@@ -54,7 +54,6 @@ const OVERVIEW_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Shows overview keys and commands."),
     ("/resume", "Opens saved Agent history."),
     ("/slides", "Starts a new Agent that makes Slides."),
-    ("/tickloop", "Starts a new Agent with the Tickloop Skill."),
 ];
 
 const OVERVIEW_AGENT_COMMAND: &str =
@@ -147,12 +146,6 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
-        command: "/tickloop",
-        arguments: "[REQUEST]",
-        description: "Loads the Tickloop Skill.",
-        menu_group: Some(CommandGroup::Skills),
-    },
-    CommandSpec {
         command: "/loop",
         arguments: "[INTERVAL] [INSTRUCTION]",
         description: "Repeats an instruction on a fixed interval or at a self-paced cadence; without instructions uses loop.md or maintenance guidance.",
@@ -186,6 +179,12 @@ const COMMANDS: &[CommandSpec] = &[
         command: "/mcp",
         arguments: "",
         description: "See MCP servers and their tools; log in, reconnect, or turn one off here.",
+        menu_group: Some(CommandGroup::ToolsAndPermissions),
+    },
+    CommandSpec {
+        command: "/hooks",
+        arguments: "",
+        description: "See the hooks of this folder; trust, disable or restore them.",
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
@@ -482,7 +481,7 @@ pub(super) fn skill_candidates(registry: &SkillRegistry) -> Arc<[CompletionCandi
         .user_definitions()
         .map(|skill| CompletionCandidate {
             command: format!("/{}", skill.name),
-            arguments: "[ARGUMENTS]".into(),
+            arguments: super::safe_line(skill.argument_hint.as_deref().unwrap_or("[ARGUMENTS]")),
             description: super::safe_line(&format!(
                 "{} · {}",
                 skill.source.display_label(),
@@ -777,13 +776,13 @@ mod tests {
             "/goal",
             "/cwd",
             "/details",
-            "/tickloop",
             "/loop",
             "/slides",
             "/artifacts",
             "/plugins",
             "/ticks",
             "/mcp",
+            "/hooks",
             "/context",
             "/sandbox",
         ] {
@@ -800,6 +799,30 @@ mod tests {
         let unique: std::collections::HashSet<_> =
             builtin_commands().iter().map(|spec| spec.command).collect();
         assert_eq!(unique.len(), builtin_commands().len());
+    }
+
+    #[test]
+    fn tickloop_is_discovered_only_from_registered_skills() {
+        let mut completion = Completion::default();
+        for scope in [
+            CommandScope::Root,
+            CommandScope::Child,
+            CommandScope::Overview,
+        ] {
+            completion.update_at("/tickloop", "/tickloop".len(), scope);
+            assert!(command_names(&completion).is_empty(), "{scope:?}");
+        }
+        assert!(
+            builtin_commands()
+                .iter()
+                .all(|spec| spec.command != "/tickloop")
+        );
+        assert!(!command_help(false).contains("/tickloop"));
+        assert!(!command_help(true).contains("/tickloop"));
+
+        completion.set_skills(Arc::from([skill("/tickloop")]));
+        completion.update("/tickloop");
+        assert_eq!(command_names(&completion), vec!["/tickloop"]);
     }
 
     #[test]
@@ -1105,6 +1128,29 @@ mod tests {
         assert!(!completion.is_open());
         completion.update("!git status");
         assert!(!completion.is_open());
+    }
+
+    #[test]
+    fn plugin_command_completion_uses_its_hint_and_invocation_flags() {
+        use tickloop_code_settings::skills::CommandDocument;
+        use tickloop_harness::protocol::SkillSource;
+        let mut registry = SkillRegistry::default();
+        for (name, visible) in [("check", true), ("hidden", false)] {
+            registry.register_command(CommandDocument {
+                name: name.into(), markdown: format!("---\ndescription: Check code\nargument-hint: <target> [mode]\nuser-invocable: {visible}\n---\nCheck"),
+                source: SkillSource::Plugin { plugin: "review".into(), path: format!("/plugin/{name}.md").into() },
+                base_directory: "/plugin".into(), metadata: Default::default(),
+                public_config: Default::default(),
+            }, &[]);
+        }
+        let candidates = skill_candidates(&registry);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].command, "/review:check");
+        assert_eq!(candidates[0].arguments, "<target> [mode]");
+        let mut completion = Completion::default();
+        completion.set_skills(candidates);
+        completion.update("/review:ch");
+        assert!(completion.is_open());
     }
 
     fn skill(command: &str) -> CompletionCandidate {

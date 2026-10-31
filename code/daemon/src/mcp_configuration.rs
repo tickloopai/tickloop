@@ -50,6 +50,7 @@ pub(crate) fn agent_connections(
     McpConnections::new(
         HostCapabilities {
             local_processes: true,
+            ..Default::default()
         },
         BTreeMap::new(),
         environment,

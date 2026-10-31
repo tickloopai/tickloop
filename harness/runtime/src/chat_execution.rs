@@ -253,7 +253,8 @@ fn no_folder() -> ExecutionError {
     ExecutionError::new(error_code::UNSUPPORTED, "this Chat has no Folder")
 }
 
-fn scope(snapshot: &ChatSnapshot) -> ExecutionScope {
+/// The scope every Port bound for `snapshot`'s directories is bound with.
+pub(crate) fn scope(snapshot: &ChatSnapshot) -> ExecutionScope {
     ExecutionScope {
         chat: snapshot.id,
         folder: snapshot

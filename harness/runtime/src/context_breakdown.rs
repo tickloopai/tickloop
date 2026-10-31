@@ -315,6 +315,9 @@ fn host_message_label(snapshot: &ChatSnapshot, index: usize) -> Option<String> {
             HostNote::Guidance(GuidanceNote::McpWarnings { .. }) => {
                 "MCP configuration warnings".into()
             }
+            HostNote::Guidance(GuidanceNote::Environment { .. }) => {
+                "Execution environment guidance".into()
+            }
             HostNote::Guidance(GuidanceNote::Later(_)) => "Guidance".into(),
             HostNote::HostTools(_) => "Host tool changes".into(),
             HostNote::DateChange(_) => "Date change".into(),
@@ -322,6 +325,7 @@ fn host_message_label(snapshot: &ChatSnapshot, index: usize) -> Option<String> {
             HostNote::ExecutionMode(note) => format!("Execution mode · {}", note.mode.label()),
             HostNote::LoopState => "Loop state".into(),
             HostNote::TaskReminder => "Task reminder".into(),
+            HostNote::Hook(event) => format!("Hook · {}", event.name()),
         });
     }
     matches!(

@@ -31,9 +31,10 @@ const TASK_ROWS: usize = 2;
 const GOAL_ROWS: usize = 2;
 const MINIMUM_TICK_SECTION_ROWS: usize = 3;
 const TICK_PREFETCH_ROWS: usize = 8;
+const ACTION_WAITING_STATUS: &str = "Waiting for previous action";
 const EMPTY_MONITOR_TEXT: &str = "Nothing to monitor";
 /// The end of the row whose card has the focus: keys go to its Tick.
-const FOCUSED_CARD_MARK: &str = "input";
+const FOCUSED_CARD_MARK: &str = "focused";
 /// The rule of a card cropped because not even its minimum fits.
 const TOO_SHORT_NOTE: &str = "terminal too short";
 
@@ -102,6 +103,30 @@ impl MonitorEntry {
                 Some(instance)
             }
             _ => None,
+        })
+    }
+
+    /// The ended Terminal Tick whose row reopens it in its place and shows it full screen.
+    pub(super) fn reopens_full_screen(&self) -> Option<&InstanceRef> {
+        self.actions.iter().find_map(|action| match &action.intent {
+            crate::monitor_rows::TickIntent::ReopenFullScreen(instance)
+                if action.key == crate::monitor_rows::MONITOR_ENTER_KEY =>
+            {
+                Some(instance)
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether Enter, or a double click, on this row shows its Tick full screen or reopens it so.
+    pub(super) fn opens_full_screen(&self) -> bool {
+        self.actions.iter().any(|action| {
+            action.key == crate::monitor_rows::MONITOR_ENTER_KEY
+                && matches!(
+                    action.intent,
+                    crate::monitor_rows::TickIntent::OpenFullScreen(_)
+                        | crate::monitor_rows::TickIntent::ReopenFullScreen(_)
+                )
         })
     }
 
@@ -179,6 +204,8 @@ pub(super) struct Monitor {
     /// its place.
     reconciled_order: Vec<MonitorTarget>,
     pub(super) action_error: Option<String>,
+    /// An action of this Chat waits behind one its host has not answered yet.
+    pub(super) action_waiting: bool,
     tick_anchor: Option<InstanceRef>,
     expanded_tasks: bool,
     goal_continued_at_ms: Option<u64>,
@@ -618,8 +645,8 @@ impl Monitor {
             })
             .collect()
     }
-    /// The subscription on `instance` whose frequency the row's `f` cycles: the last periodic
-    /// one, since the Agent lists subscriptions in the order their Loops began.
+    /// The subscription on `instance` whose frequency the row's `s` cycles: the fastest periodic
+    /// one, the frequency the row shows.
     pub(super) fn subscription_target(&self, instance: &InstanceRef) -> Option<uuid::Uuid> {
         crate::monitor_rows::subscriptions_on(&self.shown_subscriptions(), instance)
             .iter()
@@ -634,10 +661,7 @@ impl Monitor {
     ) -> Option<tickloop_harness::protocol::TickSubscriptionChange> {
         let rows = self.shown_subscriptions();
         let row = rows.iter().find(|row| row.id == subscription)?;
-        let next = match row.frequency {
-            TickSubscriptionFrequency::Low => None,
-            frequency => Some(frequency.next_periodic()?),
-        };
+        let next = Some(row.frequency.next_periodic()?);
         for target in rows.iter().filter(|target| {
             target.id == subscription
                 || (all_on_instance
@@ -651,6 +675,21 @@ impl Monitor {
             tickloop_harness::protocol::TickSubscriptionChange::Cancel,
             tickloop_harness::protocol::TickSubscriptionChange::Frequency,
         ))
+    }
+
+    /// Shows the periodic subscriptions on `instance` as cancelled at once, before the Agent
+    /// reports it; returns one of them, which a cancel of every one on the instance names.
+    pub(super) fn request_unsubscribe(&mut self, instance: &InstanceRef) -> Option<uuid::Uuid> {
+        let targets = crate::monitor_rows::subscriptions_on(&self.shown_subscriptions(), instance)
+            .iter()
+            .filter(|row| row.frequency.period().is_some())
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        for target in &targets {
+            self.requested_subscriptions.insert(*target, None);
+        }
+        self.rebuild();
+        targets.first().copied()
     }
 
     /// Shows what the Agent reports for `subscription` again, after it refused the change.
@@ -1507,11 +1546,14 @@ impl Monitor {
         self.frame(width, height, display, now_ms).lines
     }
 
-    /// The status line under the list: an action's error, or the selected row's state while the
-    /// list itself has the keyboard.
+    /// The status line under the list: an action's error, a waiting action, or the selected row's
+    /// state while the list itself has the keyboard.
     fn selected_status(&self) -> String {
         if let Some(error) = &self.action_error {
             return error.clone();
+        }
+        if self.action_waiting {
+            return ACTION_WAITING_STATUS.to_owned();
         }
         if !self.focused || self.card_focused {
             return String::new();
@@ -1677,6 +1719,7 @@ impl Monitor {
         now_ms: u64,
     ) -> usize {
         let has_status = self.action_error.is_some()
+            || self.action_waiting
             || (self.detail.is_none()
                 && !self.expanded_tasks
                 && !self.selected_status().is_empty());
@@ -2196,7 +2239,10 @@ impl Monitor {
         }
         lines.extend(goal_lines);
         if show_footer {
-            if let Some(entry) = self.selected().filter(|_| self.action_error.is_none()) {
+            if let Some(entry) = self
+                .selected()
+                .filter(|_| self.action_error.is_none() && !self.action_waiting)
+            {
                 use unicode_width::UnicodeWidthStr;
                 let title = super::safe_line(&entry.title);
                 let details = list_row::row_details(entry.tone, &entry.notes, now_ms);
@@ -4228,6 +4274,25 @@ mod scrolling_tests {
             status(&monitor).contains("Cannot open"),
             "an action's error stays"
         );
+    }
+
+    #[test]
+    fn a_waiting_action_shows_on_the_status_line_wherever_the_keyboard_is() {
+        let display = DisplayProfile::default();
+        let mut monitor = monitor(2);
+        observe(&mut monitor, &[0], 5_000);
+        let status = |monitor: &Monitor| texts(&monitor.frame(30, 12, display, 6_000)).join("\n");
+        monitor.action_waiting = true;
+        assert!(status(&monitor).contains(ACTION_WAITING_STATUS));
+        assert!(!status(&monitor).contains("Agent unread"));
+        monitor.focused = false;
+        assert!(status(&monitor).contains(ACTION_WAITING_STATUS));
+        assert_eq!(monitor.side_content_height(30, 12, display, 6_000), 12);
+        monitor.action_error = Some("Cannot open".into());
+        assert!(status(&monitor).contains("Cannot open"), "an error wins");
+        monitor.action_error = None;
+        monitor.action_waiting = false;
+        assert!(!status(&monitor).contains(ACTION_WAITING_STATUS));
     }
 
     #[test]

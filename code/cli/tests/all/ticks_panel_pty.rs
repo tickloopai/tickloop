@@ -632,27 +632,36 @@ fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
     fs::create_dir_all(directory.join(".claude-plugin")).unwrap();
     fs::write(
         directory.join(".claude-plugin/plugin.json"),
-        r#"{"name":"notes","version":"1.0.0","mcpServers":{"notes":{}},"hooks":{"hooks":{}}}"#,
+        r#"{"name":"notes","version":"1.0.0","mcpServers":{"notes":{}},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"check"}]}]},"commands":{"tidy":{"content":"Tidy"}}}"#,
     )
     .unwrap();
     install_from_path(&fixture, "plugin", &directory);
     let marketplace = fixture.marketplace_file("empty", &marketplace_json(json!([])));
     let mut terminal = Terminal::start(&fixture, &marketplace);
-    terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
+    // The plugin's hook waits for trust, so the New Agent offers its review first.
+    terminal.wait_for_frame(0, "the hooks review", |frame| {
+        frame.contains("Hooks need review")
+    });
+    terminal.press(ESCAPE, "the review skipped", |frame| {
+        !frame.contains("Hooks need review") && frame.contains("❯")
+    });
     let frame = terminal.press(b"/plugins\r", "installed plugin metadata", |frame| {
         row_shows(
             frame,
             "notes",
-            "local · enabled · 1.0.0 · no login needed · 1 MCP server",
-        ) && frame.contains("Not supported yet: hooks")
+            "local · enabled · 1.0.0 · no login needed · 1 MCP server · 1 hook needs confirming",
+        ) && !frame.contains("Not supported yet: commands")
     });
-    assert!(!frame.contains("Not supported yet: MCP"), "{frame}");
+    assert!(
+        !frame.contains("Not supported yet: MCP") && !frame.contains("commands, hooks"),
+        "{frame}"
+    );
     terminal.press(b"\r", "disable action", |frame| frame.contains("❯ Disable"));
     terminal.press(b"\r", "disabled", |frame| {
         row_shows(
             frame,
             "notes",
-            "local · disabled · 1.0.0 · no login needed · 1 MCP server",
+            "local · disabled · 1.0.0 · no login needed · 1 MCP server · 1 hook needs confirming",
         )
     });
     terminal.press(b"\r", "enable action", |frame| frame.contains("❯ Enable"));
@@ -660,7 +669,7 @@ fn installed_plugins_show_components_and_can_be_disabled_and_enabled() {
         row_shows(
             frame,
             "notes",
-            "local · enabled · 1.0.0 · no login needed · 1 MCP server",
+            "local · enabled · 1.0.0 · no login needed · 1 MCP server · 1 hook needs confirming",
         )
     });
     terminal.press(ESCAPE, "closed", |frame| !panel_is_open(frame));

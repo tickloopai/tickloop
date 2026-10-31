@@ -43,8 +43,8 @@ const FILE_TOOLS: [&str; 5] = [
 ];
 const SHELL_TOOLS: [&str; 2] = [BASH_TOOL_NAME, TASK_STOP_TOOL_NAME];
 
-/// A Settings Store that remembers each directory it was asked to read Skills or instruction
-/// files of.
+/// A Settings Store that remembers each directory it was asked to read Skills, instruction
+/// files or hooks of.
 #[derive(Default)]
 struct RecordingSettings {
     inner: MemorySettingsStore,
@@ -100,6 +100,11 @@ impl SettingsStore for RecordingSettings {
         } else {
             self.inner.instruction_files(folder)
         }
+    }
+
+    fn hooks(&self, folder: Option<&Path>) -> tickloop_harness_protocol::hooks::HookList {
+        self.record(folder);
+        self.inner.hooks(folder)
     }
 
     fn write_permissions(

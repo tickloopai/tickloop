@@ -10,7 +10,7 @@ Tickloop's product glossary. This file gives only term definitions and naming co
 A running object that the Agent can describe, read, and call, and from which it receives Tick Updates when it changes. There are only four Tick types (see "Tick Types"); a program a person starts themselves in a Herdr Pane or another terminal is not a Tick.
 
 **Tick Instance**:
-One independent run of a Tick, holding its own business identity and runtime state; its identity is written `<type>:<id>` (`hosted:`, `shell:`, `artifact:`). The identity is independent of the card that shows it; closing and reopening produces a new instance.
+One independent run of a Tick, holding its own business identity and runtime state; its identity is written `<type>:<id>` (`hosted:`, `shell:`, `artifact:`). The identity is independent of the view that shows it; closing and reopening produces a new instance.
 _Avoid_: using a Pane ID to refer to a Tick
 
 **Tick Standard**:
@@ -35,19 +35,23 @@ A capability an Extension Tick declares in its own description for the Agent to 
 _Avoid_: Action (refers only to the action kind)
 
 **Tick Subscription**:
-An explicitly established association between a Chat's Loop and a Tick Instance; it is one kind of Trigger for the Loop. There are only four frequencies: immediate, high (1 minute), medium (10 minutes), and low (30 minutes); immediate is used only for Shell Ticks. Opening, discovering, or reading a Tick is not subscribing; Artifacts do not accept Tick Subscriptions.
+An explicitly established association between a Chat's Loop and a Tick Instance; it is one kind of Trigger for the Loop. There are only four frequencies: immediate, high (1 minute), medium (10 minutes), and low (30 minutes); immediate is used only for Shell Ticks. Opening, discovering, or reading a Tick is not subscribing; Artifacts do not accept Tick Subscriptions. A subscription is how a Loop asks to be woken by a Tick's changes; a change to a Tick the Chat opened that no subscription delivers, such as the user reopening or closing it, only reaches the model in a host note on its next request.
 _Avoid_: listen, Watch, poll
 
 **Tickhost**:
-The local service that runs all local Ticks (Extension Ticks, Terminal Ticks, Shell Ticks) and holds their terminals and screens; the Daemon starts it on demand, one per config root. Tick Cards in the Monitor are the only views attached to it. The program, process, and command are always written `tickhost`.
+The local service that runs all local Ticks (Extension Ticks, Terminal Ticks, Shell Ticks) and holds their terminals and screens; the Daemon starts it on demand, one per config root. Tick Cards in the Monitor and Full-screen Views are the views attached to it. The program, process, and command are always written `tickhost`.
 _Avoid_: Tick host, tick-host, tick_host
 
 **Tick Card**:
-The only view of a local Tick: a card under the Tick's row in the Agent View's Monitor column, attached through Tickhost, showing the Tick's own screen below a rule. Showing a card and entering it (giving it keyboard input) are separate; several cards can be open, and hiding or leaving a card does not end the Tick.
+The view of an Extension Tick in the Agent View: a card under the Tick's row in the Monitor column, attached through Tickhost, showing the Tick's own screen below a rule. Showing a card and entering it (giving it keyboard input) are separate; several cards can be open, and hiding or leaving a card does not end the Tick. Terminal Ticks and Shells have no card.
 _Avoid_: popup, view Pane
 
+**Full-screen View**:
+A view of a local Tick that takes the whole terminal, its last row listing the view's keys: `Enter` on a Terminal Tick's or a Shell's Monitor row, or `tickloop attach` for any local Tick or Shell of a running Chat. Hiding it leaves the Tick running; a Shell's is read-only.
+_Avoid_: popup, attach Pane
+
 **Key Bubbling**:
-A Tick handing a key it does not use (Esc, an arrow, Tab or Shift+Tab) back to the client that shows it, through a private OSC sequence in its terminal output, after declaring that it does so; the Monitor then moves the focus from the card to its list or the input.
+A Tick handing a key it does not use (Esc, an arrow, Tab or Shift+Tab) back to the client that shows it, through a private OSC sequence in its terminal output, after declaring that it does so; the Monitor then moves the focus from the card to its list or the input, and a Full-screen View hides on a bubbled Esc.
 
 **Tick Ownership**:
 A persistent Chat's responsibility for the lifetime of the Ticks it opens, determined jointly by the config root and the Chat identity; a Subagent's Chat independently owns its own Ticks.
@@ -76,7 +80,11 @@ _Avoid_: "associated Artifact" (Artifact Association refers specifically to the 
 ### Plugins
 
 **Plugin**:
-An installable unit of components that extend the Agent's available Skills, Tick programs, or MCP Servers. A plugin can also describe components that Tickloop does not yet support. Installation and enablement are separate; enabling a plugin consents to running its programs and MCP Servers, but a plugin grants no additional permissions.
+An installable unit of components that extend the Agent's available Skills (including Commands), Tick programs, MCP Servers, or Hooks. A plugin can also describe components that Tickloop does not yet support. Installation and enablement are separate; enabling a plugin consents to running its programs and MCP Servers, but a plugin grants no additional permissions.
+
+**Plugin Command**:
+A plugin's Markdown instruction registered as a Skill, named `<plugin>:<command>` and invocable through the Skill tool or a slash command.
+_Avoid_: model tool (a Command supplies guidance through Skill), CLI command (a separate executable interface)
 
 **Plugin User Config**:
 Values a plugin declares that the user fills in, such as an API key or a server address, used by its components. Sensitive values are kept with the plugin's credentials and never reach content the model can see.
@@ -118,6 +126,16 @@ _Avoid_: deferred loading (that names the native form only), lazy tools
 
 **Fold**:
 The Tool Search form that asks nothing of the model: three fixed tools, SearchTools, DescribeTools and ExecuteTools, find, describe and call the tools, which never enter the tool list. ExecuteTools runs a batch of independent calls.
+
+### Hooks
+
+**Hook**:
+A user-configured command attached to a fixed event in the Agent's work, supplied by the user's settings, an enabled plugin or the Folder's repository configuration. A Hook is neither a model tool nor a Tick or Shell Tick.
+_Avoid_: Git hook (a separate mechanism)
+
+**Hook Trust**:
+The user's content-bound confirmation that a plugin or repository Hook may run.
+_Avoid_: Working Directory Trust, plugin enablement, tool approval (separate decisions)
 
 ### Loop and Trigger
 
@@ -202,7 +220,7 @@ _Avoid_: owner, owner daemon, Agent execution service
 The process the Daemon starts for each root Agent; it calls the Harness as a library and runs model calls, tools, approvals, Triggers, and the Transcript for that Agent and its Subagents and Branches. Processes that run the Harness in other hosts are not called Workers.
 
 **Monitor**:
-The unified list in the Agent View of the Tick Instances, Artifacts, background Shells, and Scheduled Tasks this Chat has opened or subscribed to, with the Goal pinned at the bottom; local Ticks are shown in it as Tick Cards. Membership is managed separately from subscription and ownership.
+The unified list in the Agent View of the Tick Instances, Artifacts, background Shells, and Scheduled Tasks this Chat has opened or subscribed to, with the Goal pinned at the bottom; Extension Ticks are shown in it as Tick Cards, and Terminal Ticks and Shells open from it as Full-screen Views. Membership is managed separately from subscription and ownership.
 _Avoid_: Ticks panel, task list
 
 **Unread Update**:
@@ -319,6 +337,9 @@ The process in which Jev, on technical failure or capacity problems, temporarily
 **Manual Approval Escalation**:
 Handing an operation to the user to decide after Automatic Approval is blocked; escalation does not create a standing Allow rule.
 
+**Durable Approval**:
+A durable host's human confirmation of a model tool call: the Run waits in the Transcript until the person allows or denies the call, whichever host instance holds the Chat then takes the answer, and an allowed call runs at most once. A third-party tool without a Permission Rule goes to the person rather than Automatic Approval, unless the host chose for its server Automatic Approval first or to admit tools whose declaration says they only read; prompts other than a tool call's approval are denied.
+
 **Auto Denial Tracking**:
 The count of consecutive and cumulative valid automatic denials in the current Chat; reaching the threshold triggers Manual Approval Escalation. It is not counted per command or tool, and does not imply automatic retry.
 
@@ -333,9 +354,6 @@ _Avoid_: Workspace Trust, automatic trust
 
 **Skill**:
 A set of instructions teaching the Agent how to combine existing tools to accomplish a kind of work; it provides no state access, tool capability, or extra permissions of its own. The host controls on-demand loading by the model and explicit invocation by the user separately.
-
-**Tickloop Skill**:
-The built-in system-level Skill, named `tickloop`, that teaches the Agent to open, operate, and subscribe to Ticks, independent of the working directory; it activates automatically when Tickhost is available, and the user can also start a new Agent with it via `/tickloop`.
 
 ### ID
 

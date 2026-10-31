@@ -47,10 +47,14 @@ fn configuration() -> ManagedConfiguration {
             ManagedModelInfo {
                 id: "fixture/model".into(),
                 name: "Fixture".into(),
+                provider_id: "fixture".into(),
+                provider_name: "Fixture provider".into(),
             },
             ManagedModelInfo {
                 id: "fixture/second".into(),
                 name: "Second".into(),
+                provider_id: "fixture".into(),
+                provider_name: "Fixture provider".into(),
             },
         ],
         modes: vec![ExecutionMode::Auto, ExecutionMode::AcceptEdits],
@@ -493,6 +497,7 @@ impl AgentAccess for Fake {
                     }
                     "unknown" => {
                         entry.snapshot.operations.push(OperationRecord {
+                            input_message_id: None,
                             parent_call_id: None,
                             parent_call_index: None,
                             task_binding: None,

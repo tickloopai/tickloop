@@ -182,7 +182,9 @@ pub(super) async fn replay(
                         }
                     }
                     // Managed ACP disallows these origins. Do not silently claim full replay.
-                    DisplayBlock::Question { .. } | DisplayBlock::FollowUp { .. } => {
+                    DisplayBlock::Question { .. }
+                    | DisplayBlock::Permission { .. }
+                    | DisplayBlock::FollowUp { .. } => {
                         return Err(super::invalid("unsupported public history block"));
                     }
                 }

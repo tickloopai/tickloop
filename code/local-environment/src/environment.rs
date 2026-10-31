@@ -235,6 +235,10 @@ impl ExecutionPort for LocalPort {
                     self.authority.check(self.scope.chat)?;
                     Ok(ExecutionInspection::File(inspection))
                 }
+                ExecutionQuery::Guidance => Ok(ExecutionInspection::Guidance(match &self.shells {
+                    Some(shells) => shells.guidance(self.scope.folder.as_deref()),
+                    None => sandbox::guidance(None, self.scope.folder.as_deref()),
+                })),
                 ExecutionQuery::Capabilities => {
                     Ok(ExecutionInspection::Capabilities(self.capabilities.clone()))
                 }
@@ -250,6 +254,17 @@ impl ExecutionPort for LocalPort {
                     Ok(ExecutionInspection::Instances(
                         members.into_iter().map(|member| member.instance).collect(),
                     ))
+                }
+                ExecutionQuery::InstanceStates => {
+                    let states = match &self.tools {
+                        Some(tools) => tools
+                            .states(self.scope.chat)
+                            .await
+                            .map_err(|error| ExecutionError::new(error.code, error.message))?,
+                        None => Vec::new(),
+                    };
+                    self.authority.check(self.scope.chat)?;
+                    Ok(ExecutionInspection::InstanceStates(states))
                 }
                 ExecutionQuery::Receipt(operation) => {
                     let receipt = match &self.tools {

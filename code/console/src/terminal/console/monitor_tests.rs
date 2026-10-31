@@ -45,9 +45,9 @@ fn shell(id: Uuid, title: &str) -> MonitorEntry {
         resources: None,
         actions: vec![
             crate::monitor_rows::MonitorAction {
-                key: 'o',
+                key: crate::monitor_rows::MONITOR_ENTER_KEY,
                 label: "open",
-                intent: crate::monitor_rows::TickIntent::OpenView(
+                intent: crate::monitor_rows::TickIntent::OpenFullScreen(
                     tick_protocol::InstanceRef::shell(id),
                 ),
             },
@@ -77,8 +77,7 @@ fn removed(instance: tick_protocol::InstanceRef) -> MonitorMembership {
     }
 }
 
-/// Monitor shows no Tick content: Enter on a Shell row asks for its view and opens no detail
-/// inside Monitor.
+/// Enter on a Shell row asks for its full-screen view and opens no detail inside Monitor.
 #[test]
 fn shell_tick_enter_opens_its_view_and_no_monitor_detail() {
     let mut state = click_fixture(140, false, TickGroup::Shells);
@@ -384,13 +383,10 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
     assert!(
         matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::TickAction { action, .. }) if action.instance == tick.instance.to_string() && action.key == crate::monitor_rows::MONITOR_ENTER_KEY)
     );
-    assert!(state.card_focused(), "Enter enters the Shell's card");
     assert!(
-        state
-            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .is_none()
+        !state.card_focused() && state.monitor.focused,
+        "Enter shows the Shell full screen and the list keeps the keys"
     );
-    assert!(!state.card_focused() && state.monitor.focused);
     assert!(
         state
             .key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
@@ -447,11 +443,15 @@ fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
                 let row = if meta { *rows.last().unwrap() } else { rows[0] };
                 let column = state.width - state.monitor_columns() + 2;
                 assert!(!state.monitor.focused);
-                // A row whose Tick has a card acts on the release, so a drag never toggles it.
+                // A row whose Tick has a card acts on the release, so a drag never toggles it;
+                // a Shell's row, shown full screen, takes a double click.
+                let clicks = if group == TickGroup::Shells { 2 } else { 1 };
                 for kind in [
                     MouseEventKind::Down(MouseButton::Left),
                     MouseEventKind::Up(MouseButton::Left),
-                ] {
+                ]
+                .repeat(clicks)
+                {
                     state.pointer(
                         MouseEvent {
                             kind,
@@ -1181,9 +1181,14 @@ fn subscribed_ticks_show_live_status_and_ignore_another_chats_refresh() {
             next_check: None,
         })
     );
+    assert_eq!(
+        state.monitor.entries()[0].group,
+        TickGroup::Terminals,
+        "a terminal Tick is listed apart from extension Ticks"
+    );
     let instance = state.monitor.entries()[0].instance.clone();
     state.switch_view_chat(Some(Uuid::new_v4()));
-    state.update_tick_entries(chat, TickGroup::Ticks, vec![]);
+    state.update_tick_entries(chat, TickGroup::Terminals, vec![]);
     assert!(state.monitor.entries().is_empty());
     state.switch_view_chat(Some(chat));
     assert!(
@@ -2499,11 +2504,18 @@ fn subscriptions_have_one_key_and_a_fixed_monitor_footer() {
         state.monitor.focus(false, None);
     }
     assert!(
-        state.monitor.hint().contains("s subscriptions"),
-        "shortcuts belong in the global hint row"
+        state.monitor.hint().contains("s every 10 min")
+            && state.monitor.hint().contains("S unsubscribe"),
+        "shortcuts belong in the global hint row: {}",
+        state.monitor.hint()
     );
-    for frequency in [Some("10 min"), Some("30 min"), None] {
-        assert_eq!(requested_key(press(&mut state, KeyCode::Char('s'))), 's');
+    for (key, frequency) in [
+        ('s', Some("10 min")),
+        ('s', Some("30 min")),
+        ('s', Some("1 min")),
+        ('S', None),
+    ] {
+        assert_eq!(requested_key(press(&mut state, KeyCode::Char(key))), key);
         let text = monitor_text(&mut state);
         if let Some(frequency) = frequency {
             assert!(text.contains(&format!("Every {frequency}")));
@@ -2550,12 +2562,22 @@ fn subscriptions_have_one_key_and_a_fixed_monitor_footer() {
 #[test]
 fn the_row_switch_updates_all_periodic_subscriptions_of_the_instance() {
     let mut state = subscribed_fixture(3);
-    for frequency in [
-        Some(tickloop_harness::protocol::TickSubscriptionFrequency::Medium),
-        Some(tickloop_harness::protocol::TickSubscriptionFrequency::Low),
-        None,
+    for (key, frequency) in [
+        (
+            's',
+            Some(tickloop_harness::protocol::TickSubscriptionFrequency::Medium),
+        ),
+        (
+            's',
+            Some(tickloop_harness::protocol::TickSubscriptionFrequency::Low),
+        ),
+        (
+            's',
+            Some(tickloop_harness::protocol::TickSubscriptionFrequency::High),
+        ),
+        ('S', None),
     ] {
-        assert_eq!(requested_key(press(&mut state, KeyCode::Char('s'))), 's');
+        assert_eq!(requested_key(press(&mut state, KeyCode::Char(key))), key);
         let shown = state.monitor.shown_subscriptions();
         match frequency {
             Some(frequency) => assert!(shown.iter().all(|row| row.frequency == frequency)),
@@ -2942,9 +2964,10 @@ fn a_character_the_focused_row_does_not_bind_is_typed_into_the_input() {
             .is_some(),
         "a key the row binds keeps its row action"
     );
-    // The Shell's Enter key entered its card; a lone Esc leaves it.
-    assert!(state.card_focused());
-    state.leave_card();
+    assert!(
+        !state.card_focused(),
+        "the Shell's Enter key shows it full screen, never in a card"
+    );
     state.monitor.detail = None;
     state.monitor.focus(false, None);
     for (code, modifiers) in [
@@ -3299,19 +3322,23 @@ async fn rapid_subscription_presses_across_the_first_reply_each_advance_one_step
         Low
     );
     execute(press(), context).await.unwrap();
-    assert!(
-        !agent
+    assert_eq!(
+        agent
             .tick_subscriptions(chat)
             .await
             .unwrap()
             .iter()
-            .any(|row| row.instance == instance)
+            .find(|row| row.instance == instance)
+            .map(|row| row.frequency),
+        Some(tickloop_harness::protocol::TickSubscriptionFrequency::High),
+        "s goes from low back to every minute and never cancels"
     );
     core.shutdown().await;
 }
 
 #[tokio::test]
-async fn s_subscribes_a_tick_then_cycles_through_frequencies_and_off_without_a_notice() {
+async fn s_subscribes_a_tick_and_cycles_its_frequencies_and_shift_s_unsubscribes_without_a_notice()
+{
     use crate::monitor_rows::TickIntent;
     use tickloop_harness::protocol::TickSubscriptionFrequency::{High, Medium};
     let directory = tempfile::tempdir().unwrap();
@@ -3368,9 +3395,14 @@ async fn s_subscribes_a_tick_then_cycles_through_frequencies_and_off_without_a_n
         .unwrap();
     assert_eq!(
         frequency_of_other().await,
-        None,
-        "two presses before the Agent replies go on to low, then off"
+        Some(High),
+        "two presses before the Agent replies go on to low, then back to every minute"
     );
+    run_intent(context, TickIntent::Unsubscribe(other.clone()))
+        .await
+        .unwrap();
+    assert_eq!(frequency_of_other().await, None, "S cancels it");
+    assert!(status().is_empty());
     assert_eq!(agent.tick_subscriptions(chat).await.unwrap().len(), 1);
 
     console.update_subscribed_ticks(chat, &[]).unwrap();
@@ -3676,7 +3708,7 @@ async fn space_reopens_an_ended_tick_in_its_place_showing_its_card_and_enter_ent
         let state = console.state.lock().unwrap();
         assert_eq!(
             rows(&state),
-            [first.clone(), reopened.clone(), last.clone()],
+            [last.clone(), reopened.clone(), first.clone()],
             "the reopened Tick keeps the row's place"
         );
         assert_eq!(state.monitor.selected().unwrap().instance, reopened);
@@ -3707,7 +3739,7 @@ async fn space_reopens_an_ended_tick_in_its_place_showing_its_card_and_enter_ent
     execute(action, context).await.unwrap();
     {
         let state = console.state.lock().unwrap();
-        assert_eq!(rows(&state), [first, reopened_again.clone(), last]);
+        assert_eq!(rows(&state), [last, reopened_again.clone(), first]);
         assert_eq!(
             state.cards.card(&reopened_again).map(|card| card.origin),
             Some(CardOrigin::User)
@@ -5465,10 +5497,10 @@ fn queued_input_layout_is_bounded_by_conversation_width_before_rendering() {
 }
 
 #[test]
-fn prompt_suggestion_layout_stays_inside_the_monitored_conversation() {
+fn a_prompt_suggestion_shows_in_the_input_beside_the_monitor() {
     let mut state = docked_monitor_fixture(1, 1);
     state.monitor.focused = false;
-    state.prompt_suggestion = Some(format!("suggested-next-step {}", "继续核对结果".repeat(40)));
+    state.prompt_suggestion = Some("suggested-next-step".into());
     assert!(state.visible_prompt_suggestion().is_some());
     let (lines, _, _) = state.normal_styled_frame();
     let suggestion = lines
@@ -5479,27 +5511,28 @@ fn prompt_suggestion_layout_stays_inside_the_monitored_conversation() {
         .iter()
         .position(|line| line.text().starts_with('─'))
         .unwrap();
-    assert!(suggestion < divider, "{lines:#?}");
-    assert!(display_width(&lines[suggestion].text()) <= state.content_columns());
+    assert!(
+        suggestion > divider,
+        "the suggestion is in the input, below its rule: {lines:#?}"
+    );
+    assert!(state.editor.draft().is_empty());
+    state.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.editor.draft(), "suggested-next-step");
 }
 
 #[test]
 fn monitored_conversation_footer_and_working_activity_share_the_side_column() {
     for width in [80, 100, 140] {
-        for suggestion in [false, true] {
+        {
             let mut state = docked_monitor_fixture(1, 1);
             state.resize(width, 30);
             state.monitor.focused = false;
-            if suggestion {
-                state.prompt_suggestion = Some(format!("suggestion {}", "检查全部结果".repeat(40)));
-            } else {
-                state.scrollback.set_activity(Some(RoleLine::role(
-                    format!("• Working {}", "progress ".repeat(40)),
-                    Role::MutedText,
-                )));
-                state.status_held = true;
-                state.status = format!("status-feedback {}", "details ".repeat(40));
-            }
+            state.scrollback.set_activity(Some(RoleLine::role(
+                format!("• Working {}", "progress ".repeat(40)),
+                Role::MutedText,
+            )));
+            state.status_held = true;
+            state.status = format!("status-feedback {}", "details ".repeat(40));
             let frame = state.layout_frame();
             assert!(
                 frame
@@ -5515,12 +5548,10 @@ fn monitored_conversation_footer_and_working_activity_share_the_side_column() {
                 state.height,
             );
             let rows = terminal.lines().collect::<Vec<_>>();
-            let prefix = if suggestion {
-                "suggestion "
-            } else {
-                "status-feedback "
-            };
-            let content = rows.iter().position(|line| line.contains(prefix)).unwrap();
+            let content = rows
+                .iter()
+                .position(|line| line.contains("status-feedback "))
+                .unwrap();
             let divider = rows
                 .iter()
                 .enumerate()
@@ -5542,17 +5573,11 @@ fn monitored_conversation_footer_and_working_activity_share_the_side_column() {
                     .is_empty(),
                 "{terminal}"
             );
-            if !suggestion {
-                assert!(
-                    rows.iter()
-                        .any(|line| line.contains("• Working") && line.contains('│')),
-                    "{terminal}"
-                );
-            } else {
-                assert!(state.editor.draft().is_empty());
-                state.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-                assert!(state.editor.draft().starts_with("suggestion "));
-            }
+            assert!(
+                rows.iter()
+                    .any(|line| line.contains("• Working") && line.contains('│')),
+                "{terminal}"
+            );
         }
     }
 }
@@ -5946,12 +5971,14 @@ fn a_shell_completion_flashes_its_row_and_collapsed_entry_before_the_next_snapsh
         .set_monitor_preference(tickloop_code_settings::MonitorPreference::Hidden)
         .unwrap();
     console
-        .write_shell_notification(&tickloop_harness::protocol::TaskNotification {
+        .write_task_notification(&tickloop_harness::protocol::TaskNotification {
             chat_id: chat.into(),
-            task_id: shells.tasks[0].id.into(),
-            tool_use_id: None,
-            output_file: "output.txt".into(),
-            status: tickloop_harness::protocol::TaskNotificationStatus::Completed,
+            shell: Some(tickloop_harness::protocol::ShellTaskEnd {
+                task_id: shells.tasks[0].id.into(),
+                tool_use_id: None,
+                output_file: "output.txt".into(),
+                status: tickloop_harness::protocol::TaskNotificationStatus::Completed,
+            }),
             summary: "make test completed".into(),
         })
         .unwrap();

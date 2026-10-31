@@ -148,21 +148,69 @@ fn update_goal_rejects_other_statuses_and_mismatched_fields() {
             "status `complete` requires evidence",
         ),
         (
-            json!({"status": "complete", "evidence": "done", "reason": "x"}),
-            "status `complete` does not take reason",
-        ),
-        (
             json!({"status": "blocked"}),
             "status `blocked` requires reason",
         ),
         (
-            json!({"status": "blocked", "reason": "stuck", "evidence": "x"}),
-            "status `blocked` does not take evidence",
+            json!({"status": "blocked", "reason": null, "evidence": "done"}),
+            "status `blocked` requires reason",
+        ),
+        (
+            json!({"status": "complete", "evidence": "", "reason": "stuck"}),
+            "status `complete` requires evidence",
+        ),
+        (
+            json!({"status": "complete", "evidence": "done", "note": "x"}),
+            "unknown field `note`",
         ),
         (json!({}), "missing field `status`"),
     ] {
         let error = parse_update_goal(&input).unwrap_err();
         assert!(error.starts_with("invalid UpdateGoal input:"), "{error}");
         assert!(error.contains(reason), "{error}");
+    }
+}
+
+/// Models fill both report fields of the flat schema; the one the status does not take is
+/// ignored whatever it holds, and the status's own field is still required.
+#[test]
+fn update_goal_ignores_the_field_of_the_other_status() {
+    assert_eq!(
+        parse_update_goal(&json!({"status": "complete", "evidence": "tests pass", "reason": ""})),
+        Ok(GoalReport::Complete {
+            evidence: "tests pass".into(),
+        })
+    );
+    assert_eq!(
+        parse_update_goal(&json!({"status": "complete", "evidence": "tests pass", "reason": "x"})),
+        Ok(GoalReport::Complete {
+            evidence: "tests pass".into(),
+        })
+    );
+    assert_eq!(
+        parse_update_goal(&json!({"status": "blocked", "reason": "no credentials", "evidence": 7})),
+        Ok(GoalReport::Blocked {
+            reason: "no credentials".into(),
+        })
+    );
+    assert_eq!(
+        prepared_update_input(json!({"status": "blocked", "reason": "r", "evidence": null})),
+        json!({"status": "blocked", "reason": "r"})
+    );
+    for unchanged in [
+        json!({"status": "paused", "reason": "r", "evidence": "e"}),
+        json!({"reason": "r", "evidence": "e"}),
+    ] {
+        assert_eq!(prepared_update_input(unchanged.clone()), unchanged);
+    }
+    let schema = definition(UPDATE_GOAL_TOOL_NAME).input_schema;
+    for (field, status) in [("evidence", "blocked"), ("reason", "complete")] {
+        assert!(
+            schema["properties"][field]["description"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("Ignored with `{status}`")),
+            "{field}"
+        );
     }
 }

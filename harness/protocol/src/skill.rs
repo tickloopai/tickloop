@@ -77,6 +77,9 @@ pub struct RemoteSkillDefinition {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct InvokedSkill {
+    /// Whether the original command required Shell preprocessing, even after completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_preprocessing: Option<bool>,
     pub name: String,
     pub content: String,
     pub source: SkillSource,
@@ -84,9 +87,14 @@ pub struct InvokedSkill {
     pub run_id: Option<RunId>,
 }
 
-/// Display metadata captured when the user loads a Skill; it grants no active guidance.
+/// Metadata captured with a user's Skill input. Preparation facts belong to that input's Run;
+/// they neither activate guidance by themselves nor grant tool permissions.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct UserSkillInvocation {
     pub name: String,
     pub source: SkillSource,
+    /// This input's guidance was fully prepared without requiring Shell. This input-bound
+    /// fact survives later same-name invocations replacing the current guidance cache.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prepared_without_shell: bool,
 }

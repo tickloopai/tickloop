@@ -52,6 +52,12 @@ const GIT_ENVIRONMENT = {
 const COMMIT_SHA = /^[0-9a-f]{7,40}$/i;
 const GIT_REF = /^(?!-)[A-Za-z0-9._\/-]+$/;
 
+export const HOOK_SUPPORT = {
+  fully: "fully",
+  partly: "partly",
+  none: "none",
+};
+
 export const STATUS = {
   installable: "installable",
   invalid: "invalid",
@@ -79,9 +85,22 @@ export function describeSource(entry, format, pluginRoot) {
   return { type: typeof type === "string" ? type : "unknown", unsupported: true };
 }
 
+function nameList(text) {
+  return text === "none" ? [] : text.split(", ");
+}
+
+/** Whether Tickloop runs all, some or none of a plugin's declared hooks. */
+function hookSupport(hooks) {
+  const hasUnsupported = hooks.unsupportedEvents.length + hooks.unsupportedTypes.length + hooks.unsupportedFields.length > 0;
+  if (hooks.supported === 0) return HOOK_SUPPORT.none;
+  return hasUnsupported ? HOOK_SUPPORT.partly : HOOK_SUPPORT.fully;
+}
+
 /** What `tickloop plugin validate` printed for a plugin it could read. */
 export function parseValidateOutput(stdout) {
-  const result = { name: null, displayName: null, version: null, format: null, skills: [], tick: null, mcp: [], unsupported: [], warnings: [] };
+  const result = { name: null, displayName: null, version: null, format: null, skills: [], commands: [], tick: null, mcp: [], hooks: null, unsupported: [], warnings: [] };
+  const hooks = { supported: 0, events: [], types: [], fields: [], unsupportedEvents: [], unsupportedTypes: [], unsupportedFields: [] };
+  let declaresHooks = false;
   for (const line of stdout.split("\n")) {
     let match;
     if ((match = /^Plugin (\S+)(?: (\S+))?, read from (.+)\.$/.exec(line))) {
@@ -90,6 +109,8 @@ export function parseValidateOutput(stdout) {
       result.displayName = match[1];
     } else if ((match = /^Skills: (.+)$/.exec(line))) {
       result.skills = match[1] === "none" ? [] : match[1].split(", ");
+    } else if ((match = /^Commands: (.+)$/.exec(line))) {
+      result.commands = nameList(match[1]);
     } else if ((match = /^Tick program: (.+) \((.+)\)$/.exec(line))) {
       result.tick = { executable: match[1], kind: match[2] };
     } else if ((match = /^Not supported yet, so not used: (.+)\.$/.exec(line))) {
@@ -97,10 +118,18 @@ export function parseValidateOutput(stdout) {
     } else if ((match = /^MCP server: (.*?) \| transport: (.*?) \| (command|address): (.*?) \| OAuth: (.*?) \| userConfig: (.*?) \| status: (.*?)$/.exec(line))) {
       const [, name, transport, targetKind, target, oauth, userConfig, status] = match;
       result.mcp.push({ name, transport, targetKind, target, oauth, userConfig, status });
+    } else if ((match = /^Hooks: (\d+) supported \| events: (.*?) \| types: (.*?) \| fields: (.*)$/.exec(line))) {
+      declaresHooks = true;
+      hooks.supported = Number(match[1]);
+      [hooks.events, hooks.types, hooks.fields] = match.slice(2).map(nameList);
+    } else if ((match = /^Hooks not supported yet: events: (.*?) \| types: (.*?) \| fields: (.*)$/.exec(line))) {
+      declaresHooks = true;
+      [hooks.unsupportedEvents, hooks.unsupportedTypes, hooks.unsupportedFields] = match.slice(1).map(nameList);
     } else if ((match = /^Warning: (.+)$/.exec(line))) {
       result.warnings.push(match[1]);
     }
   }
+  if (declaresHooks) result.hooks = { support: hookSupport(hooks), ...hooks };
   return result;
 }
 
@@ -343,8 +372,10 @@ async function examinePlugin(plugin, context) {
     manifestFormat: null,
     version: null,
     skills: [],
+    commands: [],
     tick: null,
     mcp: [],
+    hooks: null,
     supportedComponents: [],
     unsupportedComponents: [],
     warnings: [],
@@ -384,8 +415,16 @@ async function examinePlugin(plugin, context) {
   result.version = validated.version;
   result.skills = validated.skills;
   result.tick = validated.tick;
+  result.commands = validated.commands;
   result.mcp = validated.mcp;
-  result.supportedComponents = [...(validated.tick ? ["tick"] : []), ...(validated.skills.length ? ["skills"] : []), ...(validated.mcp.length ? ["MCP servers"] : [])];
+  result.hooks = validated.hooks;
+  result.supportedComponents = [
+    ...(validated.tick ? ["tick"] : []),
+    ...(validated.skills.length ? ["skills"] : []),
+    ...(validated.commands.length ? ["commands"] : []),
+    ...(validated.mcp.length ? ["MCP servers"] : []),
+    ...(validated.hooks?.supported ? ["hooks"] : []),
+  ];
   result.unsupportedComponents = validated.unsupported;
   result.warnings = validated.warnings;
   if (validated.displayName) result.warnings.push(`the manifest names it ${validated.displayName}, the marketplace ${plugin.name}`);
@@ -401,6 +440,7 @@ function countBy(items, key) {
 export function summarize(plugins) {
   const installable = plugins.filter(plugin => plugin.status === STATUS.installable);
   const mcp = installable.flatMap(plugin => plugin.mcp ?? []);
+  const hooked = installable.filter(plugin => plugin.hooks);
   const bySourceType = {};
   for (const plugin of plugins) {
     const row = bySourceType[plugin.sourceType] ??= { plugins: 0, ...Object.fromEntries(Object.values(STATUS).map(status => [status, 0])) };
@@ -418,7 +458,7 @@ export function summarize(plugins) {
     },
     plugins: plugins.length,
     installable: installable.length,
-    installableWithSkillsOrTick: installable.filter(plugin => plugin.supportedComponents.some(component => component === "skills" || component === "tick")).length,
+    installableWithSkillsOrTick: installable.filter(plugin => plugin.supportedComponents.some(component => component === "skills" || component === "commands" || component === "tick")).length,
     invalid: plugins.filter(plugin => plugin.status === STATUS.invalid).length,
     notFetchable: plugins.filter(plugin => plugin.status === STATUS.notFetchable).length,
     unsupportedSource: plugins.filter(plugin => plugin.status === STATUS.unsupportedSource).length,
@@ -427,6 +467,16 @@ export function summarize(plugins) {
     manifestFormats: countBy(installable, plugin => plugin.manifestFormat),
     supportedComponents: countBy(installable, plugin => plugin.supportedComponents),
     unsupportedComponents: countBy(installable, plugin => plugin.unsupportedComponents),
+    hooks: {
+      plugins: hooked.length,
+      fully: hooked.filter(plugin => plugin.hooks.support === HOOK_SUPPORT.fully).length,
+      partly: hooked.filter(plugin => plugin.hooks.support === HOOK_SUPPORT.partly).length,
+      none: hooked.filter(plugin => plugin.hooks.support === HOOK_SUPPORT.none).length,
+      supportedHooks: hooked.reduce((sum, plugin) => sum + plugin.hooks.supported, 0),
+      unsupportedEvents: countBy(hooked, plugin => plugin.hooks.unsupportedEvents),
+      unsupportedTypes: countBy(hooked, plugin => plugin.hooks.unsupportedTypes),
+      unsupportedFields: countBy(hooked, plugin => plugin.hooks.unsupportedFields),
+    },
   };
 }
 
@@ -474,6 +524,16 @@ function describeSourceCell(plugin) {
   const path = source?.path ? ` ${source.path}` : "";
   const pin = source?.sha ? ` @${source.sha.slice(0, REVISION_LENGTH)}` : source?.ref ? ` #${source.ref}` : "";
   return `${plugin.sourceType} ${where}${path}${pin}`.trim();
+}
+
+/** One line on what Tickloop runs of a plugin's hooks and what it skips. */
+function describeHooksCell(hooks) {
+  if (!hooks) return "";
+  const supported = `${hooks.support}: ${hooks.supported} supported${hooks.events.length ? ` (${hooks.events.join(", ")})` : ""}`;
+  const skipped = [["events", hooks.unsupportedEvents], ["types", hooks.unsupportedTypes], ["fields", hooks.unsupportedFields]]
+    .filter(([, names]) => names.length)
+    .map(([kind, names]) => `${kind} ${names.join(", ")}`);
+  return skipped.length ? `${supported}; not supported: ${skipped.join("; ")}` : supported;
 }
 
 export function renderMarkdown(report) {
@@ -529,9 +589,35 @@ export function renderMarkdown(report) {
     table(["Plugin", "Server", "Transport", "Command or address", "OAuth", "userConfig", "Status"],
       report.plugins.flatMap(plugin => (plugin.mcp ?? []).map(server => [plugin.name, server.name, server.transport, server.target, server.oauth, server.userConfig, server.status]))),
     "",
+    "## Hooks",
+    "",
+    "Tickloop runs `command` hooks of its supported events; each runs once the user confirms it. Other events, types and the newer `command` fields are skipped.",
+    "",
+    table(["", "Plugins"], [
+      ["With hooks", totals.hooks.plugins],
+      ["Fully supported", totals.hooks.fully],
+      ["Partly supported", totals.hooks.partly],
+      ["Not supported", totals.hooks.none],
+      ["Supported hooks (all plugins)", totals.hooks.supportedHooks],
+    ]),
+    "",
+    table(["Not supported", "Name", "Plugins"], [
+      ...Object.entries(totals.hooks.unsupportedEvents).map(([name, count]) => ["event", name, count]),
+      ...Object.entries(totals.hooks.unsupportedTypes).map(([name, count]) => ["type", name, count]),
+      ...Object.entries(totals.hooks.unsupportedFields).map(([name, count]) => ["field", name, count]),
+    ]),
+    "",
+    table(["Plugin", "Support", "Supported hooks", "Events", "Types", "Fields", "Unsupported events", "Unsupported types", "Unsupported fields"],
+      report.plugins.filter(plugin => plugin.hooks).map(({ name, hooks }) => [
+        name,
+        hooks.support,
+        hooks.supported,
+        ...[hooks.events, hooks.types, hooks.fields, hooks.unsupportedEvents, hooks.unsupportedTypes, hooks.unsupportedFields].map(names => names.join(", ")),
+      ])),
+    "",
     "## Plugins",
     "",
-    table(["Plugin", "Source", "Status", "Revision", "Manifest", "Version", "Used", "Not supported yet", "Warnings and errors"],
+    table(["Plugin", "Source", "Status", "Revision", "Manifest", "Version", "Used", "Not supported yet", "Hooks", "Warnings and errors"],
       report.plugins.map(plugin => [
         plugin.name,
         describeSourceCell(plugin),
@@ -541,6 +627,7 @@ export function renderMarkdown(report) {
         plugin.version,
         plugin.supportedComponents.join(", "),
         plugin.unsupportedComponents.join(", "),
+        describeHooksCell(plugin.hooks),
         [...plugin.errors, ...plugin.warnings].join("; "),
       ])),
     "",
@@ -590,6 +677,7 @@ async function main() {
   const { markdownPath, jsonPath } = await writeReport(report, outDirectory);
   const { totals } = report;
   console.log(`${totals.plugins} plugins: ${totals.installable} installable (${totals.installableWithSkillsOrTick} with Skills or a Tick program), ${totals.invalid} invalid, ${totals.notFetchable} not fetchable, ${totals.unsupportedSource} with an unsupported source.`);
+  console.log(`${totals.hooks.plugins} installable plugins have hooks: ${totals.hooks.fully} fully supported, ${totals.hooks.partly} partly, ${totals.hooks.none} not supported.`);
   console.log(`Wrote ${markdownPath} and ${jsonPath}.`);
 }
 

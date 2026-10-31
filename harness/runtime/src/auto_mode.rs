@@ -536,6 +536,7 @@ mod tests {
             },
         ];
         let operation = tickloop_harness_protocol::OperationRecord {
+            input_message_id: None,
             parent_call_id: None,
             parent_call_index: None,
             task_binding: None,
@@ -556,7 +557,7 @@ mod tests {
             &operation,
             None,
             None,
-            snapshot.folder.as_deref().unwrap(),
+            snapshot.folder.as_deref(),
             tickloop_harness_policy::AutoSettings::default().policy(),
         )
         .unwrap();

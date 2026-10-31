@@ -1184,6 +1184,20 @@ impl SandboxFixture {
 #[tokio::test]
 async fn sandboxed_build_runs_without_review_unless_auto_allow_is_turned_off() {
     use tickloop_harness::protocol::DirectApprovalReason;
+    // Resolve macOS's developer-tool launcher before timing the sandboxed build itself.
+    let resolved = std::process::Command::new("/usr/bin/xcrun")
+        .args(["--find", "make"])
+        .output()
+        .unwrap();
+    assert!(
+        resolved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+    let make = String::from_utf8(resolved.stdout).unwrap();
+    let make = make.trim();
+    assert!(std::path::Path::new(make).is_absolute());
+    let command = format!("'{}'", make.replace('\'', "'\\''"));
     for auto_allow in [None, Some(true), Some(false)] {
         for mode in [ExecutionMode::Auto, ExecutionMode::AcceptEdits] {
             let mut sandbox = serde_json::json!({"enabled":true, "failIfUnavailable":true});
@@ -1193,7 +1207,7 @@ async fn sandboxed_build_runs_without_review_unless_auto_allow_is_turned_off() {
             let fixture = SandboxFixture::new(sandbox);
             let folder = fixture.workspace.folder.clone().unwrap();
             std::fs::write(folder.join("Makefile"), BUILD_MAKEFILE).unwrap();
-            let run = fixture.run_without_approval_answers("make", mode).await;
+            let run = fixture.run_without_approval_answers(&command, mode).await;
             let case = format!("autoAllowBashIfSandboxed={auto_allow:?} mode={mode:?}");
             let skips_approval = auto_allow != Some(false);
             assert_eq!(

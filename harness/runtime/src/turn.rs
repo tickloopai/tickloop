@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::event_sources::ExternalDelivery;
 use crate::lifecycle::{LedgerInput, ledger_state};
+use crate::task_board_history::ConversationChange;
 use crate::{
     Agent, AgentError, Chat, LoopSnapshotExt, TurnAdmission, WeakAgent, chat_is_busy, rewind,
 };
@@ -74,6 +75,12 @@ pub enum TurnOp {
     },
     /// The user's reply to the question `request` a Run waits on; it joins that Run.
     Answer { request: Uuid, reply: QuestionReply },
+    /// The user's answer to the permission `request` a Run waits on under Durable Approval; it
+    /// joins that Run.
+    AnswerPermission {
+        request: Uuid,
+        reply: PermissionReply,
+    },
     /// An @tickloop request delivered to the Chat's Loop, under the input id its delivery names.
     /// It queues behind the Loop's work, whatever the delivery mode.
     Deliver { delivery: ExternalDelivery },
@@ -87,6 +94,21 @@ pub enum QuestionReply {
     Answered(Vec<QuestionAnswer>),
     /// The question is declined, as Esc does in its dialog; the waiting Run ends there.
     Declined,
+}
+
+/// How the user answers a permission a Run waits on under Durable Approval.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionReply {
+    /// The call runs, this once.
+    AllowOnce,
+    /// The call runs, and a persistent Allow rule is saved in the user's settings for `rule`:
+    /// the tool's name or, for an MCP tool, `mcp__<server>`; without one, for this call's input.
+    /// Those settings are kept per working directory, so a Chat without a Folder refuses it.
+    AllowAlways { rule: Option<String> },
+    /// The call does not run: the model reads the denial, with `comment` when given. Without a
+    /// comment the Run ends there, as after any bare denial.
+    Deny { comment: Option<String> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -384,7 +406,7 @@ impl TurnOp {
             Self::ReplacePrompt { .. } => InputOp::ReplacePrompt,
             Self::RegenerateAnswer { .. } => InputOp::RegenerateAnswer,
             Self::Skill { .. } => InputOp::Skill,
-            Self::Answer { .. } => InputOp::Answer,
+            Self::Answer { .. } | Self::AnswerPermission { .. } => InputOp::Answer,
             Self::Deliver { .. } => InputOp::Feedback,
         }
     }
@@ -464,6 +486,11 @@ impl Agent {
                     .reply_to_question(chat_id, request, reply, Some(ledger))
                     .await;
             }
+            TurnOp::AnswerPermission { request, reply } => {
+                return self
+                    .reply_to_permission(chat_id, request, reply, Some(ledger))
+                    .await;
+            }
             TurnOp::Deliver { delivery } => {
                 return self.take_delivery(chat_id, delivery, ledger).await;
             }
@@ -491,7 +518,10 @@ impl Agent {
                 self.submit_skill(chat_id, skill, host_context, ledger, turn)
                     .await
             }
-            TurnOp::RegenerateAnswer { .. } | TurnOp::Answer { .. } | TurnOp::Deliver { .. } => {
+            TurnOp::RegenerateAnswer { .. }
+            | TurnOp::Answer { .. }
+            | TurnOp::AnswerPermission { .. }
+            | TurnOp::Deliver { .. } => {
                 unreachable!("regenerated, answered or delivered above")
             }
         };
@@ -827,6 +857,7 @@ impl Agent {
         let receipt = {
             let mut chats = self.inner.chats.lock().await;
             self.refuse_when_closed()?;
+            let live = crate::shared_tasks::live_runs(chats.values());
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
             if let Some(replay) = crate::lifecycle::replay(chat, &ledger) {
                 return replay;
@@ -852,7 +883,17 @@ impl Agent {
             let mut candidate = base.clone();
             let cut = (index < base.snapshot.messages.len()).then_some((index, None));
             Self::prepare_cut(base, &mut candidate, cut)?;
-            let board_cleared = crate::shared_tasks::clear_board_for_new_answer(&mut candidate)
+            let board_moved = crate::task_board_history::follow_conversation(
+                &mut candidate.snapshot,
+                &mut candidate.bookkeeping,
+                node.first,
+                ConversationChange::NewAnswer,
+                &live,
+            )
+            .map_err(AgentError::Invalid)?;
+            // The new answer starts over without a finished board; the restored one still
+            // stands before its prompt.
+            let cleared = crate::shared_tasks::cleared_finished_board(&candidate.snapshot)
                 .map_err(AgentError::Invalid)?;
             let selected_leaf = staged.map(|staged| self.install_branch(chat, staged));
             if cut.is_some() {
@@ -864,8 +905,14 @@ impl Agent {
             {
                 self.emit_conversation_rewound(chat, leaf);
             }
-            if board_cleared {
+            if board_moved {
                 self.queue_task_boards(chat);
+            }
+            let board_changed = board_moved || cleared.is_some();
+            if let Some(board) = cleared {
+                let loop_id = chat.snapshot.chat_loop.id;
+                chat.snapshot.task_boards.insert(loop_id, board);
+                self.queue_latest_task_boards(chat);
             }
             let receipt = Receipt {
                 chat_id,
@@ -881,7 +928,7 @@ impl Agent {
                 .expect("the answer's Run is queued")
                 .clone();
             chat.bookkeeping.lifecycle.accept(&ledger, &queued);
-            if board_cleared {
+            if board_changed {
                 self.publish_task_board(&mut chats, chat_id, receipt.loop_id);
             }
             receipt
@@ -1408,6 +1455,7 @@ fn waiting_member(chats: &HashMap<ChatId, Chat>, chat: &Chat, run: RunId) -> Opt
             })
             .collect(),
         tickloop_harness_transcript::WaitKind::Question { .. }
+        | tickloop_harness_transcript::WaitKind::Permission { .. }
         | tickloop_harness_transcript::WaitKind::Handover => Vec::new(),
     };
     runs.into_iter().find_map(|(member, run)| {

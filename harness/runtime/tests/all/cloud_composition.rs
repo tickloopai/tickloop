@@ -293,6 +293,17 @@ async fn eventually<T>(mut probe: impl AsyncFnMut() -> Option<T>) -> T {
 /// `deleting_a_scheduled_task_is_reviewed_under_the_cloud_composition`.
 #[tokio::test]
 async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_cloud_composition() {
+    every_catalog_tool_is_admitted_without_review_or_a_prompt(PromptPolicy::DenyOnPrompt).await;
+}
+
+/// Durable Approval asks a person only what would prompt: the built-in tools the host's rules
+/// allow never ask.
+#[tokio::test]
+async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_durable_approval() {
+    every_catalog_tool_is_admitted_without_review_or_a_prompt(PromptPolicy::DurableApproval).await;
+}
+
+async fn every_catalog_tool_is_admitted_without_review_or_a_prompt(prompt_policy: PromptPolicy) {
     let service = ArtifactService::start().await;
     service.control.skills_enabled.store(true, Ordering::SeqCst);
     let credentials = tempfile::tempdir().unwrap();
@@ -312,6 +323,10 @@ async fn every_catalog_tool_is_admitted_without_review_or_a_prompt_under_the_clo
             // The cloud trusts the Agent's tasks, so the task CronCreate makes is CronUpdate's
             // to change; one waiting for confirmation would not change.
             trust_model_scheduled_tasks: true,
+            host: AgentHostOptions {
+                prompt_policy,
+                ..AgentHostOptions::product_defaults()
+            },
             ..cloud_options(durable_chat_host_rules())
         },
     );
@@ -1898,6 +1913,223 @@ async fn a_skill_from_a_later_source_is_never_invoked_again() {
             "written back as recorded"
         );
     }
+}
+
+#[tokio::test]
+async fn retired_builtin_tickloop_guidance_is_withdrawn_once_and_never_restored() {
+    use tickloop_harness_protocol::{GuidanceNote, HostNote};
+
+    const LEGACY_GUIDANCE: &str = "LEGACY BUILTIN TICKLOOP GUIDANCE";
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+    let (chat, _) = turn_on_a_fresh_replica(&store, &model, None, "One.", async |_, _| {}).await;
+    let legacy = as_written_later(&store, chat, |entry| {
+        entry.insert(
+            "invokedSkills".into(),
+            json!([{"name": "tickloop", "content": LEGACY_GUIDANCE, "source": {"kind": "built_in"}}]),
+        );
+        if entry["message"]["role"] == "user" && entry["message"]["content"][0]["text"] == "One." {
+            entry["message"]["content"][0]["text"] = json!(LEGACY_GUIDANCE);
+            entry.insert(
+                "guidance".into(),
+                json!({"kind": "skill", "name": "tickloop", "digest": "sha256:legacy"}),
+            );
+        }
+    });
+    let original_lines = serde_json::to_value(legacy.lines(chat)).unwrap();
+    for input in ["Two.", "Three."] {
+        let (_, resumed) =
+            turn_on_a_fresh_replica(&legacy, &model, Some(chat), input, async |_, _| {}).await;
+        assert_eq!(
+            resumed
+                .host_notes
+                .values()
+                .filter(|note| matches!(
+                    note,
+                    HostNote::Guidance(GuidanceNote::Withdrawn { skills, .. })
+                        if skills.contains("tickloop")
+                ))
+                .count(),
+            1,
+            "retirement adds one withdrawal across reloads"
+        );
+        assert!(!resumed.visible_guidance().skills.contains_key("tickloop"));
+        let request = model.requests.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            tickloop_harness_test_support::routed::history_text(&request)
+                .matches(LEGACY_GUIDANCE)
+                .count(),
+            1,
+            "the original guidance stays in history without being repeated"
+        );
+        let written = serde_json::to_value(legacy.lines(chat)).unwrap();
+        let original = original_lines.as_array().unwrap();
+        assert_eq!(&written.as_array().unwrap()[..original.len()], original);
+    }
+    let (_, compacted) = turn_on_a_fresh_replica(
+        &legacy,
+        &model,
+        Some(chat),
+        "After compaction.",
+        async |agent, chat| {
+            agent.compact(chat).await.unwrap();
+        },
+    )
+    .await;
+    assert!(!compacted.message_compactions.is_empty());
+    assert!(!compacted.visible_guidance().skills.contains_key("tickloop"));
+    let request = model.requests.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        !tickloop_harness_test_support::routed::history_text(&request).contains(LEGACY_GUIDANCE),
+        "compaction must not reactivate retired guidance"
+    );
+}
+
+#[tokio::test]
+async fn retiring_tickloop_only_excludes_the_exact_builtin_source_and_name() {
+    const GUIDANCE: &str = "RESTORED TICKLOOP NAMED SKILL GUIDANCE";
+    for (name, source, guides) in [
+        ("tickloop", json!({"kind": "built_in"}), false),
+        (
+            "tickloop",
+            json!({"kind": "user", "path": "/user/skills/tickloop/SKILL.md"}),
+            true,
+        ),
+        (
+            "tickloop",
+            json!({"kind": "project", "path": "/project/skills/tickloop/SKILL.md"}),
+            true,
+        ),
+        (
+            "tickloop:usage",
+            json!({"kind": "plugin", "plugin": "tickloop", "path": "/plugin/skills/usage/SKILL.md"}),
+            true,
+        ),
+        ("tickloop-extra", json!({"kind": "built_in"}), true),
+    ] {
+        let store = Arc::new(InMemoryTranscriptStore::new());
+        let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+        let (chat, _) =
+            turn_on_a_fresh_replica(&store, &model, None, "One.", async |_, _| {}).await;
+        let legacy = as_written_later(&store, chat, |entry| {
+            entry.insert(
+                "invokedSkills".into(),
+                json!([{
+                    "name": name, "content": GUIDANCE, "source": source,
+                }]),
+            );
+        });
+        let (_, resumed) = turn_on_a_fresh_replica(
+            &legacy,
+            &model,
+            Some(chat),
+            "Continue.",
+            async |agent, chat| {
+                agent.compact(chat).await.unwrap();
+            },
+        )
+        .await;
+        assert_eq!(
+            resumed.visible_guidance().skills.contains_key(name),
+            guides,
+            "{name}: {source}"
+        );
+        let request = model.requests.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            tickloop_harness_test_support::routed::history_text(&request).contains(GUIDANCE),
+            guides,
+            "{name}: {source}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_branch_does_not_reactivate_retired_builtin_tickloop_guidance() {
+    const LEGACY_GUIDANCE: &str = "RETIRED TICKLOOP BRANCH GUIDANCE";
+    let folder = tempfile::tempdir().unwrap();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Arc::new(RoutedModel::new(|_| text("Done.")));
+    let make_agent = |store: Arc<InMemoryTranscriptStore>| {
+        Agent::with_seams(
+            HarnessSeams {
+                search: None,
+                transcripts: Some(store),
+                environment: Some(Arc::new(
+                    tickloop_harness_runtime::environment::FolderEnvironment::bare(),
+                )),
+                models: ChosenModels::new(model.clone()),
+            },
+            cloud_options(durable_chat_host_rules()),
+        )
+        .unwrap()
+    };
+    let agent = make_agent(store.clone());
+    agent
+        .trust_working_directory(folder.path().to_path_buf())
+        .await
+        .unwrap();
+    let chat = agent
+        .create_chat(folder.path().to_path_buf())
+        .await
+        .unwrap();
+    let request = prompt("One.");
+    agent.advance(chat, request.clone()).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(WAIT, agent.settled_input(chat, request.input_id))
+            .await
+            .unwrap()
+            .unwrap(),
+        SettledOutcome::Completed { .. }
+    ));
+    agent.shutdown().await;
+    agent.sync().await.unwrap();
+    let legacy = as_written_later(&store, chat, |entry| {
+        entry.insert(
+            "invokedSkills".into(),
+            json!([{
+                "name": "tickloop", "content": LEGACY_GUIDANCE, "source": {"kind": "built_in"},
+            }]),
+        );
+    });
+    let agent = make_agent(legacy.clone());
+    agent
+        .trust_working_directory(folder.path().to_path_buf())
+        .await
+        .unwrap();
+    agent.resume_chat(chat).await.unwrap();
+    let branch = agent
+        .branch_chat(tickloop_harness_protocol::BranchRequest {
+            request_id: Uuid::new_v4(),
+            source_chat_id: chat,
+            name: Some("Retired guidance".into()),
+        })
+        .await
+        .unwrap()
+        .child_chat_id;
+    agent.shutdown().await;
+    agent.sync().await.unwrap();
+    let agent = make_agent(legacy);
+    agent
+        .trust_working_directory(folder.path().to_path_buf())
+        .await
+        .unwrap();
+    agent.resume_chat(branch).await.unwrap();
+    let request = prompt("Continue.");
+    agent.advance(branch, request.clone()).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(WAIT, agent.settled_input(branch, request.input_id))
+            .await
+            .unwrap()
+            .unwrap(),
+        SettledOutcome::Completed { .. }
+    ));
+    let resumed = agent.snapshot(branch).await.unwrap();
+    assert!(!resumed.visible_guidance().skills.contains_key("tickloop"));
+    let request = model.requests.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        !tickloop_harness_test_support::routed::history_text(&request).contains(LEGACY_GUIDANCE)
+    );
+    agent.shutdown().await;
 }
 
 /// An answer whose model or private history source a later version recorded with values this

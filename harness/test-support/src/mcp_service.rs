@@ -34,6 +34,8 @@ struct State {
     resume_directory: bool,
     directory_response: Option<Value>,
     directory_resumes: usize,
+    directory_resume_id: Option<String>,
+    empty_sse_priming: bool,
     resources_capability: Option<Value>,
     resources: Value,
     resource_text: String,
@@ -73,6 +75,8 @@ impl McpService {
                 resume_directory: false,
                 directory_response: None,
                 directory_resumes: 0,
+                directory_resume_id: None,
+                empty_sse_priming: false,
                 resources_capability: Some(json!({})),
                 resources: json!([{"uri":"fixture://text","name":"text"}]),
                 resource_text: "resource text".into(),
@@ -121,7 +125,14 @@ impl McpService {
                                 let response = {
                                     let mut state = state.lock().unwrap();
                                     let response = state.directory_response.take();
-                                    if response.is_some() { state.directory_resumes += 1; }
+                                    if response.is_some() {
+                                        state.directory_resumes += 1;
+                                        state.directory_resume_id = headers.lines().find_map(|line| {
+                                            let (name, value) = line.split_once(':')?;
+                                            name.eq_ignore_ascii_case("last-event-id")
+                                                .then(|| value.trim().to_owned())
+                                        });
+                                    }
                                     response
                                 };
                                 if let Some(response) = response {
@@ -205,14 +216,39 @@ impl McpService {
                                     true
                                 } else { false }
                             };
+                            let empty_sse_priming = state.lock().unwrap().empty_sse_priming;
+                            let discover_error_over_sse = request["method"] == "server/discover"
+                                && state.lock().unwrap().discover_error_over_sse;
+                            let prime_sse =
+                                empty_sse_priming && request["method"] != "server/discover";
                             let (status, content_type, body) = if resume_directory {
-                                (200, "text/event-stream", "id: directory-cut\nretry: 0\n\n".into())
+                                let data = if empty_sse_priming { "data: \n" } else { "" };
+                                (
+                                    200,
+                                    "text/event-stream",
+                                    format!("{data}id: directory-cut\nretry: 0\n\n"),
+                                )
                             } else if request.get("id").is_none() {
                                 (202, "application/json", String::new())
-                            } else if !notifications.is_empty() || (request["method"] == "server/discover" && state.lock().unwrap().discover_error_over_sse) {
-                                let events: String = notifications.iter().map(|notification| format!("data: {notification}\n\n")).collect();
-                                (status, "text/event-stream", format!("{events}data: {response}\n\n"))
-                            } else { (status, "application/json", response.to_string()) };
+                            } else if !notifications.is_empty() || discover_error_over_sse || prime_sse
+                            {
+                                let priming = if empty_sse_priming {
+                                    "data: \nid: 0\nretry: 3000\n\n"
+                                } else {
+                                    ""
+                                };
+                                let events: String = notifications
+                                    .iter()
+                                    .map(|notification| format!("data: {notification}\n\n"))
+                                    .collect();
+                                (
+                                    status,
+                                    "text/event-stream",
+                                    format!("{priming}{events}data: {response}\n\n"),
+                                )
+                            } else {
+                                (status, "application/json", response.to_string())
+                            };
                             let (status, body) = state.lock().unwrap().http_responses.get(request["method"].as_str().unwrap_or("")).cloned().unwrap_or((status, body));
                             let challenge = challenge.map(|value| format!("WWW-Authenticate: {value}\r\n")).unwrap_or_default();
                             let body_length = body.len() + if request["method"] == "server/discover" && state.lock().unwrap().truncate_discover { 100 } else { 0 };
@@ -314,11 +350,17 @@ impl McpService {
     pub async fn discover_disconnected(&self) {
         self.discover_disconnected.notified().await;
     }
+    pub fn prime_sse_with_empty_data(&self) {
+        self.state.lock().unwrap().empty_sse_priming = true;
+    }
     pub fn resume_tool_directory_once(&self) {
         self.state.lock().unwrap().resume_directory = true;
     }
     pub fn directory_resumes(&self) -> usize {
         self.state.lock().unwrap().directory_resumes
+    }
+    pub fn directory_resume_id(&self) -> Option<String> {
+        self.state.lock().unwrap().directory_resume_id.clone()
     }
     pub fn notify_log(&self, text: &str) {
         self.state.lock().unwrap().notification = Some(

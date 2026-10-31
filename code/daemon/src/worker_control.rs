@@ -392,7 +392,19 @@ impl WorkerControl {
             } => {
                 let _lifecycle = registry.lifecycle(chat).await;
                 // An instance whose host died since the last listing is lost only once settled.
-                let listing = self.controller.owner_listing(&tick_owner).await?;
+                let mut listing = self.controller.owner_listing(&tick_owner).await?;
+                // A terminal Tick whose program exited only shows its last screen: closing it
+                // first ends it by itself, as reopening one that ended expects.
+                if listing
+                    .running
+                    .as_ref()
+                    .is_some_and(|running| running.exited.contains(&instance))
+                {
+                    self.controller
+                        .close(Uuid::new_v4(), &tick_owner, &instance)
+                        .await?;
+                    listing = self.controller.owner_listing(&tick_owner).await?;
+                }
                 registry
                     .settle_launches(&self.controller, &tick_owner, &listing)
                     .await?;

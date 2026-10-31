@@ -4,7 +4,7 @@ use super::super::{
     task_access::ShellTaskCenter,
 };
 use super::*;
-use crate::monitor_rows::{REMOVE_KEY, SUBSCRIBE_KEY, TickIntent};
+use crate::monitor_rows::{REMOVE_KEY, SUBSCRIBE_KEY, TickIntent, UNSUBSCRIBE_ROW_KEY};
 
 /// The Console executor that carries out a Monitor row's intent. A notice has none: the Console
 /// only shows it.
@@ -16,11 +16,17 @@ pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickA
         // The Console shows and enters Monitor cards itself.
         TickIntent::OpenView(_) => return None,
         TickIntent::CloseHosted { instance, .. } => Arc::new(CloseHosted { instance }),
+        TickIntent::OpenFullScreen(instance) => Arc::new(OpenFullScreen { instance }),
         TickIntent::ReopenHosted(instance) => Arc::new(ReopenHosted {
             instance,
             card: ReopenedCard::Enter,
         }),
+        TickIntent::ReopenFullScreen(instance) => Arc::new(ReopenHosted {
+            instance,
+            card: ReopenedCard::FullScreen,
+        }),
         TickIntent::Subscribe(instance) => Arc::new(Subscribe { instance }),
+        TickIntent::Unsubscribe(instance) => Arc::new(Unsubscribe { instance }),
         TickIntent::SendUpdate(instance) => Arc::new(SendUpdate { instance }),
         TickIntent::StopShell { task } => Arc::new(StopShell { task }),
         TickIntent::Artifact { id, key } => artifact(&id, key),
@@ -266,6 +272,37 @@ impl TickActionBackend for AttachCard {
     }
 }
 
+/// Enter or a double click on a Terminal Tick's or a Shell's row: a one-time view grant from the
+/// Agent, with which the view takes this whole terminal.
+struct OpenFullScreen {
+    instance: tick_protocol::InstanceRef,
+}
+impl TickActionExecutor for OpenFullScreen {
+    fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        ui.monitor_entry(&self.instance)
+            .ok_or("This Tick is no longer in Monitor")?;
+        Ok(PreparedTickAction::new(
+            self.instance.to_string(),
+            crate::monitor_rows::MONITOR_ENTER_KEY,
+            Arc::new(OpenFullScreen {
+                instance: self.instance.clone(),
+            }),
+        ))
+    }
+}
+#[async_trait]
+impl TickActionBackend for OpenFullScreen {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
+        let grant = ctx
+            .agent
+            .attach_hosted_tick(ctx.chat, self.instance.clone())
+            .await
+            .map_err(|error| format!("Cannot open {}: {error}", self.instance.public()))?;
+        ctx.console
+            .begin_full_screen_attach(ctx.chat, self.instance.clone(), grant)
+    }
+}
+
 struct NoBackend;
 #[async_trait]
 impl TickActionBackend for NoBackend {
@@ -381,6 +418,8 @@ pub(in crate::terminal) enum ReopenedCard {
     Show,
     /// Enter: shows it and gives it the keys.
     Enter,
+    /// Enter on a Terminal Tick: shows the new instance full screen.
+    FullScreen,
 }
 
 /// Reopens a hosted Tick from its row with Space, which shows the new instance's card.
@@ -425,6 +464,15 @@ impl TickActionBackend for ReopenHosted {
         if let Some(error) = restore_error {
             ctx.notify(&format!("Reopened as {reopened}; {}", safe_text(&error)))?;
         }
+        if self.card == ReopenedCard::FullScreen {
+            if ctx
+                .console
+                .reopened_opens_full_screen(ctx.chat, &reopened)?
+            {
+                OpenFullScreen { instance: reopened }.execute(ctx).await?;
+            }
+            return Ok(());
+        }
         if ctx
             .console
             .show_reopened_card(ctx.chat, &reopened, self.card)?
@@ -460,9 +508,32 @@ impl TickActionBackend for SendUpdate {
     }
 }
 
+/// The row's `S`: cancels the Chat's periodic subscriptions on the Tick, shown cancelled at once.
+struct Unsubscribe {
+    instance: tick_protocol::InstanceRef,
+}
+impl TickActionExecutor for Unsubscribe {
+    fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        let subscription = ui
+            .unsubscribe(&self.instance)
+            .ok_or("This Tick has no subscription to cancel")?;
+        Ok(PreparedTickAction::new(
+            self.instance.to_string(),
+            UNSUBSCRIBE_ROW_KEY,
+            Arc::new(ChangeSubscription {
+                panel: None,
+                request: SubscriptionRequest {
+                    subscription,
+                    change: tickloop_harness::protocol::TickSubscriptionChange::Cancel,
+                },
+            }),
+        ))
+    }
+}
+
 /// The row's `s` on an extension or terminal Tick: subscribes the Chat at the default frequency
-/// on its user's word, or, once a Loop of the Chat subscribes to it, cycles that subscription's
-/// frequency.
+/// on its user's word, or, once a Loop of the Chat subscribes to it, cycles that subscription
+/// through the periodic frequencies without ever cancelling it.
 struct Subscribe {
     instance: tick_protocol::InstanceRef,
 }
@@ -495,14 +566,11 @@ impl TickActionBackend for Subscribe {
             .filter(|row| row.frequency.period().is_some())
             .min_by_key(|row| row.frequency.period())
         {
-            let change = match row.frequency {
-                tickloop_harness::protocol::TickSubscriptionFrequency::Low => {
-                    tickloop_harness::protocol::TickSubscriptionChange::Cancel
-                }
-                frequency => tickloop_harness::protocol::TickSubscriptionChange::Frequency(
-                    frequency.next_periodic().expect("periodic subscription"),
-                ),
-            };
+            let change = tickloop_harness::protocol::TickSubscriptionChange::Frequency(
+                row.frequency
+                    .next_periodic()
+                    .expect("periodic subscription"),
+            );
             return ChangeSubscription {
                 panel: None,
                 request: SubscriptionRequest {

@@ -109,6 +109,7 @@ async fn scheduled_wrapper_provenance_survives_persistence_and_history_load() {
         ),
         loop_instructions_error_prompt(&task_text(TASK), "permission denied"),
         final_scheduled_run_prompt("Check the release"),
+        "/guide check the Ticks".into(),
         "/tickloop check the Ticks".into(),
         DEFAULT_INSTRUCTIONS_PROMPT.into(),
     ] {
@@ -123,7 +124,13 @@ async fn scheduled_wrapper_provenance_survives_persistence_and_history_load() {
         ]));
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
-        std::fs::create_dir_all(directory.path().join(".tickloop")).unwrap();
+        let skill_directory = directory.path().join(".tickloop/skills/guide");
+        std::fs::create_dir_all(&skill_directory).unwrap();
+        std::fs::write(
+            skill_directory.join("SKILL.md"),
+            "---\nname: guide\ndescription: Test guidance\n---\nGuide $ARGUMENTS",
+        )
+        .unwrap();
         let origin = directory.path().join(".tickloop/loop.md");
         std::fs::write(&origin, loop_text).unwrap();
         let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
@@ -151,9 +158,9 @@ async fn scheduled_wrapper_provenance_survives_persistence_and_history_load() {
                         instructions: loop_text.into(),
                     }],
                 )
-            } else if instruction.starts_with('/') {
+            } else if instruction.starts_with("/guide ") {
                 (
-                    scheduled_skill_prompt(&task_text(task.id), "tickloop", "check the Ticks"),
+                    scheduled_skill_prompt(&task_text(task.id), "guide", "check the Ticks"),
                     instruction.clone(),
                     vec![ScheduledInputWrapper::Skill {
                         instruction: instruction.clone(),

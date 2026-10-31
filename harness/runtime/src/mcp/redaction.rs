@@ -1,8 +1,9 @@
 use super::*;
+use crate::secret_redaction::SecretRedactor;
 
 pub(super) struct Redactor {
     secrets: std::collections::BTreeSet<String>,
-    matcher: aho_corasick::AhoCorasick,
+    matcher: SecretRedactor,
 }
 impl Redactor {
     pub(super) fn new(entry: &Entry) -> Option<Self> {
@@ -69,63 +70,19 @@ impl Redactor {
         {
             return None;
         }
-        let normalizer = icu_normalizer::ComposingNormalizerBorrowed::new_nfc();
-        let mut variants = std::collections::BTreeSet::new();
-        for secret in &secrets {
-            let secret = normalizer.normalize(secret).into_owned();
-            variants.insert(secret.clone());
-            let encoded =
-                percent_encoding::utf8_percent_encode(&secret, percent_encoding::NON_ALPHANUMERIC)
-                    .to_string();
-            variants.insert(encoded.clone());
-            variants.insert(encoded.replace("%2F", "%2f").replace("%2B", "%2b"));
-            variants.insert(secret.bytes().map(|b| format!("%{b:02X}")).collect());
-            variants.insert(secret.bytes().map(|b| format!("%{b:02x}")).collect());
-            variants.insert(
-                serde_json::to_string(&secret)
-                    .unwrap_or_default()
-                    .trim_matches('"')
-                    .to_owned(),
-            );
-        }
-        // OAuth tokens are long; avoid determinizing their encoded variants on rotation.
-        let matcher = aho_corasick::AhoCorasick::builder()
-            .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
-            .build(variants)
-            .expect("valid secret patterns");
+        #[cfg(feature = "test-support")]
+        super::test_pauses::wait(
+            super::test_pauses::PausePoint::RedactorBuild,
+            &entry.config.name,
+        );
+        let matcher = SecretRedactor::new(&secrets);
         Some(Self { secrets, matcher })
     }
+    /// Whether the redactor redacts `secret`.
+    pub(super) fn covers(&self, secret: &str) -> bool {
+        self.secrets.contains(secret)
+    }
     pub(super) fn redact(&self, content: String) -> String {
-        let normalizer = icu_normalizer::ComposingNormalizerBorrowed::new_nfc();
-        let content = normalizer.normalize(&content);
-        let mut matches: Vec<_> = self
-            .matcher
-            .find_overlapping_iter(content.as_bytes())
-            .collect();
-        if matches.is_empty() {
-            return content.into_owned();
-        }
-        // Preserve longest-pattern priority even when a shorter match starts earlier.
-        matches.sort_unstable_by_key(|m| (std::cmp::Reverse(m.len()), m.pattern(), m.start()));
-        let mut selected = BTreeMap::new();
-        for matched in matches {
-            if selected
-                .range(..matched.end())
-                .next_back()
-                .is_some_and(|(_, end)| *end > matched.start())
-            {
-                continue;
-            }
-            selected.insert(matched.start(), matched.end());
-        }
-        let mut result = String::with_capacity(content.len());
-        let mut end = 0;
-        for (start, next) in selected {
-            result.push_str(&content[end..start]);
-            result.push_str("[redacted]");
-            end = next;
-        }
-        result.push_str(&content[end..]);
-        result
+        self.matcher.redact(content)
     }
 }

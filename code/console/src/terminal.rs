@@ -18,6 +18,8 @@ mod agent_messaging;
 mod approval_status;
 mod artifact_ui;
 mod artifacts_picker;
+mod attach;
+pub mod attach_command;
 mod auto_setup_surface;
 mod background_work;
 #[cfg(test)]
@@ -48,6 +50,9 @@ mod file_mentions;
 mod footer;
 mod goal_view;
 mod herdr_agent;
+mod hook_activity;
+mod hooks_panel;
+mod hooks_work;
 mod hosted_probe;
 mod hyperlink;
 mod image_cache;
@@ -94,6 +99,7 @@ mod scrollback;
 mod selection;
 mod settings;
 mod shell_input;
+mod stall_watch;
 mod status_area;
 mod style;
 mod subagent_panel;
@@ -105,6 +111,7 @@ mod thinking_preview;
 pub mod tick_actions;
 mod tick_labels;
 mod ticks_panel;
+pub use ticks_panel::hooks_to_confirm_summary;
 mod ticks_work;
 mod transcript;
 mod update_notice;
@@ -484,6 +491,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/plugins"
                 | "/ticks"
                 | "/mcp"
+                | "/hooks"
                 | "/settings"
                 | "/permissions"
                 | "/sandbox"
@@ -908,6 +916,7 @@ Usage: tickloop [--cwd DIRECTORY]
        tickloop acp [--working-directory-is-trusted]
        tickloop update [--check | --status]
        tickloop daemon stop
+       tickloop attach [INSTANCE]
        tickloop tick install TICK[@MARKETPLACE] | install --path PATH | update [TICK] | uninstall TICK [--keep-data] | enable TICK | disable TICK | list [--available] | login TICK [--issuer LABEL] | logout TICK
        tickloop plugin install PLUGIN[@MARKETPLACE] | install --path PATH | update [PLUGIN] | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | validate DIRECTORY | marketplace add SOURCE | marketplace list | marketplace update [MARKETPLACE] | marketplace remove MARKETPLACE
        tickloop mcp list | add NAME URL [--header 'NAME: VALUE']... [--dir] | add NAME [--env NAME=VALUE]... [--dir] -- COMMAND [ARGUMENTS...] | remove NAME [--dir] | login NAME | logout NAME
@@ -917,6 +926,7 @@ Print/ACP use new managed Chats, not Console resume. They disable questions, Pla
 ACP stdout contains protocol traffic only; it offers one-time tool permissions, cancellation, session listing and loading, and approved session-scoped stdio MCP, not client filesystem or terminal execution.
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
+attach shows a Tick or a Shell that a running Agent opened full screen in this terminal, chosen from a list without INSTANCE; hiding it leaves the Tick running.
 Run tickloop again to start this build. Each config root (~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set) has one daemon.
 tick manages Ticks, the plugins that carry a Tick program: installs one by name from a marketplace or from its directory or archive, updates, enables, disables or uninstalls one, logs one in or out of its data source, or lists those installed or available; tickloop tick --help explains them.
 plugin manages the plugins without a Tick program the same way, manages marketplaces, or checks a plugin directory; tickloop plugin --help explains them.
@@ -949,7 +959,7 @@ Click Subagents N to hide/show the list. In the list enter opens an Agent (modif
 Subagents wear the colour they were given at creation; the input takes the colour of the subagent it is viewing.
 The key hints always end the screen; notices share that row.
 shift+up/down focuses Monitor's Shells group; enter opens the selected Shell.
-space or a click on a hosted Tick or a Shell in Monitor shows or hides its live screen as a card under its row, and several cards can stay open; enter enters the card, or a click in it does: keys, ctrl+c and a single esc included, go to the Tick until esc esc leaves the card back to the list, which shows other cards with space, while the card stays shown and the Tick keeps running; a Tick that hands back keys it does not use also leaves on one esc, moves to the card above or below with the arrows, to the next row with tab and to the input with left; a click outside leaves too and then acts where it landed, so a click on another row shows its card; a Shell's screen only shows it, and esc leaves it. tab and shift+tab select every row in turn and preview its card until tab moves on, unless you enter it; a click on an edge line counting updated rows above or below selects one. Rows keep the order they joined. Press x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. space on a Tick this Chat opened that no longer runs reopens it in place, restoring its subscriptions at their frequencies, and shows its card, and enter reopens it and enters the card; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
+space or a click on an extension Tick in Monitor shows or hides its live screen as a card under its row, and several cards can stay open; enter enters the card, or a click in it does: keys, ctrl+c and a single esc included, go to the Tick until esc esc leaves the card back to the list, which shows other cards with space, while the card stays shown and the Tick keeps running; a Tick that hands back keys it does not use also leaves on one esc, moves to the card above or below with the arrows, to the next row with tab and to the input with left; a click outside leaves too and then acts where it landed, so a click on another row shows its card. A terminal Tick or a Shell has no card: enter or a double click shows it full screen. There keys, ctrl+c included, go to a terminal Tick, its first esc too, and a second esc within a second hides it; a Shell's screen hides on esc, scrolls with the arrows, ctrl+n/p and page up/down, follows its newest output again with G or end, and ctrl+c stops it. Hiding leaves the Tick running; tickloop attach shows any of them full screen from another terminal. tab and shift+tab select every row in turn and preview its card until tab moves on, unless you enter it; a click on an edge line counting updated rows above or below selects one. Rows keep the order they joined. Press x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. space on an extension Tick this Chat opened that no longer runs reopens it in place, restoring its subscriptions at their frequencies, and shows its card, and enter reopens it and enters the card, or for a terminal Tick shows it full screen; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
 The shared tasks summary appears only when tasks exist. ctrl+t expands or focuses it; ctrl+n/p select, enter shows details, esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
@@ -1373,6 +1383,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         session_persistence,
         exact_chat: None,
         host_work_context,
+        after_clear: false,
         environment: std::env::vars_os()
             .map(|(name, value)| EnvironmentValue {
                 name: name.as_os_str().as_bytes().to_vec(),
@@ -1936,6 +1947,12 @@ async fn interact(
     startup: StartupState,
     config_root: Option<PathBuf>,
 ) -> Result<(), String> {
+    #[cfg(not(test))]
+    if console.is_interactive()
+        && let Some(root) = &config_root
+    {
+        stall_watch::install(root);
+    }
     // This is a View integration, not a daemon integration: only a terminal actually hosted
     // by Herdr owns a pane identity. Ordinary terminals never start the reporter.
     let mut herdr_reporter = herdr_agent::Reporter::from_environment(console.is_interactive());
@@ -2005,7 +2022,10 @@ async fn interact_with_herdr(
     ));
     let mut artifact_loads = tokio::task::JoinSet::new();
     let mut tick_package_tasks = ticks_work::TickPackageTasks::new(agent.clone());
+    let mut monitor_actions =
+        tick_actions::MonitorActionQueue::new(agent.clone(), console.clone(), config_root.clone());
     let mut mcp_tasks = mcp_work::McpTasks::default();
+    let mut hook_tasks = hooks_work::HookTasks::default();
     // While `/mcp` shows servers that are still connecting, it reads them again this often.
     let mut mcp_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
     mcp_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2209,10 +2229,21 @@ async fn interact_with_herdr(
         write_warning(console, HANDOFF_AGENT_ENDED)?;
     }
     loop {
+        let preparing = stall_watch::enter("main loop: before select");
         observed_run_starts.retain(|run, _| pending.contains_key(run));
         awaited_mcp_servers.retain(|run, _| pending.contains_key(run));
         suggestible_runs.retain(|run| pending.contains_key(run));
         let dispatch_directory = global.projection().dispatch_directory;
+        if interactive && config_root.is_some() {
+            hooks_work::offer_review(
+                console,
+                agent,
+                selected_chat.is_none() && !overview_active,
+                selected_chat.map(Into::into),
+                &dispatch_directory,
+                &mut hook_tasks,
+            )?;
+        }
         menus.set_new_agent_directory(dispatch_directory.clone());
         agent.set_new_agent_directory(dispatch_directory);
         if !overview_active && ui_selected != selected_chat {
@@ -3010,13 +3041,16 @@ async fn interact_with_herdr(
         let global_refresh_enabled = agent.recovery_refresh_enabled();
         #[cfg(not(test))]
         let global_refresh_enabled = true;
+        drop(preparing);
         tokio::select! {
             _ = background_poll.tick(), if background_work.is_waiting() => {},
             _ = activation_refresh.tick(), if interactive && activation_checks.is_empty() => {
+                let _stall = stall_watch::enter("main loop: activation refresh");
                 let initial = std::mem::take(&mut initial_activation);
                 activation_checks.spawn(runtime_upgrade::check(agent.clone(), initial));
             },
             checked = activation_checks.join_next(), if !activation_checks.is_empty() => {
+                let _stall = stall_watch::enter("main loop: activation check");
                 ready_runtime = None;
                 match checked {
                 Some(Ok(Ok(mut activation))) => {
@@ -3043,6 +3077,7 @@ async fn interact_with_herdr(
                 }
             },
             result = completed_task_cleanups.join_next(), if !completed_task_cleanups.is_empty() => {
+                let _stall = stall_watch::enter("main loop: task cleanup");
                 match result {
                     Some(Ok(Ok(()))) => {},
                     Some(Ok(Err(error))) => {
@@ -3057,24 +3092,40 @@ async fn interact_with_herdr(
             },
             _ = artifact_refresh.tick(), if console.artifacts_picker_is_open()? => {},
             result = artifact_loads.join_next(), if !artifact_loads.is_empty() => {
+                let _stall = stall_watch::enter("main loop: artifact load");
                 if let Some(Ok((request, result))) = result { console.artifact_page_loaded(&request, result)?; }
             },
+            result = monitor_actions.finished(), if monitor_actions.is_running() => {
+                let _stall = stall_watch::enter("main loop: Monitor action finished");
+                if let Err((chat, error)) = result { console.report_monitor_error(chat, &error)?; }
+                status_dirty=true;
+            },
             result = tick_package_tasks.join_next(), if !tick_package_tasks.is_empty() => {
+                let _stall = stall_watch::enter("main loop: Tick package task");
                 if let Some((panel, result)) = result && let Some(root) = config_root.as_deref() {
                     ticks_work::finish(console, root, panel, result, &mut tick_package_tasks)?;
                 }
             },
             result = mcp_tasks.join_next(), if !mcp_tasks.is_empty() => {
+                let _stall = stall_watch::enter("main loop: MCP task");
                 if let Some((panel, done)) = result && let Some(root) = config_root.as_deref() {
                     mcp_work::finish(console, root, agent, panel, done, &mut mcp_tasks)?;
                 }
             },
+            done = hook_tasks.join_next(), if !hook_tasks.is_empty() => {
+                let _stall = stall_watch::enter("main loop: hook task");
+                if let Some(done) = done {
+                    hooks_work::finish(console, agent, done, &mut hook_tasks)?;
+                }
+            },
             _ = mcp_refresh.tick(), if console.mcp_panel_awaiting_connections()?.is_some() => {
+                let _stall = stall_watch::enter("main loop: MCP refresh");
                 if let Some(panel) = console.mcp_panel_awaiting_connections()? && let Some(root) = config_root.as_deref() {
                     mcp_work::refresh(root, agent, panel, &mut mcp_tasks);
                 }
             },
             result = suggestions.join_next(), if !suggestions.is_empty() => {
+                let _stall = stall_watch::enter("main loop: prompt suggestion");
                 if let Some(Ok((request, mut result))) = result {
                     let suppression = if selected_chat != Some(request.chat.into()) || overview_active {
                         Some("discarded: Agent View changed")
@@ -3100,6 +3151,7 @@ async fn interact_with_herdr(
                 }
             },
             result = menus.next_provider_update(), if discovery_active || search_test_active => {
+                let _stall = stall_watch::enter("main loop: provider update");
                 match result {
                     menus::ProviderUpdate::Search(result) => menus.finish_search_test(console, result)?,
                     menus::ProviderUpdate::Models(result) => menus.finish_discovery(agent, console, result).await?,
@@ -3107,6 +3159,7 @@ async fn interact_with_herdr(
                 status_dirty = true;
             },
             (login_id, update) = login::next_login_update(&mut logins), if login_updates_pending => {
+                let _stall = stall_watch::enter("main loop: login update");
                 match update {
                     Some(LoginUpdate::Device { address, code }) => logins[&login_id].flow.show_device(console, &address, &code)?,
                     Some(LoginUpdate::Browser { address, callback }) => logins.get_mut(&login_id).unwrap().flow.show_browser(console, address, callback)?,
@@ -3148,6 +3201,7 @@ async fn interact_with_herdr(
                 status_dirty = true;
             },
             result = async { logout.as_mut().unwrap().next().await }, if logout_active => {
+                let _stall = stall_watch::enter("main loop: logout");
                 logout.take();
                 match result {
                     Ok(()) => {
@@ -3173,6 +3227,7 @@ async fn interact_with_herdr(
                 else if !login_active && !logout_active && let Some(command)=menu_commands.pop_front() {Some(InputEvent::Line(command))}
                 else {input.recv().await}
             }, if !eof || (!logout_active && (!paused_inputs.is_empty() || !menu_commands.is_empty())) => {
+                let _stall = stall_watch::enter("main loop: input");
                 // Opening the overview, navigating, restoring or any other View action may show
                 // the conversation again, so a merged-input block only spans uninterrupted events.
                 merged_echoes.close_all();
@@ -3181,9 +3236,7 @@ async fn interact_with_herdr(
                 }
                 let line = match line {
                     Some(InputEvent::TickAction { chat, action }) if selected_chat == Some(chat.into()) && !overview_active && !login_active => {
-                        let context = tick_actions::TickActionContext { agent, console, root:config_root.as_deref(), chat };
-                        if let Err(error) = tick_actions::execute(action,context).await { console.report_monitor_error(chat, &error)?; }
-                        status_dirty=true;
+                        monitor_actions.submit(chat, action)?;
                         continue;
                     }
                     Some(InputEvent::TickAction { .. }) => continue,
@@ -3449,6 +3502,7 @@ async fn interact_with_herdr(
                 Some(InputEvent::Mcp(work)) => {
                     if let Some(root) = config_root.as_deref() { mcp_work::start(console, root, agent, work, &mut mcp_tasks)?; }
                 },
+                Some(InputEvent::Hooks(work)) => hooks_work::start(agent, work, &mut hook_tasks),
                 Some(InputEvent::TickAction { .. }) => {},
                 Some(InputEvent::OpenRewind) => {
                     let is_busy=selected_chat.is_some_and(|chat| pending.values().any(|receipt|receipt.chat_id==chat)
@@ -4131,6 +4185,12 @@ async fn interact_with_herdr(
                             if !interactive { outln!(console, "/mcp needs an interactive terminal; run tickloop mcp list there instead."); continue; }
                             if let Err(error) = mcp_work::open(console, root, agent, selected_chat.map(Into::into), workdir.clone(), &mut mcp_tasks) { outln!(console, "Cannot open /mcp: {}", safe_text(&error)); }
                         },
+                        command if command.split_whitespace().next() == Some("/hooks") => {
+                            if command.split_whitespace().count() != 1 { outln!(console, "Use /hooks"); continue; }
+                            if config_root.is_none() { outln!(console, "/hooks needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; }
+                            if !interactive { outln!(console, "/hooks needs an interactive terminal."); continue; }
+                            if let Err(error) = hooks_work::open(console, agent, selected_chat.map(Into::into), global.projection().dispatch_directory, &mut hook_tasks) { outln!(console, "Cannot open /hooks: {}", safe_text(&error)); }
+                        },
                         command if is_rewind_command(command) => {
                             let is_busy=selected_chat.is_some_and(|chat| input_waits(chat,&pending,&foreground_shells)
                                 || compaction_chats.values().any(|(candidate,_)|*candidate==chat)
@@ -4157,6 +4217,7 @@ async fn interact_with_herdr(
                                     }
                                 }
                                 if shell_stop_failed {continue;}
+                                agent.follow_clear_in_draft();
                             }
                             global.interpret(crate::agent_console::Intent::NewDraft).map_err(|error|error.to_string())?;
                             console.clear_visible_agent()?;
@@ -4700,6 +4761,10 @@ async fn interact_with_herdr(
                 }
             }},
             event = next_event(&mut events, &mut feed_gaps, &mut deferred_events, visual_pacing_pending) => {
+                let _stall = stall_watch::enter_with(|| match &event {
+                    Ok(event) => format!("main loop: agent event {} #{} of {}", stall_watch::variant_name(&event.kind), event.sequence, event.chat_id.public()),
+                    Err(_) => "main loop: lost events recovery".to_owned(),
+                });
                 if matches!(&event, Ok(event) if Some(event.chat_id) == selected_chat && matches!(event.kind, EventKind::Started | EventKind::InputMerged { .. } | EventKind::ConversationRewound { .. })) {
                     console.clear_prompt_suggestion()?;
                 }
@@ -5097,6 +5162,14 @@ async fn interact_with_herdr(
                         EventKind::GoalUpdated {goal, notice} => {
                             if let Some(notice) = notice { console.write_pieces(&goal_view::notice_pieces(&notice, goal.as_ref().map_or("", |goal| goal.objective.as_str())))?; }
                         },
+                        EventKind::HookRan {record} => {
+                            for (notice, role) in hook_activity::run_notices(&record) {
+                                console.write_roles(&[("\n".into(), None), (safe_text(&notice), Some(role)), ("\n".into(), None)])?;
+                            }
+                        },
+                        EventKind::HooksSkipped {notice} => {
+                            console.write_roles(&[("\n".into(), None), (safe_text(&hook_activity::skip_notice(&notice)), Some(Role::MutedText)), ("\n".into(), None)])?;
+                        },
                         EventKind::CommandUpdated {..} | EventKind::TaskBoardChanged {..} | EventKind::ScheduledTasksChanged {..} => {},
                         EventKind::ContextCompaction {status,error} => {
                             outln!(console, "\nContext compaction: {status:?}");
@@ -5170,7 +5243,7 @@ async fn interact_with_herdr(
                 Err(EventInterruption::Closed) => return Err("agent event stream closed".into()),
                 }
             },
-            event = user_shell_events.recv() => match event {
+            event = user_shell_events.recv() => { let _stall = stall_watch::enter("main loop: user shell event"); match event {
                 Ok(record) if user_shell_offsets.contains_key(&record.id) => {
                     status_dirty=true;
                     let observation=observe_user_shell_record(&mut foreground_shells,&mut backgrounded_shells,&record);
@@ -5216,8 +5289,9 @@ async fn interact_with_herdr(
                     }
                 },
                 Err(broadcast::error::RecvError::Closed) => return Err("user shell event stream closed".into()),
-            },
+            }},
             Some(result)=compactions.join_next_with_id(), if !compactions.is_empty() => {
+                let _stall = stall_watch::enter("main loop: compaction");
                 status_dirty=true;
                 let task_id=match &result {Ok((id,_))=>*id,Err(error)=>error.id()};
                 compaction_chats.remove(&task_id).ok_or("unknown compaction task")?;
@@ -5228,6 +5302,7 @@ async fn interact_with_herdr(
                 }
             },
             completion=directed_summaries.join_next(), if !directed_summaries.is_empty() => {
+                let _stall = stall_watch::enter("main loop: directed summary");
                 status_dirty=true;
                 match completion?.ok_or("directed summary task disappeared")? {
                     SummaryTaskCompletion::Finished {metadata,result} => match *result {
@@ -5259,6 +5334,7 @@ async fn interact_with_herdr(
                 }
             },
             _ = global_refresh.tick(), if global_refresh_enabled => {
+                let _stall = stall_watch::enter("main loop: global refresh");
                 match global.refresh().await {
                     Ok(_)=>{
                         if let Ok(Some(receipt))=global.reconcile_dispatch().await {
@@ -5398,13 +5474,16 @@ async fn interact_with_herdr(
                 }
             },
             _ = update_notice_refresh.tick(), if interactive && !visual_pacing_pending && update_monitor.is_some() => {
+                let _stall = stall_watch::enter("main loop: update notice");
                 installation_notice = update_monitor.as_ref().and_then(|monitor| monitor.notice());
             },
             _ = animation_refresh.tick(), if interactive && !visual_pacing_pending && (thinking_frame_due || (!prefers_reduced_motion && (!pending.is_empty() || !directed_summaries.is_empty()))) => {
+                let _stall = stall_watch::enter("main loop: animation");
                 thinking_frame_due = false;
                 activity_dirty = true;
             },
             _ = transcript_refresh.tick(), if interactive && transcript_refresh_due => {
+                let _stall = stall_watch::enter("main loop: transcript refresh");
                 transcript_refresh_due = false;
                 if let Some(chat) = selected_chat
                     && let Some(id) = console.open_transcript()?
@@ -5414,14 +5493,17 @@ async fn interact_with_herdr(
                 }
             },
             _ = elapsed_refresh.tick(), if interactive && !visual_pacing_pending && (prefers_reduced_motion && running_activity.as_ref().is_some_and(|activity| activity.started_at.is_some())) => {
+                let _stall = stall_watch::enter("main loop: elapsed refresh");
                 activity_dirty = true;
             },
             _ = tokio::task::yield_now(), if visual_pacing_pending => {
+                let _stall = stall_watch::enter("main loop: visual pacing");
                 if let Some(reply) = reply_lines.values_mut().find(|reply| Some(reply.chat_id) == selected_chat.map(Into::into) && reply.has_complete_line()) {
                     write_next_reply_line(console, reply)?;
                 }
             },
             _ = member_probe.tick(), if interactive && !overview_active => {
+                let _stall = stall_watch::enter("main loop: member probe");
                 // A slow host never stalls input: the probe runs beside the loop and reports back.
                 if let Some(probe) = console.claim_member_probe()? {
                     let console = console.clone();
@@ -5443,9 +5525,11 @@ async fn interact_with_herdr(
                 }
             },
             _ = subscription_refresh.tick(), if interactive && !overview_active && console.monitor_has_entries()? => {
+                let _stall = stall_watch::enter("main loop: subscription refresh");
                 monitor_refresh_due = true;
             },
             _ = prompt_watchdog_refresh.tick(), if selected_chat.is_some() => {
+                let _stall = stall_watch::enter("main loop: prompt watchdog");
                 let chat=selected_chat.expect("selected Chat checked above");
                 check_shell_prompt_watchdog(
                     &task_center,
@@ -5455,26 +5539,28 @@ async fn interact_with_herdr(
                     prompt_watchdog_epoch.elapsed(),
                 ).await?;
             },
-            notification = task_notifications.recv() => match notification {
+            notification = task_notifications.recv() => { let _stall = stall_watch::enter("main loop: task notification"); match notification {
                 Ok(notification) if !overview_active && Some(notification.chat_id)==selected_chat => {
-                    console.write_shell_notification(&notification)?;
+                    console.write_task_notification(&notification)?;
                     status_dirty=true;
                 },
                 Ok(notification) => {
                     let notice=format!("{} · {}",background_label(agent,console,notification.chat_id),safe_line(&notification.summary));
                     if !interactive {outln!(console,"Background {notice}");}
-                    let (message, necessary) = match notification.status {
-                        TaskNotificationStatus::Completed => ("Shell task completed", false),
-                        TaskNotificationStatus::Failed => ("Shell task failed", true),
-                        TaskNotificationStatus::Killed => ("Shell task killed", false),
+                    let (message, necessary) = match notification.status() {
+                        Some(TaskNotificationStatus::Completed) => ("Shell task completed", false),
+                        Some(TaskNotificationStatus::Failed) => ("Shell task failed", true),
+                        Some(TaskNotificationStatus::Killed) => ("Shell task killed", false),
+                        None => ("Background hook finished", false),
                     };
                     background_notice=Some((notification.chat_id,BackgroundRunNotice { message: message.into(), compact_message: None, necessary }));
                     status_dirty=true;
                 },
                 Err(broadcast::error::RecvError::Lagged(_)) => {},
                 Err(broadcast::error::RecvError::Closed) => return Err("task notification stream closed".into()),
-            },
+            }},
             signal = tokio::signal::ctrl_c() => {
+                let _stall = stall_watch::enter("main loop: Ctrl+C");
                 signal.map_err(|_| "cannot listen for terminal interrupt")?;
                 outln!(console, "\nClosing this View; Agent work continues.");
                 return Ok(());
@@ -5628,21 +5714,13 @@ async fn check_shell_prompt_watchdog(
     Ok(())
 }
 
-/// Following Claude Code's task notification style: a status-colored dot plus a summary.
+/// The line a background task's end adds to the conversation as it happens, the one a replay of
+/// its task notification shows.
 fn task_notification_line(
     notification: &TaskNotification,
     display: DisplayProfile,
 ) -> Vec<(String, Option<Role>)> {
-    let role = match notification.status {
-        TaskNotificationStatus::Completed => Role::Success,
-        TaskNotificationStatus::Failed => Role::Error,
-        TaskNotificationStatus::Killed => Role::Warning,
-    };
-    vec![
-        ("\n".into(), None),
-        (display.glyph(Glyph::ToolCall).into(), Some(role)),
-        (format!(" {}\n", safe_text(&notification.summary)), None),
-    ]
+    presentation::task_notification_runs(notification.status(), &notification.summary, display)
 }
 
 /// What the view has read of a `!` command: where reading resumes and its latest lines.
@@ -10015,6 +10093,42 @@ mod tests {
     }
 
     #[test]
+    fn a_background_hook_summary_shows_once_live_as_its_replay_shows_it() {
+        use super::{ChatSnapshot, consume_input_echo_from_snapshot};
+        use tickloop_harness::protocol::{TaskNotification, local_messages};
+        const SUMMARY: &str = "Background check found something";
+        let chat = uuid::Uuid::new_v4();
+        let run = uuid::Uuid::new_v4();
+        let message = local_messages::background_hook_notification(
+            SUMMARY,
+            "Stop hook blocking error from command \"PostToolUse:Bash\": REWAKE-DEMO",
+        );
+        let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
+            "id":chat,"folder":"/work","messages":[message],"chat_loop":{"id":"00000000-0000-0000-0000-000000000000","state":"Idle"}
+        })).unwrap();
+        snapshot.message_ids.insert(0, uuid::Uuid::new_v4());
+        snapshot.message_runs.insert(0, run.into());
+
+        let live = Console::test_interactive_for_chat(chat);
+        live.write_task_notification(&TaskNotification::for_background_hook(chat.into(), SUMMARY))
+            .unwrap();
+        live.defer_input_echo(chat, run).unwrap();
+        consume_input_echo_from_snapshot(&live, &snapshot, run).unwrap();
+        let replay = Console::test_interactive_for_chat(chat);
+        super::workflows::write_public_history(&replay, &snapshot).unwrap();
+
+        assert_eq!(
+            live.test_conversation_text(),
+            format!("\n⏺ {SUMMARY}\n"),
+            "the line shows as the hook ends, and the run it wakes does not repeat it"
+        );
+        assert_eq!(
+            replay.test_conversation_text(),
+            live.test_conversation_text()
+        );
+    }
+
+    #[test]
     fn mixed_native_deliveries_keep_both_labels_once() {
         use super::{ChatSnapshot, consume_input_echo_from_snapshot};
         let chat = uuid::Uuid::new_v4();
@@ -11361,5 +11475,9 @@ mod status_agents_help_tests {
         assert!(help.contains(
             "a click outside leaves too and then acts where it landed, so a click on another row shows its card"
         ));
+        assert!(help.contains(
+            "A terminal Tick or a Shell has no card: enter or a double click shows it full screen"
+        ));
+        assert!(help.contains("tickloop attach [INSTANCE]"));
     }
 }

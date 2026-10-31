@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 fn http_server(name: &str, server: &McpService) -> McpServerConfig {
     McpServerConfig {
+        unruled: Default::default(),
         exposure: tickloop_harness_protocol::mcp::ToolExposure::Direct,
         tool_exposure: Vec::new(),
         description: String::new(),

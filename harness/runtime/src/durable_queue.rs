@@ -26,8 +26,9 @@ impl Agent {
     /// hosting, unconsumed family messages retain their delivery state, and Trigger inputs
     /// are queued again since their sources already moved past them; what the load makes of
     /// the Trigger records is its guess, never recorded, since another process may hold the
-    /// Chat's lease and go on with them. Other inputs the Agent queued for itself are lost with
-    /// the process.
+    /// Chat's lease and go on with them. Human prompts saved while waiting for input hooks stay
+    /// disarmed until explicit continuation; ordinary queued prompts keep the existing restart
+    /// behavior, and other inputs the Agent queued for itself are lost with the process.
     pub(crate) async fn restore_after_load(&self, chat_id: ChatId, waits: WaitHosting) {
         match waits {
             WaitHosting::Process => {
@@ -38,7 +39,9 @@ impl Agent {
                 let before = chat.bookkeeping.lifecycle.trigger_revisions();
                 chat.bookkeeping.lifecycle.reopen_started_ahead();
                 let survives_restart = |pending: &PendingInput| {
-                    is_trigger_input(pending) || pending.agent_message.is_some()
+                    is_trigger_input(pending)
+                        || pending.agent_message.is_some()
+                        || (crate::hooks::is_user_prompt(pending) && !pending.armed)
                 };
                 let waiting = chat
                     .bookkeeping
@@ -174,6 +177,23 @@ impl Agent {
                 .any(|queued| queued.receipt.run_id == pending.receipt.run_id);
             if is_queued {
                 continue;
+            }
+            if pending.is_skill_invocation
+                && let Some(skill) = &pending.skill_guidance
+                && skill.shell_preprocessing != Some(true)
+            {
+                chat.snapshot.user_skill_invocations.insert(
+                    pending.receipt.run_id,
+                    tickloop_harness_protocol::UserSkillInvocation {
+                        name: skill.name.clone(),
+                        source: skill.source.clone(),
+                        prepared_without_shell: true,
+                    },
+                );
+                chat.user_skill_preparations.insert(
+                    pending.receipt.run_id,
+                    super::command_skills::UserSkillPreparation::Complete,
+                );
             }
             pending.receipt.loop_id = chat.snapshot.chat_loop.id;
             if let Some(TriggerSource::TickUpdate { items }) = &mut pending.trigger_source {

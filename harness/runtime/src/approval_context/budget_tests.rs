@@ -87,6 +87,7 @@ impl Session {
             run,
         );
         let operation = OperationRecord {
+            input_message_id: None,
             parent_call_id: None,
             parent_call_index: None,
             task_binding: None,
@@ -107,7 +108,7 @@ impl Session {
             &operation,
             None,
             None,
-            self.snapshot.folder.as_deref().unwrap(),
+            self.snapshot.folder.as_deref(),
             tickloop_harness_policy::AutoSettings::default().policy(),
         )
         .unwrap();

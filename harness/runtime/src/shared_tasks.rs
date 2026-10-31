@@ -100,10 +100,11 @@ enum UpdateAction {
     Cancel {
         result: String,
     },
+    /// A partial edit: each field left out keeps its current value.
     Edit {
-        title: String,
-        description: String,
-        dependencies: Vec<SharedTaskId>,
+        title: Option<String>,
+        description: Option<String>,
+        dependencies: Option<Vec<SharedTaskId>>,
     },
 }
 
@@ -196,7 +197,7 @@ pub(super) fn definitions(access: TaskToolAccess) -> Vec<ToolDefinition> {
         ToolDefinition { name: "TaskCreate".into(), description: "Create an optional task on your Agent family's task board. Reuse mutation_id when retrying an uncertain response. Tasks do not extend user authorization. The root can assign work; any member may claim available work. No automatic pickup or polling is needed.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":task}},"required":["mutation_id","title","description"],"additionalProperties":false}) },
         ToolDefinition { name: "TaskList".into(), description: "Read the current task board, including revisions, assignments and unresolved dependencies. Display numbers are task_number_offset plus the task’s position in board.tasks plus one; TaskGet/TaskUpdate still require the task id, not its display number. Do not poll: assignment messages arrive automatically. A Run ending does not complete its Task. A member may have multiple Runs: compare claim.run_id and report.run_id; a hand-back from an earlier Run does not settle a later claim.".into(), input_schema: json!({"type":"object","properties":{},"additionalProperties":false}) },
         ToolDefinition { name: "TaskGet".into(), description: "Read one task with its current revision and dependencies.".into(), input_schema: json!({"type":"object","properties":{"task_id":task},"required":["task_id"],"additionalProperties":false}) },
-        ToolDefinition { name: "TaskUpdate".into(), description: "Apply one typed action at expected_revision. Each action takes only its own fields; fields of other actions are ignored: claim takes none; assign requires owner; complete, release and cancel require result; edit requires title, description and dependencies (the full list, [] for none). claim atomically starts an unowned or self-assigned pending task; one active task per member. assign, edit and cancel are root-only. complete marks the task completed and requires its claiming Run. release relinquishes unfinished work back to pending, clearing owner and claim; it does not mark work completed. Only the claiming Run may release active work; main may release needs_attention after reconciling its effects. A hand-back from a different Run does not settle the current claim: compare claim.run_id and report.run_id. Completed and cancelled tasks must not be changed. Active work cannot be reassigned or cancelled: stop its execution first and reconcile its effects. A recovered/ended claim needs attention and never automatically reruns. On a revision conflict, use current_task to reconsider the action; do not blindly retry with a newer revision, and do not retry terminal tasks. Reuse mutation_id only with identical input. Completion stores a report reference; include the final report in the normal final response or Subagent report. Assignment notifies the target once; a delivery failure is reported without rolling back the assignment.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"task_id":task,"expected_revision":{"type":"integer","minimum":1},"action":{"type":"string","enum":["claim","assign","complete","release","cancel","edit"]},"owner":{"type":"string","minLength":1},"result":{"type":"string","minLength":1},"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":task}},"required":["mutation_id","task_id","expected_revision","action"],"additionalProperties":false}) },
+        ToolDefinition { name: "TaskUpdate".into(), description: "Apply one typed action at expected_revision. Each action takes only its own fields; fields of other actions are ignored: claim takes none; assign requires owner; complete, release and cancel require result; edit takes any of title, description and dependencies (the full list, [] for none); omitted fields keep their current value; give at least one. claim atomically starts an unowned or self-assigned pending task; one active task per member. assign, edit and cancel are root-only. complete marks the task completed and requires its claiming Run. release relinquishes unfinished work back to pending, clearing owner and claim; it does not mark work completed. Only the claiming Run may release active work; main may release needs_attention after reconciling its effects. A hand-back from a different Run does not settle the current claim: compare claim.run_id and report.run_id. Completed and cancelled tasks must not be changed. Active work cannot be reassigned or cancelled: stop its execution first and reconcile its effects. A recovered/ended claim needs attention and never automatically reruns. On a revision conflict, use current_task to reconsider the action; do not blindly retry with a newer revision, and do not retry terminal tasks. Reuse mutation_id only with identical input. Completion stores a report reference; include the final report in the normal final response or Subagent report. Assignment notifies the target once; a delivery failure is reported without rolling back the assignment.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"task_id":task,"expected_revision":{"type":"integer","minimum":1},"action":{"type":"string","enum":["claim","assign","complete","release","cancel","edit"]},"owner":{"type":"string","minLength":1},"result":{"type":"string","minLength":1},"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":task}},"required":["mutation_id","task_id","expected_revision","action"],"additionalProperties":false}) },
     ];
     match access {
         TaskToolAccess::Disabled => tools.clear(),
@@ -450,6 +451,14 @@ fn apply_update(
     claim: TaskClaim,
     assignment: Option<TaskOwner>,
 ) -> Result<Uuid, String> {
+    if let UpdateAction::Edit {
+        title: None,
+        description: None,
+        dependencies: None,
+    } = &input.action
+    {
+        return Err("edit requires at least one of title, description or dependencies".into());
+    }
     let index = board
         .tasks
         .iter()
@@ -538,9 +547,12 @@ fn apply_update(
         dependencies,
     } = &input.action
     {
-        text_valid(title)?;
-        text_valid(description)?;
-        validate_dependencies(board, input.task_id, dependencies)?;
+        for text in [title, description].into_iter().flatten() {
+            text_valid(text)?;
+        }
+        if let Some(dependencies) = dependencies {
+            validate_dependencies(board, input.task_id, dependencies)?;
+        }
     }
     if let UpdateAction::Cancel { result } = &input.action {
         text_valid(result)?;
@@ -576,9 +588,15 @@ fn apply_update(
             description,
             dependencies,
         } => {
-            task.title = title;
-            task.description = description;
-            task.dependencies = dependencies;
+            if let Some(title) = title {
+                task.title = title;
+            }
+            if let Some(description) = description {
+                task.description = description;
+            }
+            if let Some(dependencies) = dependencies {
+                task.dependencies = dependencies;
+            }
         }
     }
     task.revision += 1;
@@ -725,7 +743,7 @@ fn ensure_execution_settled(
 
 /// Empties `board` in one revision: retries of its recorded mutations report the task cleared,
 /// and numbering continues after the removed tasks.
-fn clear_board(board: &mut TaskBoard) -> Result<(), String> {
+pub(super) fn clear_board(board: &mut TaskBoard) -> Result<(), String> {
     let offset = board
         .task_number_offset
         .checked_add(board.tasks.len() as u64)
@@ -744,24 +762,45 @@ fn clear_board(board: &mut TaskBoard) -> Result<(), String> {
     Ok(())
 }
 
-/// Clears the task board of `chat`'s current Loop when a prompt is answered again, regenerated
-/// or edited: one answer plans and finishes its own tasks, so the replaced answer's tasks do
-/// not carry over. Tells whether a board was cleared.
-pub(super) fn clear_board_for_new_answer(chat: &mut Chat) -> Result<bool, String> {
-    if chat.snapshot.delegation.is_some() {
-        return Ok(false);
+/// The finished board of the root Chat's Loop, cleared: a new answer to a prompt starts over
+/// without the tasks of earlier answers, which keep them where they ended.
+pub(super) fn cleared_finished_board(snapshot: &ChatSnapshot) -> Result<Option<TaskBoard>, String> {
+    if snapshot.delegation.is_some() {
+        return Ok(None);
     }
-    let loop_id = chat.snapshot.chat_loop.id;
-    let Some(board) = chat
-        .snapshot
+    snapshot
         .task_boards
-        .get_mut(&loop_id)
-        .filter(|board| !board.tasks.is_empty())
-    else {
-        return Ok(false);
-    };
-    clear_board(board)?;
-    Ok(true)
+        .get(&snapshot.chat_loop.id)
+        .filter(|board| board.is_finished())
+        .map(|board| {
+            let mut board = board.clone();
+            clear_board(&mut board).map(|()| board)
+        })
+        .transpose()
+}
+
+/// The Runs of `chats` that run, wait to run, or continue for their task's commands.
+pub(super) fn live_runs<'a>(
+    chats: impl IntoIterator<Item = &'a Chat>,
+) -> crate::task_board_history::LiveRuns {
+    chats
+        .into_iter()
+        .flat_map(|chat| {
+            chat.ready_runs
+                .iter()
+                .chain(chat.parked.keys())
+                .copied()
+                .chain(chat.active_run)
+                .chain(
+                    chat.snapshot
+                        .pending_inputs
+                        .iter()
+                        .filter(|pending| pending.task_continuation)
+                        .map(|pending| pending.receipt.run_id),
+                )
+                .map(|run| ((chat.snapshot.id, run), chat.family_generation))
+        })
+        .collect()
 }
 
 impl Agent {
@@ -806,13 +845,7 @@ impl Agent {
         let Some(board) = root.snapshot.task_boards.get_mut(&root_loop_id) else {
             return Ok(());
         };
-        if board.revision != expected_revision
-            || board.tasks.is_empty()
-            || board
-                .tasks
-                .iter()
-                .any(|task| task.status != Status::Completed)
-        {
+        if board.revision != expected_revision || !board.is_finished() {
             return Ok(());
         }
         clear_board(board).map_err(AgentError::Invalid)?;
@@ -945,15 +978,41 @@ impl Agent {
 
     pub(super) async fn persist_task_boards(&self, root: &mut Chat) -> Result<(), String> {
         self.queue_task_boards(root);
+        self.checkpoint_task_boards(root).await
+    }
+
+    /// Takes the Transcript checkpoint that `root`'s queued boards wait for. A failed write
+    /// keeps the reservation.
+    async fn checkpoint_task_boards(&self, root: &mut Chat) -> Result<(), String> {
         self.checkpoint_transcript(&root.snapshot, &root.bookkeeping).await
             .map_err(|error| format!("task persistence outcome unknown; reservation retained; retry the identical mutation or TaskList: {error}"))?;
         root.task_checkpoint_pending = false;
         Ok(())
     }
 
-    /// Records `root`'s boards for the next Transcript checkpoint; task work waits for that
-    /// checkpoint before it changes them again.
+    /// Takes the checkpoint that boards queued as the conversation moved, or as an answer
+    /// started, wait for, so the Run that follows can work. Without it, task work and an
+    /// upgrade would wait for a checkpoint no one takes; a failed write keeps them waiting.
+    pub(super) async fn take_due_task_checkpoint(&self, chat: &mut Chat) {
+        if chat.task_checkpoint_pending {
+            let _ = self.checkpoint_task_boards(chat).await;
+        }
+    }
+
+    /// Queues `root`'s boards as [`Self::queue_latest_task_boards`] does. A change while the
+    /// root runs no answer also stands where its conversation ends; a running answer's changes
+    /// stand where the answer ends.
     pub(super) fn queue_task_boards(&self, root: &mut Chat) {
+        if root.active_run.is_none() && root.parked.is_empty() {
+            self.record_task_board_checkpoint(root);
+        }
+        self.queue_latest_task_boards(root);
+    }
+
+    /// Records `root`'s boards for the next Transcript checkpoint; task work waits for that
+    /// checkpoint before it changes them again, and the Chat takes it as it looks for its next
+    /// Run.
+    pub(super) fn queue_latest_task_boards(&self, root: &mut Chat) {
         self.record_chat_metadata(
             root.snapshot.id,
             Line::TaskBoards(TaskBoardsEntry {
@@ -1097,7 +1156,7 @@ impl Agent {
             && snapshot.subagent_reports.contains_key(&receipt.run_id)
         {
             Some(
-                self.review_operation(receipt, operation, None, cancel.clone(), false)
+                self.review_operation(receipt, operation, None, cancel.clone(), false, false)
                     .await
                     .map_err(|error| error.to_string())?
                     .details,
@@ -1251,9 +1310,14 @@ impl Agent {
                 .find(|task| task.id == previous.task_id)
                 .cloned();
             drop(chats);
-            let delivery = self
-                .deliver_task_assignment(receipt, root_id, loop_id, mutation_id, cancel)
-                .await;
+            let delivery = Box::pin(self.deliver_task_assignment(
+                receipt,
+                root_id,
+                loop_id,
+                mutation_id,
+                cancel,
+            ))
+            .await;
             return Ok(ToolResult {
                 content: model_json(
                     &ids,
@@ -1417,9 +1481,9 @@ impl Agent {
         self.persist_task_boards(root).await?;
         self.publish_task_board(&mut chats, root_id, loop_id);
         drop(chats);
-        let delivery = self
-            .deliver_task_assignment(receipt, root_id, loop_id, mutation_id, cancel)
-            .await;
+        let delivery =
+            Box::pin(self.deliver_task_assignment(receipt, root_id, loop_id, mutation_id, cancel))
+                .await;
         Ok(ToolResult {
             content: model_json(
                 &ids,
@@ -1641,25 +1705,7 @@ impl Agent {
     /// before any Run starts. A claim whose execution did not come back needs reconciliation.
     pub(crate) async fn restore_task_claims(&self, members: &[ChatId]) {
         let mut chats = self.inner.chats.lock().await;
-        let live = members
-            .iter()
-            .filter_map(|id| chats.get(id))
-            .flat_map(|chat| {
-                chat.ready_runs
-                    .iter()
-                    .chain(chat.parked.keys())
-                    .copied()
-                    .chain(chat.active_run)
-                    .chain(
-                        chat.snapshot
-                            .pending_inputs
-                            .iter()
-                            .filter(|pending| pending.task_continuation)
-                            .map(|pending| pending.receipt.run_id),
-                    )
-                    .map(|run| ((chat.snapshot.id, run), chat.family_generation))
-            })
-            .collect::<HashMap<_, _>>();
+        let live = live_runs(members.iter().filter_map(|id| chats.get(id)));
         for id in members {
             let Some(root) = chats.get_mut(id) else {
                 continue;

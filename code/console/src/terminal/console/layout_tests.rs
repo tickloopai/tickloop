@@ -4350,9 +4350,25 @@ fn agent_layout_commands_show_and_enforce_their_scope_before_sending() {
         .unwrap();
     {
         let mut state = console.state.lock().unwrap();
+        let mut skills = tickloop_code_settings::skills::SkillRegistry::default();
+        skills.register_markdown(
+            "---\nname: guide\ndescription: Test guidance\n---\nGuide $ARGUMENTS",
+            tickloop_harness::protocol::SkillSource::Project {
+                path: "/fixture/launch/.tickloop/skills/guide/SKILL.md".into(),
+            },
+            &[],
+        );
+        state.completion_skills = Some((
+            state.working_directory().into(),
+            super::super::completion::skill_candidates(&skills),
+        ));
         state.key(key(KeyCode::Tab));
         state.insert("/");
         let candidates = candidate_texts(&state);
+        assert!(
+            candidates.iter().any(|line| line.contains("/guide")),
+            "the overview offers the registered project Skill: {candidates:#?}"
+        );
         assert!(
             candidates.iter().any(|line| line.contains("/cwd")),
             "{candidates:#?}"
@@ -4375,8 +4391,8 @@ fn agent_layout_commands_show_and_enforce_their_scope_before_sending() {
         assert!(state.help_open, "/help opens the overview help");
         state.key(key(KeyCode::Esc));
         assert!(matches!(
-            submit(&mut state, "/tickloop check the layout"),
-            Some(InputEvent::Prompt { text, .. }) if text == "/tickloop check the layout"
+            submit(&mut state, "/guide check the layout"),
+            Some(InputEvent::Prompt { text, .. }) if text == "/guide check the layout"
         ));
         assert!(
             matches!(

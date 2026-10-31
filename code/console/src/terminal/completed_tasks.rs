@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use tickloop_harness::protocol::{SharedTaskStatus, TaskBoard};
+use tickloop_harness::protocol::TaskBoard;
 use uuid::Uuid;
 
 const COMPLETED_TASK_RETENTION: Duration = Duration::from_secs(30);
@@ -30,13 +30,7 @@ impl CompletedTaskRetention {
         board: Option<&TaskBoard>,
         now: Instant,
     ) -> Option<CompletedTaskCleanup> {
-        let Some(board) = board.filter(|board| {
-            !board.tasks.is_empty()
-                && board
-                    .tasks
-                    .iter()
-                    .all(|task| task.status == SharedTaskStatus::Completed)
-        }) else {
+        let Some(board) = board.filter(|board| board.is_finished()) else {
             self.observation = None;
             return None;
         };
@@ -85,6 +79,7 @@ impl CompletedTaskRetention {
 mod tests {
     use super::*;
     use crate::terminal::status_area::test_task_board;
+    use tickloop_harness::protocol::SharedTaskStatus;
 
     fn completed_board() -> TaskBoard {
         let mut board = test_task_board(&["First", "Second"]);
@@ -125,7 +120,6 @@ mod tests {
             SharedTaskStatus::Pending,
             SharedTaskStatus::InProgress,
             SharedTaskStatus::NeedsAttention,
-            SharedTaskStatus::Cancelled,
         ] {
             let mut retention = CompletedTaskRetention::default();
             let mut board = completed_board();
@@ -154,6 +148,20 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn a_board_of_completed_and_cancelled_tasks_is_finished_and_cleared() {
+        let mut retention = CompletedTaskRetention::default();
+        let mut board = completed_board();
+        board.tasks[1].status = SharedTaskStatus::Cancelled;
+        let start = Instant::now();
+        assert_eq!(retention.observe(Some(&board), start), None);
+        assert!(
+            retention
+                .observe(Some(&board), start + Duration::from_secs(30))
+                .is_some()
+        );
     }
 
     #[test]

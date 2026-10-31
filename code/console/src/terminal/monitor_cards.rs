@@ -376,6 +376,8 @@ async fn read_frames(
                 screen.parser.process(data.as_bytes());
             }
             Some("gone") => break ViewEnd::TickEnded,
+            // A card's row says how a terminal Tick's program ended; its last screen stays.
+            Some("exited") => continue,
             Some("bubbling") => {
                 let Ok(mut screen) = screen.lock() else {
                     return;
@@ -1303,6 +1305,33 @@ impl SgrMouse {
         self.pressed && !self.is_motion() && !self.is_wheel()
     }
 
+    /// The left button pressed down.
+    pub(super) fn is_left_click(self) -> bool {
+        self.is_click() && self.code & MOUSE_BUTTONS == 0
+    }
+
+    /// The pointer moved with the left button held.
+    pub(super) fn is_left_drag(self) -> bool {
+        self.is_motion() && !self.is_wheel() && self.code & MOUSE_BUTTONS == 0
+    }
+
+    /// A button let go.
+    pub(super) fn is_release(self) -> bool {
+        !self.pressed && !self.is_motion() && !self.is_wheel()
+    }
+
+    /// Whether a wheel report scrolls up (`Some(true)`) or down; `None` for any other report.
+    pub(super) fn wheel_scrolls_up(self) -> Option<bool> {
+        if !self.is_wheel() {
+            return None;
+        }
+        match self.code & MOUSE_BUTTONS {
+            0 => Some(true),
+            1 => Some(false),
+            _ => None,
+        }
+    }
+
     /// The report as the Console's own mouse event, as crossterm decodes it.
     pub(super) fn console_event(self) -> crossterm::event::MouseEvent {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -1408,15 +1437,16 @@ pub(super) enum CardInput {
 }
 
 /// Splits a focused card's raw input into what reaches the Tick and what leaves the card. A lone
-/// Esc reaches the Tick as soon as it is known to be alone; a second lone Esc within
-/// [`DOUBLE_ESCAPE_WINDOW`] of it, with no other key between them, leaves the card and never
-/// reaches the Tick. A read-only card leaves on a lone Esc. Escape sequences such as arrows,
-/// Alt-keys and every other byte, Ctrl keys included, reach the Tick unchanged. Text inside a
-/// bracketed paste is never a key; its markers reach the Tick only when it asked for them.
-/// Mouse reports and the terminal's focus reports are never sent as they came, and neither
-/// breaks an Esc pair.
-#[derive(Debug, Default)]
+/// Esc reaches the Tick as soon as it is known to be alone; a second lone Esc within the escape
+/// window of it ([`DOUBLE_ESCAPE_WINDOW`] for a card, longer for a full-screen view), with no
+/// other key between them, leaves the card and never reaches the Tick. A read-only card leaves
+/// on a lone Esc. Escape sequences such as arrows, Alt-keys and every other byte, Ctrl keys
+/// included, reach the Tick unchanged. Text inside a bracketed paste is never a key; its markers
+/// reach the Tick only when it asked for them. Mouse reports and the terminal's focus reports
+/// are never sent as they came, and neither breaks an Esc pair.
+#[derive(Debug)]
 pub(super) struct CardKeys {
+    escape_window: Duration,
     /// An escape sequence not ended yet, perhaps a lone Esc, and when its Esc arrived.
     sequence: Vec<u8>,
     sequence_at: Option<Instant>,
@@ -1430,7 +1460,26 @@ pub(super) struct CardKeys {
     paste_tail: Vec<u8>,
 }
 
+impl Default for CardKeys {
+    fn default() -> Self {
+        Self::with_escape_window(DOUBLE_ESCAPE_WINDOW)
+    }
+}
+
 impl CardKeys {
+    pub(super) fn with_escape_window(escape_window: Duration) -> Self {
+        Self {
+            escape_window,
+            sequence: Vec::new(),
+            sequence_at: None,
+            escape_at: None,
+            in_paste: false,
+            paste_at: None,
+            paste_markers: false,
+            paste_tail: Vec::new(),
+        }
+    }
+
     /// The items `input`, read at `now`, makes; `paste_markers` is whether the Tick asked for
     /// bracketed paste, and `read_only` whether a lone Esc leaves at once.
     pub(super) fn feed(
@@ -1554,7 +1603,7 @@ impl CardKeys {
         let second = self
             .escape_at
             .take()
-            .is_some_and(|first| at.saturating_duration_since(first) < DOUBLE_ESCAPE_WINDOW);
+            .is_some_and(|first| at.saturating_duration_since(first) < self.escape_window);
         if read_only || second {
             items.push(CardInput::Leave);
         } else {

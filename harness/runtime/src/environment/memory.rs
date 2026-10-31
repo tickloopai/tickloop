@@ -305,6 +305,8 @@ fn tree_mut<'s>(state: &'s mut MemoryState, path: &FilePath) -> Option<&'s mut M
 /// How one run of a scripted one-shot command behaves.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryCommandRun {
+    /// Written to standard output as soon as the command starts; `stdout` follows as it ends.
+    pub early_stdout: Vec<u8>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_code: i32,
@@ -356,6 +358,8 @@ struct MemoryInstance {
     screen: String,
     history_floor: u64,
     updates: tokio::sync::watch::Sender<ExecutionUpdate>,
+    /// A terminal program's exit code once it exited.
+    exit_code: Option<i32>,
 }
 
 impl MemoryInstance {
@@ -561,6 +565,14 @@ impl MemoryEnvironment {
                 }),
             });
         }
+    }
+
+    /// Ends a terminal Tick's program with `code`; its instance stays listed as exited.
+    pub fn exit_terminal(&self, instance: &InstanceRef, code: i32) {
+        let mut state = self.state.lock().unwrap();
+        let instance = state.instances.get_mut(instance).unwrap();
+        assert!(instance.tick.is_none());
+        instance.exit_code = Some(code);
     }
 
     pub fn publish(&self, instance: &InstanceRef, data: Value) {
@@ -941,6 +953,11 @@ impl MemoryPort {
             return ExecutionOutcome::NotDispatched(error);
         }
         let run = script(spec);
+        if let Some(tap) = &spec.stdout_tap
+            && !run.early_stdout.is_empty()
+        {
+            tap.send(&run.early_stdout);
+        }
         let timed_out = run.duration > spec.timeout;
         tokio::select! {
             biased;
@@ -958,6 +975,8 @@ impl MemoryPort {
             }
             _ = tokio::time::sleep(run.duration.min(spec.timeout)) => {}
         }
+        let mut stdout = CapturedOutput::new(&run.early_stdout);
+        stdout.append(&run.stdout);
         let exit = if timed_out {
             ProgramExit {
                 code: None,
@@ -973,7 +992,7 @@ impl MemoryPort {
             CommandOutput {
                 exit,
                 timed_out,
-                stdout: CapturedOutput::new(&run.stdout),
+                stdout,
                 stderr: CapturedOutput::new(&run.stderr),
             }
             .into_result(),
@@ -1080,6 +1099,10 @@ impl ExecutionPort for MemoryPort {
         self.authority.check(self.scope.chat)?;
         let describes = matches!(&query, ExecutionQuery::Describe(_));
         match query {
+            ExecutionQuery::Guidance => Err(ExecutionError::new(
+                "Unsupported",
+                "this environment supplies no guidance",
+            )),
             ExecutionQuery::Capabilities => {
                 let state = self.state.lock().unwrap();
                 let files = self.file_capabilities(&state);
@@ -1101,6 +1124,30 @@ impl ExecutionPort for MemoryPort {
                     .map(|(instance, _)| instance.clone())
                     .collect(),
             )),
+            ExecutionQuery::InstanceStates => {
+                let state = self.state.lock().unwrap();
+                let running = state.instances.iter().map(|(instance, target)| {
+                    let state = match target.exit_code {
+                        Some(code) => InstanceState::Exited {
+                            code: Some(code),
+                            signal: None,
+                        },
+                        None => InstanceState::Running,
+                    };
+                    (instance, target, state)
+                });
+                let lost = state
+                    .lost
+                    .iter()
+                    .map(|(instance, target)| (instance, target, InstanceState::Lost));
+                Ok(ExecutionInspection::InstanceStates(
+                    running
+                        .chain(lost)
+                        .filter(|(_, target, _)| target.owner == self.scope.chat)
+                        .map(|(instance, _, state)| (instance.clone(), state))
+                        .collect(),
+                ))
+            }
             ExecutionQuery::Receipt(operation) => Ok(ExecutionInspection::Receipt(
                 self.state
                     .lock()
@@ -1608,6 +1655,7 @@ impl ExecutionPort for MemoryPort {
                             sequence: 0,
                             screen,
                             history_floor: 0,
+                            exit_code: None,
                             updates: tokio::sync::watch::channel(ExecutionUpdate {
                                 update: None,
                                 received: 0,

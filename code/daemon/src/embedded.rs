@@ -1,7 +1,7 @@
 use crate::access_error::agent_access_error;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     sync::{
@@ -843,11 +843,6 @@ impl EmbeddedAgentAccess {
                         ));
                     }
                     let model = if let Some(id) = change.model_id {
-                        if !config.models.iter().any(|item| item.id == id) {
-                            return Err(AccessError::invalid(
-                                "model is not in the session model directory",
-                            ));
-                        }
                         let current = self
                             .inner
                             .agent
@@ -856,9 +851,15 @@ impl EmbeddedAgentAccess {
                             .map_err(agent_access_error)?
                             .model;
                         Some(
-                            tickloop_harness::model::cards::ModelCatalog::defaults()
-                                .get(&current.provider_id, &id)
-                                .ok_or_else(|| AccessError::invalid("unknown model ID"))?,
+                            self.managed_models(&current, entry.launch.config_root.clone())
+                                .await
+                                .into_iter()
+                                .find(|config| qualified_model_id(config) == id)
+                                .ok_or_else(|| {
+                                    AccessError::invalid(
+                                        "model is not in the session model directory",
+                                    )
+                                })?,
                         )
                     } else {
                         None
@@ -1035,6 +1036,11 @@ impl EmbeddedAgentAccess {
                     .close_for_user(chat.into(), &instance)
                     .await
                     .map_err(hosted_access_error)?;
+                self.inner
+                    .agent
+                    .record_user_closed_tick(chat.into(), &instance)
+                    .await
+                    .map_err(agent_access_error)?;
                 Ok(CommandResult::Done)
             }),
             AgentCommand::ReopenHostedTick {
@@ -1138,12 +1144,20 @@ impl EmbeddedAgentAccess {
                         .map_err(agent_access_error)?;
                     chat
                 } else {
-                    self.inner
+                    let chat = self
+                        .inner
                         .agent
                         .create_chat_with_launch_rules(launch.folder.clone(), launch_rules)
                         .await
-                        .map_err(agent_access_error)?
-                        .uuid()
+                        .map_err(agent_access_error)?;
+                    if launch.after_clear {
+                        self.inner
+                            .agent
+                            .start_session_after_clear(chat)
+                            .await
+                            .map_err(agent_access_error)?;
+                    }
+                    chat.uuid()
                 };
                 if !launch.additional_directories.is_empty() {
                     self.inner
@@ -1533,6 +1547,15 @@ impl EmbeddedAgentAccess {
             AgentCommand::FlushTranscripts => Box::pin(async move {
                 self.inner.agent.flush_transcripts().await;
                 Ok(CommandResult::Done)
+            }),
+            AgentCommand::WriteHookTrust {
+                launch,
+                changes,
+                expected_revision,
+            } => Box::pin(async move {
+                crate::hook_trust::write_trust(&launch, changes, expected_revision)
+                    .await
+                    .map(|hooks| CommandResult::Hooks(Box::new(hooks)))
             }),
             AgentCommand::UpgradeRuntime { .. } => {
                 Box::pin(std::future::ready(Err(AccessError::new(
@@ -2064,36 +2087,32 @@ impl EmbeddedAgentAccess {
             .await
             .map_err(agent_access_error)?;
         let current = &snapshot.model;
-        let cancel = CancellationToken::new();
-        let directory = tokio::time::timeout(
-            Duration::from_secs(15),
-            self.inner.account_models.discover(
-                current,
-                entry.launch.config_root.as_deref(),
-                false,
-                &cancel,
-            ),
-        )
-        .await;
-        cancel.cancel();
-        let directory = match directory {
-            Ok(Ok(value)) => Some(value),
-            _ => None,
-        };
-        let models = tickloop_harness::model::cards::ModelCatalog::defaults()
-            .profiles()
-            .into_iter()
-            .filter(|config| config.provider_id == current.provider_id)
-            .filter(|config| {
-                directory
-                    .as_ref()
-                    .map_or(config.model_id == current.model_id, |directory| {
-                        directory.availability(&config.model_id).selectable()
-                    })
-            })
+        let models = self
+            .managed_models(current, entry.launch.config_root.clone())
+            .await;
+        let mut providers_named = HashMap::<&str, HashSet<&str>>::new();
+        for config in &models {
+            providers_named
+                .entry(&config.provider_name)
+                .or_default()
+                .insert(&config.provider_id);
+        }
+        let models = models
+            .iter()
             .map(|config| ManagedModelInfo {
-                id: config.model_id,
-                name: config.name,
+                id: qualified_model_id(config),
+                name: config.name.clone(),
+                provider_id: config.provider_id.clone(),
+                // Regions of one product share its display name; only then is the region added.
+                provider_name: match &config.connection {
+                    Some(connection)
+                        if providers_named[config.provider_name.as_str()].len() > 1
+                            && let Some(region) = &connection.region =>
+                    {
+                        format!("{} · {}", config.provider_name, region.name)
+                    }
+                    _ => config.provider_name.clone(),
+                },
             })
             .collect();
         let ceiling = if let Ok(Some(metadata)) =
@@ -2118,13 +2137,63 @@ impl EmbeddedAgentAccess {
         };
         let _ = execution;
         Ok(ManagedConfiguration {
-            model_id: current.model_id.clone(),
+            model_id: qualified_model_id(current),
             mode: snapshot.policy.mode,
             models,
             modes,
             reasoning_effort: snapshot.reasoning_effort,
             efforts: ReasoningEffort::choices(current).to_vec(),
         })
+    }
+
+    /// The models of the current provider and of each signed-in built-in provider, filtered as
+    /// the Console's model page filters them; a managed client names each by its
+    /// [`qualified_model_id`]. As in the Console, only the current provider's account directory
+    /// is read; other providers' models are offered unverified, so their sign-ins cost no
+    /// network call.
+    async fn managed_models(
+        &self,
+        current: &tickloop_harness::protocol::ModelConfig,
+        config_root: Option<std::path::PathBuf>,
+    ) -> Vec<tickloop_harness::protocol::ModelConfig> {
+        use tickloop_harness::model::{access::AccessCatalog, auth, cards};
+        let cancel = CancellationToken::new();
+        let directory = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.inner
+                .account_models
+                .discover(current, config_root.as_deref(), false, &cancel),
+        )
+        .await;
+        cancel.cancel();
+        let directory = directory.ok().and_then(Result::ok);
+        let scope = auth::current_provider_credential_scope(config_root);
+        let defaults = cards::ModelCatalog::defaults();
+        let access = AccessCatalog::defaults();
+        let mut signed_in = HashMap::new();
+        defaults
+            .profiles()
+            .into_iter()
+            .filter(|config| {
+                if config.provider_id == current.provider_id && config.model_id == current.model_id
+                {
+                    return true;
+                }
+                let visible = access
+                    .ordinary_candidate(config, &defaults)
+                    .unwrap_or_else(|| cards::is_default_visible(config));
+                visible
+                    && if config.provider_id == current.provider_id {
+                        directory.as_ref().is_none_or(|directory| {
+                            directory.availability(&config.model).selectable()
+                        })
+                    } else {
+                        *signed_in
+                            .entry(config.provider_id.clone())
+                            .or_insert_with(|| auth::provider_signed_in(config, &scope) == Ok(true))
+                    }
+            })
+            .collect()
     }
 
     fn builtin_config(
@@ -2598,6 +2667,15 @@ impl AgentAccess for EmbeddedAgentAccess {
                 ObservationValue::McpServers(vec![
                     crate::draft_mcp::connect(&launch, &name).await?,
                 ]),
+                Cursor {
+                    daemon_epoch: self.inner.epoch,
+                    execution: None,
+                    sequence: 0,
+                },
+                None,
+            )),
+            ObservationRequest::Hooks { launch } => Ok(Observation::single(
+                ObservationValue::Hooks(Box::new(crate::hook_trust::hooks(&launch).await?)),
                 Cursor {
                     daemon_epoch: self.inner.epoch,
                     execution: None,
@@ -3184,4 +3262,10 @@ fn hosted_access_error(error: tickhost_connect::host_error::HostError) -> Access
         AccessErrorCode::Unavailable
     };
     AccessError::new(code, error.to_string())
+}
+
+/// The one option id that names a model, the same whichever provider is current; built-in
+/// model ids contain no `/`, so it is unambiguous.
+fn qualified_model_id(config: &tickloop_harness::protocol::ModelConfig) -> String {
+    format!("{}/{}", config.provider_id, config.model_id)
 }

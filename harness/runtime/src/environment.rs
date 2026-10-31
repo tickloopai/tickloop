@@ -132,6 +132,9 @@ impl ExecutionPort for FolderPort {
                     }))
                 }
                 ExecutionQuery::Instances => Ok(ExecutionInspection::Instances(Vec::new())),
+                ExecutionQuery::InstanceStates => {
+                    Ok(ExecutionInspection::InstanceStates(Vec::new()))
+                }
                 ExecutionQuery::File(query) => {
                     let inspection = self.files.inspect(query).await?;
                     self.authority.check(self.scope.chat)?;

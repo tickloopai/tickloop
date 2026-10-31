@@ -74,7 +74,7 @@ Examples of the kind of risky actions that warrant user confirmation:
 When you encounter an obstacle, do not use destructive actions as a shortcut to simply make it go away. Try to identify root causes and fix underlying issues rather than bypassing safety checks (e.g. --no-verify). If you discover unexpected state like unfamiliar files, branches, or configuration, investigate before deleting or overwriting, as it may represent the user's in-progress work. In short: only take risky actions carefully, and when in doubt, ask before acting.
 
 In Tickloop specifically:
-- Installing, updating, enabling, disabling, configuring and logging in to plugins, Tick packages and MCP servers, and changing an MCP server's exposure, are the user's steps: plugins and Tick packages in /plugins and /ticks; MCP servers are added with `tickloop mcp add`, and /mcp logs them in or out, reconnects them, turns them off or on and changes their exposure (`e`). Never do these yourself, and never read credential files.
+- Installing, updating, enabling, disabling, configuring and logging in to plugins, Tick packages and MCP servers, and changing an MCP server's exposure, are the user's steps: plugins and Tick packages in /plugins and /ticks; {MCP_MANAGEMENT}. Never do these yourself, and never read credential files.
 - After an unknown outcome, inspect the resulting state before another change; never resend a mutating call automatically.
 - Stopping or restarting the Tickloop Agent daemon is a manual user operation: never run `tickloop daemon stop`, kill its process, or use shell or process-manager indirection to shut it down, since that interrupts every running Agent. Explain the impact and give the user the command to run in their own terminal; a request to inspect, diagnose or repair the Agent never authorizes it. Stopping a process your own task started stays allowed.";
 
@@ -90,7 +90,7 @@ const USING_TOOLS_SECTION: &str = "# Using your tools
  - You can call multiple tools in a single response. If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel. However, if some tool calls depend on previous calls to inform dependent values, call them sequentially.";
 
 const DENIAL_QUESTION_NOTE: &str = "If you do not understand why the user has denied a tool call, use AskUserQuestion to ask them.";
-const USER_SHELL_NOTE: &str = "If you need the user to run a shell command themselves (e.g., an interactive login like `gcloud auth login`), suggest they type `! <command>` in the prompt — the `!` prefix runs the command in this session so its output lands directly in the conversation. Plugin, Tick package and MCP logins are the exception: the user logs in to those in /plugins, /ticks or /mcp.";
+const USER_SHELL_NOTE: &str = "If you need the user to run a shell command themselves (e.g., an interactive login like `gcloud auth login`), suggest they type `! <command>` in the prompt — the `!` prefix runs the command in this session so its output lands directly in the conversation. Plugin, Tick package and MCP logins are the exception: the user logs in to those in /plugins, /ticks or {MCP_PLACE}.";
 const SUBAGENT_NOTE: &str = "Use Subagent for a bounded child task. Subagents are valuable for parallelizing independent work or for protecting your context from excessive results, but they should not be used excessively when not needed. Avoid duplicating work that subagents are already doing; finish your own work while they run, then wait for their results before reporting.";
 const SKILL_NOTE: &str = "/<skill-name> is shorthand for users to invoke a user-invocable Skill. When executed, the Skill gets expanded to a full prompt. Use the Skill tool to execute them. IMPORTANT: Only use Skill for Skills listed in its description - do not guess or use built-in commands.";
 
@@ -136,6 +136,8 @@ pub(super) struct PromptScope<'a> {
     pub environment: Option<&'a str>,
     /// The tools offered only through tool search, by name.
     pub deferred_tools: &'a [String],
+    /// Where the user manages MCP servers; `None` names the terminal's places.
+    pub mcp_guidance: Option<&'a crate::tool_exposure::McpGuidance>,
 }
 
 impl PromptScope<'_> {
@@ -151,6 +153,7 @@ impl PromptScope<'_> {
         compacts: false,
         environment: None,
         deferred_tools: &[],
+        mcp_guidance: None,
     };
 }
 
@@ -170,10 +173,11 @@ fn deferred_tools_section(names: &[String]) -> Option<String> {
 }
 
 /// Claude Code's `getSessionSpecificGuidanceSection`.
-fn session_guidance_section(tools: crate::ToolPolicy) -> String {
+fn session_guidance_section(tools: crate::ToolPolicy, mcp_place: &str) -> String {
+    let user_shell_note = USER_SHELL_NOTE.replace("{MCP_PLACE}", mcp_place);
     let items = [
         tools.questions.then_some(DENIAL_QUESTION_NOTE),
-        Some(USER_SHELL_NOTE),
+        Some(user_shell_note.as_str()),
         tools.delegation.then_some(SUBAGENT_NOTE),
         tools.skills.then_some(SKILL_NOTE),
     ];
@@ -199,7 +203,16 @@ pub(super) fn conversation_system_prompt(
         compacts,
         environment,
         deferred_tools,
+        mcp_guidance,
     } = scope;
+    let default_guidance;
+    let mcp_guidance = match mcp_guidance {
+        Some(guidance) => guidance,
+        None => {
+            default_guidance = crate::tool_exposure::McpGuidance::default();
+            &default_guidance
+        }
+    };
     let style_section = output_style.system_prompt_section();
     let mut intro = if has_folder && tools.questions {
         INTRO.to_owned()
@@ -247,9 +260,9 @@ pub(super) fn conversation_system_prompt(
         Some(intro),
         Some(system),
         has_folder.then_some(doing_tasks),
-        has_folder.then(|| ACTIONS_SECTION.to_owned()),
+        has_folder.then(|| ACTIONS_SECTION.replace("{MCP_MANAGEMENT}", &mcp_guidance.management)),
         has_folder.then(|| USING_TOOLS_SECTION.to_owned()),
-        has_folder.then(|| session_guidance_section(tools)),
+        has_folder.then(|| session_guidance_section(tools, &mcp_guidance.place)),
         deferred_tools_section(deferred_tools),
         (tools.delegation || tools.family_messages).then(|| AGENT_MESSAGE_SECTION.to_owned()),
         Some(TONE_AND_STYLE_SECTION.to_owned()),
@@ -287,6 +300,13 @@ impl crate::Agent {
                 .map(|(directories, environment)| {
                     environment.section(directories, &chat.snapshot.model)
                 });
+        let mcp_guidance = self
+            .inner
+            .host_tools
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|provider| provider.mcp_guidance());
         let scope = PromptScope {
             has_folder: chat.local_folder().is_some(),
             has_environment_folder: chat.execution.folder_in_environment(),
@@ -298,6 +318,7 @@ impl crate::Agent {
             compacts: crate::context::context_window(&chat.snapshot).is_some(),
             environment: environment.as_deref(),
             deferred_tools,
+            mcp_guidance: mcp_guidance.as_ref(),
         };
         let family_temp = chat.tools.family_temp_directory();
         let mut state = serde_json::json!({
@@ -553,7 +574,7 @@ mod tests {
             "changes their exposure (`e`)",
             "# Using your tools",
             "# Session-specific guidance",
-            USER_SHELL_NOTE,
+            &USER_SHELL_NOTE.replace("{MCP_PLACE}", "/mcp"),
             DENIAL_QUESTION_NOTE,
             ESCALATION_WITH_QUESTIONS,
             SUBAGENT_NOTE,
@@ -594,7 +615,7 @@ mod tests {
         ] {
             assert!(!narrow.contains(absent), "{absent}");
         }
-        assert!(narrow.contains(USER_SHELL_NOTE));
+        assert!(narrow.contains(&USER_SHELL_NOTE.replace("{MCP_PLACE}", "/mcp")));
 
         let folderless = conversation_system_prompt(
             &serde_json::json!({"scratchpad": "/tmp/family/scratchpad"}),
@@ -644,7 +665,7 @@ mod tests {
     }
 
     /// A host that denies whatever would prompt never tells the model someone will be asked;
-    /// every other policy keeps the sentence the local prompt has.
+    /// every other policy, Durable Approval among them, keeps the sentence the local prompt has.
     #[test]
     fn calls_that_would_prompt_are_described_by_the_hosts_prompt_policy() {
         use tickloop_harness_protocol::PromptPolicy;
@@ -666,7 +687,11 @@ mod tests {
             )));
             assert!(!denying.contains("will be prompted"), "{denying}");
             assert!(!denying.contains("{APPROVAL}"));
-            for asking in [PromptPolicy::Interactive, PromptPolicy::Unrestricted] {
+            for asking in [
+                PromptPolicy::Interactive,
+                PromptPolicy::Unrestricted,
+                PromptPolicy::DurableApproval,
+            ] {
                 let asking = prompt(asking, has_folder);
                 assert!(asking.contains(APPROVAL_PROMPTED));
                 assert_eq!(
@@ -705,10 +730,40 @@ mod tests {
         ] {
             assert!(!prompt.contains(absent), "{absent}");
         }
-        for section in [AGENT_MESSAGE_SECTION, ACTIONS_SECTION] {
+        for section in [AGENT_MESSAGE_SECTION, "# Executing actions with care"] {
             assert!(!prompt.contains(section));
         }
         assert!(prompt.contains("# Tone and style"));
+    }
+
+    /// A host names where its users manage MCP servers, and the prompt names nothing of the
+    /// terminal's for them.
+    #[test]
+    fn a_host_names_where_its_users_manage_mcp_servers() {
+        let guidance = crate::tool_exposure::McpGuidance {
+            place: "Settings → Connectors".into(),
+            management:
+                "Connectors are added, logged in and managed by the user in Settings → Connectors"
+                    .into(),
+            ..Default::default()
+        };
+        let prompt = conversation_system_prompt(
+            &serde_json::json!({}),
+            OutputStyle::Standard,
+            PromptScope {
+                mcp_guidance: Some(&guidance),
+                ..PromptScope::LOCAL
+            },
+        );
+        assert!(prompt.contains("are the user's steps: plugins and Tick packages in /plugins and /ticks; Connectors are added, logged in and managed by the user in Settings → Connectors. Never do these yourself"), "{prompt}");
+        assert!(
+            prompt.contains(
+                "the user logs in to those in /plugins, /ticks or Settings → Connectors."
+            )
+        );
+        assert!(!prompt.contains("/mcp"));
+        assert!(!prompt.contains("tickloop mcp"));
+        assert!(!prompt.contains("{MCP_"));
     }
 
     #[test]

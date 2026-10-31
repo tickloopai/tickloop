@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 fn credential() -> ConnectorCredential {
     ConnectorCredential {
+        login: None,
         server_url: "https://example.com/mcp".into(),
         registration: ClientRegistration {
             authorization_server: "https://example.com".into(),
