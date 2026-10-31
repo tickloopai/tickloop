@@ -6,8 +6,9 @@ Tickloop (tickloop.ai) is a terminal AI agent for code and office work: the `tic
 
 - Terms follow [CONTEXT.md](./CONTEXT.md); use its names in code, UI and discussion. Internal module boundaries are not product Tick types.
 - When a change conflicts with documented behavior, say so; never change a meaning silently. When documents and source disagree, the source wins.
-- Division of documents: agent instructions live only in AGENTS.md (no CLAUDE.md); CONTEXT.md holds term definitions only; the READMEs describe user-facing usage only.
-- `docs/` (design records `docs/design/`, ADRs `docs/adr/`, `docs/agents/`), `code/cli/README.md` (the agent manual, in Chinese), `.tickloop/skills/` and `.scratch/` are maintainer-local files outside Git. Pointers to them below apply only when they exist; in a contributor's checkout, this file, CONTEXT.md, the READMEs and the source are authoritative. When reading an ADR, check its frontmatter `status` and follow "superseded by" to the ADR that replaces it.
+- Division of documents: agent instructions live only in AGENTS.md (no CLAUDE.md); CONTEXT.md holds term definitions only; user-facing usage lives in `README.md`, `README.zh-CN.md` and `docs/` (`docs/zh-CN/` mirrors it).
+- English changes to `README.md` or `docs/` must update the matching `README.zh-CN.md` or `docs/zh-CN/` page in the same change.
+- Design records `docs/design/`, ADRs `docs/adr/` and `docs/agents/`, `code/cli/README.md` (the agent manual, in Chinese), `.tickloop/skills/` and `.scratch/` are maintainer-local files outside Git. Pointers to them below apply only when they exist; in a contributor's checkout, this file, CONTEXT.md, the READMEs, `docs/` and the source are authoritative. When reading an ADR, check its frontmatter `status` and follow "superseded by" to the ADR that replaces it.
 
 ## Core behavior
 
@@ -127,7 +128,7 @@ Integration seams: Transcript Store, Execution Environment, Model Endpoint, Cred
 | UI style, Theme, Role table, glyphs | `docs/design/ui-theme.md`, `docs/design/agent-ui.md`; ADR 0025 |
 | Image input and model image capabilities (images only, no PDF yet) | `docs/design/image-input.md` |
 | Artifacts client | `docs/design/ai-artifacts.md`; ADR 0031, 0028 |
-| The agent's overall user-facing behavior | `code/cli/README.md` |
+| The agent's overall user-facing behavior | `README.md` and `docs/`; maintainer manual `code/cli/README.md` |
 
 ## Verification and tickets
 

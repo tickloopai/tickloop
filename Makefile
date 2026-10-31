@@ -62,7 +62,7 @@ test-workspace:
 	@cargo nextest --version >/dev/null 2>&1 || { echo 'make test requires cargo-nextest; install it with: cargo install --locked cargo-nextest' >&2; exit 1; }
 	# The compatibility test invokes target/debug/tickloop; clippy does not refresh it.
 	cargo build --locked $(CARGO_PACKAGE) --bin tickloop --target-dir target
-	node --test scripts/test-workspace.test.mjs scripts/dev-agent.test.mjs scripts/check-boundaries.test.mjs scripts/check-public-api.test.mjs scripts/plugin-compat-report.test.mjs
+	node --test scripts/test-workspace.test.mjs scripts/dev-agent.test.mjs scripts/check-boundaries.test.mjs scripts/check-public-api.test.mjs scripts/check-docs-sync.test.mjs scripts/plugin-compat-report.test.mjs
 	node scripts/test-workspace.mjs
 
 
@@ -75,6 +75,7 @@ check-workspace:
 	node scripts/check-agent-access.mjs
 	node scripts/check-boundaries.mjs
 	node scripts/check-public-api.mjs
+	node scripts/check-docs-sync.mjs
 	cargo fmt --all --check
 	cargo fmt --manifest-path distribution/cargo/Cargo.toml -- --check
 	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
