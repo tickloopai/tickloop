@@ -3,6 +3,8 @@ use tickloop_harness::protocol::{EventSourceBinding, ShellTask, ShellTaskState, 
 
 /// Subscribes the Chat to an extension or terminal Tick from its Monitor row.
 pub(crate) const SUBSCRIBE_KEY: char = 's';
+/// Cancels the row's periodic Tick Subscriptions; `s` only subscribes and cycles frequencies.
+pub(crate) const UNSUBSCRIBE_ROW_KEY: char = 'S';
 /// The row action ID dispatched by x.
 pub(crate) const REMOVE_KEY: char = 'x';
 
@@ -54,7 +56,11 @@ impl MonitorRows for HostedRows {
                         .filter(|_| run == HostedRun::Exited)
                         .map(terminal_exit_status)
                         .unwrap_or_else(|| link_status(row.link).into()),
-                    notes: Vec::new(),
+                    notes: if run == HostedRun::Exited {
+                        super::terminal_exit_notes(row.program_exit)
+                    } else {
+                        Vec::new()
+                    },
                     subscription: None,
                     owner: if is_opened_here {
                         TickOwner::ThisChat
@@ -101,10 +107,11 @@ impl MonitorRows for HostedRows {
                 row.tone = link_tone(TickLinkState::Live);
                 HostedRun::Running
             }
-            Some(MemberState::Exited(status)) => {
-                row.status = status.clone();
+            Some(MemberState::Exited(exit)) => {
+                row.status = exit.map_or_else(|| "exited".into(), terminal_exit_status);
+                row.notes = super::terminal_exit_notes(*exit);
                 row.tone = StatusTone::Neutral;
-                row.ended = Some(status.clone());
+                row.ended = Some(row.status.clone());
                 HostedRun::Exited
             }
             Some(MemberState::Lost) => {
@@ -425,44 +432,12 @@ fn add_probed_update(row: &mut TickDescriptor, context: &MonitorContext) {
     }
 }
 
-/// What a finished Shell's row says beside its glyph's colour: the signal that ended it, by
-/// name, or a non-zero exit code. Success needs no words.
+/// What a finished Shell's row says beside its glyph's colour, as an ended program's row does.
 fn shell_notes(task: &ShellTask) -> Vec<String> {
     if !task.state.is_terminal() {
         return Vec::new();
     }
-    match (task.signal, task.exit_code) {
-        (Some(signal), _) => {
-            vec![signal_name(signal).map_or_else(|| format!("signal {signal}"), str::to_owned)]
-        }
-        (None, Some(code)) if code != 0 => vec![code.to_string()],
-        _ => Vec::new(),
-    }
-}
-
-/// The name of a signal that ends a process, such as `SIGTERM`.
-fn signal_name(signal: i32) -> Option<&'static str> {
-    Some(match signal {
-        libc::SIGHUP => "SIGHUP",
-        libc::SIGINT => "SIGINT",
-        libc::SIGQUIT => "SIGQUIT",
-        libc::SIGILL => "SIGILL",
-        libc::SIGTRAP => "SIGTRAP",
-        libc::SIGABRT => "SIGABRT",
-        libc::SIGBUS => "SIGBUS",
-        libc::SIGFPE => "SIGFPE",
-        libc::SIGKILL => "SIGKILL",
-        libc::SIGUSR1 => "SIGUSR1",
-        libc::SIGSEGV => "SIGSEGV",
-        libc::SIGUSR2 => "SIGUSR2",
-        libc::SIGPIPE => "SIGPIPE",
-        libc::SIGALRM => "SIGALRM",
-        libc::SIGTERM => "SIGTERM",
-        libc::SIGXCPU => "SIGXCPU",
-        libc::SIGXFSZ => "SIGXFSZ",
-        libc::SIGSYS => "SIGSYS",
-        _ => return None,
-    })
+    super::exit_notes(task.exit_code, task.signal)
 }
 
 /// A Shell row is named by its key command, so the row says what runs; its description, full
@@ -1412,12 +1387,20 @@ mod tests {
         chat.monitor.record_opened(exited.clone(), None);
         let context = MonitorContext {
             chat: Some(Arc::new(chat)),
-            member_states: [(exited.clone(), MemberState::Exited("exited 3".into()))].into(),
+            member_states: [(
+                exited.clone(),
+                MemberState::Exited(Some(tickloop_harness::protocol::HostedProgramExit {
+                    code: Some(3),
+                    signal: None,
+                })),
+            )]
+            .into(),
             ..Default::default()
         };
         let rows = MonitorRowsRegistry::builtin().list(&context);
         let row = rows.iter().find(|row| row.instance == exited).unwrap();
         assert_eq!(row.status, "exited 3");
+        assert_eq!(row.notes, ["exit 3"], "the row says how it ended");
         assert!(!row.running);
         assert_eq!(row.tone, StatusTone::Neutral);
         assert_eq!(row.ended.as_deref(), Some("exited 3"), "its card says how");
@@ -1514,5 +1497,24 @@ mod tests {
             actions.starts_with(&[('o', "open"), ('x', "close")]),
             "nothing offers to reopen a Tick that may still run: {actions:?}"
         );
+    }
+
+    #[test]
+    fn an_exited_terminal_ticks_row_always_says_how_it_ended() {
+        use tickloop_harness::protocol::HostedProgramExit;
+        let exit = |code, signal| Some(HostedProgramExit { code, signal });
+        assert_eq!(
+            super::super::terminal_exit_notes(exit(Some(0), None)),
+            ["exit 0"]
+        );
+        assert_eq!(
+            super::super::terminal_exit_notes(exit(Some(3), None)),
+            ["exit 3"]
+        );
+        assert_eq!(
+            super::super::terminal_exit_notes(exit(None, Some(libc::SIGTERM))),
+            ["SIGTERM"]
+        );
+        assert_eq!(super::super::terminal_exit_notes(None), ["exited"]);
     }
 }

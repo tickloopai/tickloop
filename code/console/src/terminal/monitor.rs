@@ -34,7 +34,7 @@ const TICK_PREFETCH_ROWS: usize = 8;
 const ACTION_WAITING_STATUS: &str = "Waiting for previous action";
 const EMPTY_MONITOR_TEXT: &str = "Nothing to monitor";
 /// The end of the row whose card has the focus: keys go to its Tick.
-const FOCUSED_CARD_MARK: &str = "input";
+const FOCUSED_CARD_MARK: &str = "focused";
 /// The rule of a card cropped because not even its minimum fits.
 const TOO_SHORT_NOTE: &str = "terminal too short";
 
@@ -645,8 +645,8 @@ impl Monitor {
             })
             .collect()
     }
-    /// The subscription on `instance` whose frequency the row's `f` cycles: the last periodic
-    /// one, since the Agent lists subscriptions in the order their Loops began.
+    /// The subscription on `instance` whose frequency the row's `s` cycles: the fastest periodic
+    /// one, the frequency the row shows.
     pub(super) fn subscription_target(&self, instance: &InstanceRef) -> Option<uuid::Uuid> {
         crate::monitor_rows::subscriptions_on(&self.shown_subscriptions(), instance)
             .iter()
@@ -661,10 +661,7 @@ impl Monitor {
     ) -> Option<tickloop_harness::protocol::TickSubscriptionChange> {
         let rows = self.shown_subscriptions();
         let row = rows.iter().find(|row| row.id == subscription)?;
-        let next = match row.frequency {
-            TickSubscriptionFrequency::Low => None,
-            frequency => Some(frequency.next_periodic()?),
-        };
+        let next = Some(row.frequency.next_periodic()?);
         for target in rows.iter().filter(|target| {
             target.id == subscription
                 || (all_on_instance
@@ -678,6 +675,21 @@ impl Monitor {
             tickloop_harness::protocol::TickSubscriptionChange::Cancel,
             tickloop_harness::protocol::TickSubscriptionChange::Frequency,
         ))
+    }
+
+    /// Shows the periodic subscriptions on `instance` as cancelled at once, before the Agent
+    /// reports it; returns one of them, which a cancel of every one on the instance names.
+    pub(super) fn request_unsubscribe(&mut self, instance: &InstanceRef) -> Option<uuid::Uuid> {
+        let targets = crate::monitor_rows::subscriptions_on(&self.shown_subscriptions(), instance)
+            .iter()
+            .filter(|row| row.frequency.period().is_some())
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        for target in &targets {
+            self.requested_subscriptions.insert(*target, None);
+        }
+        self.rebuild();
+        targets.first().copied()
     }
 
     /// Shows what the Agent reports for `subscription` again, after it refused the change.

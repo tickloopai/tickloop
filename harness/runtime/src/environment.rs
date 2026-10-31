@@ -117,6 +117,7 @@ impl ExecutionPort for FolderPort {
                 }))
             }
             ExecutionQuery::Instances => Ok(ExecutionInspection::Instances(Vec::new())),
+            ExecutionQuery::InstanceStates => Ok(ExecutionInspection::InstanceStates(Vec::new())),
             _ => Err(ExecutionError::new(
                 "Unsupported",
                 "this environment has no execution host",

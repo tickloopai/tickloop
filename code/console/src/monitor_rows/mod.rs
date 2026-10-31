@@ -7,7 +7,7 @@ mod probe;
 #[cfg(test)]
 pub(crate) use builtin::artifact_actions;
 pub use builtin::{ArtifactRows, HostedRows, ShellRows};
-pub(crate) use builtin::{REMOVE_KEY, SUBSCRIBE_KEY};
+pub(crate) use builtin::{REMOVE_KEY, SUBSCRIBE_KEY, UNSUBSCRIBE_ROW_KEY};
 pub use probe::{MemberFindings, ProbeError, TickProbe};
 
 use std::{
@@ -33,12 +33,18 @@ impl TickGroup {
         order: 0,
         name: "Artifacts",
     };
+    /// Extension Ticks, shown as cards.
     pub const Ticks: Self = Self {
         order: 1,
         name: "Ticks",
     };
-    pub const Shells: Self = Self {
+    /// Terminal Ticks, shown full screen.
+    pub const Terminals: Self = Self {
         order: 2,
+        name: "Terminals",
+    };
+    pub const Shells: Self = Self {
+        order: 3,
         name: "Shells",
     };
     pub fn title(self) -> &'static str {
@@ -81,8 +87,11 @@ pub enum TickIntent {
     /// restores the old instance's Tick Subscriptions.
     ReopenHosted(InstanceRef),
     /// Subscribes the Chat to an extension or terminal Tick at the default frequency, or, once one
-    /// of its Loops subscribes to it, cycles that subscription through high, medium and low.
+    /// of its Loops subscribes to it, cycles that subscription through high, medium and low and
+    /// back to high; it never cancels.
     Subscribe(InstanceRef),
+    /// Cancels the Chat's periodic Tick Subscriptions on an instance.
+    Unsubscribe(InstanceRef),
     SendUpdate(InstanceRef),
     /// Stops a running Shell.
     StopShell {
@@ -327,11 +336,72 @@ pub struct MonitorContext {
 pub(crate) const TICK_ENDED: &str = "ended";
 
 pub(crate) fn terminal_exit_status(exit: tickloop_harness::protocol::HostedProgramExit) -> String {
-    match (exit.code, exit.signal) {
+    exit_status(exit.code, exit.signal)
+}
+
+/// How a program ended, for a status line: `exited 3`, `exited by SIGTERM`.
+pub(crate) fn exit_status(code: Option<i32>, signal: Option<i32>) -> String {
+    match (code, signal) {
         (Some(code), _) => format!("exited {code}"),
-        (_, Some(signal)) => format!("exited by signal {signal}"),
+        (_, Some(signal)) => format!("exited by {}", signal_label(signal)),
         _ => "exited".into(),
     }
+}
+
+/// What an ended program's row says beside its glyph's colour: the signal that ended it, by
+/// name, or a non-zero exit code. Success needs no words.
+pub(crate) fn exit_notes(code: Option<i32>, signal: Option<i32>) -> Vec<String> {
+    match (signal, code) {
+        (Some(signal), _) => vec![signal_label(signal)],
+        (None, Some(code)) if code != 0 => vec![code.to_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// What an exited Terminal Tick's row says: unlike a finished Shell, which leaves the list, it
+/// stays listed, so success says so too: `exit 0`, `exit 3`, `SIGTERM`.
+pub(crate) fn terminal_exit_notes(
+    exit: Option<tickloop_harness::protocol::HostedProgramExit>,
+) -> Vec<String> {
+    vec![match exit {
+        Some(tickloop_harness::protocol::HostedProgramExit {
+            signal: Some(signal),
+            ..
+        }) => signal_label(signal),
+        Some(tickloop_harness::protocol::HostedProgramExit {
+            code: Some(code), ..
+        }) => format!("exit {code}"),
+        _ => "exited".into(),
+    }]
+}
+
+fn signal_label(signal: i32) -> String {
+    signal_name(signal).map_or_else(|| format!("signal {signal}"), str::to_owned)
+}
+
+/// The name of a signal that ends a process, such as `SIGTERM`.
+fn signal_name(signal: i32) -> Option<&'static str> {
+    Some(match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGXFSZ => "SIGXFSZ",
+        libc::SIGSYS => "SIGSYS",
+        _ => return None,
+    })
 }
 
 /// A host probe's finding for one member. Probing reads host state only: it never reads Tick
@@ -339,8 +409,8 @@ pub(crate) fn terminal_exit_status(exit: tickloop_harness::protocol::HostedProgr
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemberState {
     Live,
-    /// A hosted terminal Tick whose program ended, with how it ended for its status.
-    Exited(String),
+    /// A hosted terminal Tick whose program ended, with how, when its host said.
+    Exited(Option<tickloop_harness::protocol::HostedProgramExit>),
     /// Its host died with it; a hosted Tick can be reopened as a new instance.
     Lost,
     Gone,
@@ -355,7 +425,7 @@ pub const MONITOR_REFRESH_KEY: char = 'r';
 /// Cancels the selected subscription directly in its detail.
 pub const UNSUBSCRIBE_KEY: char = 'u';
 /// What the subscribe key does on a row with a periodic subscription.
-const SUBSCRIPTION_ACTION_LABEL: &str = "subscriptions";
+const SUBSCRIBE_LABEL: &str = "subscribe";
 /// Shows a subscribed row's Tick Subscriptions; Enter stays with opening the Tick.
 pub const SUBSCRIPTIONS_KEY: char = 'w';
 /// Keys the Monitor list itself owns. Row actions never use them, so the list's hints always
@@ -477,31 +547,53 @@ fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus])
             },
         );
     }
-    if rows.iter().any(|row| row.frequency.period().is_some()) {
-        let is_key_free = !entry
-            .actions
-            .iter()
-            .any(|action| action.key == SUBSCRIBE_KEY);
+    // `s` moves the fastest periodic subscription, the one the row shows, to the next frequency.
+    if let Some(fastest) = rows
+        .iter()
+        .filter_map(|row| row.frequency.period().map(|period| (period, row.frequency)))
+        .min_by_key(|(period, _)| *period)
+        .map(|(_, frequency)| frequency)
+    {
+        let label = next_frequency_label(fastest);
+        let is_key_free =
+            |actions: &[MonitorAction], key| !actions.iter().any(|action| action.key == key);
+        let can_subscribe = is_key_free(&entry.actions, SUBSCRIBE_KEY);
         match entry
             .actions
             .iter_mut()
             .find(|action| matches!(action.intent, TickIntent::Subscribe(_)))
         {
-            Some(subscribe) => subscribe.label = SUBSCRIPTION_ACTION_LABEL,
-            None if is_key_free => entry.actions.push(MonitorAction {
+            Some(subscribe) => subscribe.label = label,
+            None if can_subscribe => entry.actions.push(MonitorAction {
                 key: SUBSCRIBE_KEY,
-                label: SUBSCRIPTION_ACTION_LABEL,
+                label,
                 intent: TickIntent::Subscribe(instance.clone()),
             }),
             None => {}
         }
+        if is_key_free(&entry.actions, UNSUBSCRIBE_ROW_KEY) {
+            entry.actions.push(MonitorAction {
+                key: UNSUBSCRIBE_ROW_KEY,
+                label: "unsubscribe",
+                intent: TickIntent::Unsubscribe(instance),
+            });
+        }
+    }
+}
+
+/// What the row's `s` says it moves a subscription of `frequency` to.
+fn next_frequency_label(frequency: TickSubscriptionFrequency) -> &'static str {
+    match frequency.next_periodic() {
+        Some(TickSubscriptionFrequency::Medium) => "every 10 min",
+        Some(TickSubscriptionFrequency::Low) => "every 30 min",
+        _ => "every minute",
     }
 }
 
 /// Lets the user subscribe an extension or terminal Tick that still exists from its row; Shells and
 /// artifacts are subscribed by default.
 fn offer_subscribing(entry: &mut TickDescriptor) {
-    let is_tick = entry.group == TickGroup::Ticks
+    let is_tick = matches!(entry.group, TickGroup::Ticks | TickGroup::Terminals)
         && matches!(entry.glyph, TickGlyph::Protocol | TickGlyph::Terminal);
     if is_tick
         && entry.tone != StatusTone::Gone
@@ -512,7 +604,7 @@ fn offer_subscribing(entry: &mut TickDescriptor) {
     {
         entry.actions.push(MonitorAction {
             key: SUBSCRIBE_KEY,
-            label: "subscriptions",
+            label: SUBSCRIBE_LABEL,
             intent: TickIntent::Subscribe(entry.instance.clone()),
         });
     }
@@ -676,6 +768,9 @@ impl MonitorRowsRegistry {
         }
         let mut entries = merged.into_values().collect::<Vec<_>>();
         for entry in &mut entries {
+            if entry.group == TickGroup::Ticks && entry.glyph == TickGlyph::Terminal {
+                entry.group = TickGroup::Terminals;
+            }
             entry.actions.retain(|action| {
                 let reserved = MONITOR_KEYS.contains(&action.key);
                 debug_assert!(
@@ -747,14 +842,17 @@ pub fn page_of(
     cursor: Option<&tickhost_connect::page::PageCursor>,
     limit: Option<usize>,
 ) -> Result<tickhost_connect::page::Page<TickDescriptor>, tickhost_connect::page::PageError> {
-    // The key sorts as the display order does: no join time sorts after every join time.
+    // The key sorts as the display order does: the latest join time first, no join time after
+    // every join time.
     let mut page = tickhost_connect::page::paginate(
         entries,
         |entry| {
             format!(
                 "{:05}:{:020}:{}",
                 entry.group.order,
-                entry.joined_at_ms.unwrap_or(u64::MAX),
+                entry
+                    .joined_at_ms
+                    .map_or(u64::MAX, |joined| u64::MAX - 1 - joined),
                 entry.instance
             )
         },
@@ -772,13 +870,14 @@ fn descriptor_order(left: &TickDescriptor, right: &TickDescriptor) -> std::cmp::
     )
 }
 
-/// Groups in their declared order; within a group rows in the order they joined, oldest first,
-/// rows without a join time after them by identity. Updates never move a row.
+/// Groups in their declared order; within a group the row that joined last first, rows without
+/// a join time after them by identity. Updates never move a row.
 pub(crate) fn display_order(
     left: (TickGroup, Option<u64>, &InstanceRef),
     right: (TickGroup, Option<u64>, &InstanceRef),
 ) -> std::cmp::Ordering {
-    let joined = |time: Option<u64>| time.unwrap_or(u64::MAX);
+    // Newest first; a row with no time of joining comes after every timed one.
+    let joined = |time: Option<u64>| std::cmp::Reverse(time.map_or(0, |time| time + 1));
     left.0
         .cmp(&right.0)
         .then_with(|| joined(left.1).cmp(&joined(right.1)))
@@ -916,7 +1015,7 @@ mod order_tests {
     }
 
     #[test]
-    fn rows_keep_the_order_they_joined_in_whatever_updates_later() {
+    fn rows_list_the_last_joined_first_in_whatever_updates_later() {
         let (oldest, middle, newest) = (
             hosted_created_at(1_000),
             hosted_created_at(2_000),
@@ -938,11 +1037,11 @@ mod order_tests {
             ]
         };
         let expected = vec![
-            linked_early.instance.clone(),
             linked_late.instance.clone(),
-            oldest.clone(),
-            middle.clone(),
+            linked_early.instance.clone(),
             newest.clone(),
+            middle.clone(),
+            oldest.clone(),
             untimed.clone(),
         ];
         assert_eq!(listed(rows([10, 20, 30])), expected);
@@ -991,7 +1090,7 @@ mod order_tests {
                 member,
                 row(oldest.clone(), TickGroup::Ticks, 2),
             ]),
-            [oldest, reopened, middle],
+            [middle, reopened, oldest],
             "a subscription's row of it moves it nowhere either"
         );
     }

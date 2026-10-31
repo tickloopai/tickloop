@@ -3022,6 +3022,21 @@ enum Viewed {
 }
 
 impl Viewed {
+    /// How a terminal Tick's program or a Shell task ended, once it did; an extension Tick's
+    /// screen never says.
+    fn exit(&self) -> Option<ProgramExit> {
+        match self {
+            Self::Tick(tick) => match &tick.adapter {
+                Adapter::Terminal(program) => program.exit(),
+                Adapter::Protocol(_) => None,
+            },
+            Self::Shell(task) => task.exit().map(|exit| ProgramExit {
+                code: exit.code,
+                signal: exit.signal,
+            }),
+        }
+    }
+
     fn changes(&self) -> watch::Receiver<()> {
         match self {
             Self::Tick(tick) => tick.screen_changes.subscribe(),
@@ -3210,16 +3225,9 @@ async fn attach_view(
         }
         told = current;
     }
-    // A terminal Tick whose program exits while this view shows it says so once; one that had
-    // exited before only shows its last screen.
-    let program = match &viewed {
-        Viewed::Tick(tick) => match &tick.adapter {
-            Adapter::Terminal(program) => Some(program),
-            Adapter::Protocol(_) => None,
-        },
-        Viewed::Shell(_) => None,
-    };
-    let mut has_told_exit = program.is_some_and(|program| program.exit().is_some());
+    // A terminal Tick's program or a Shell task that ended says so once, after the frame that
+    // shows how; a view attached after it ended is told right after its first frame.
+    let mut has_told_exit = false;
     let output = async {
         let mut shown = None;
         loop {
@@ -3240,7 +3248,7 @@ async fn attach_view(
                 )
                 .await?;
             }
-            if !has_told_exit && let Some(exit) = program.and_then(|program| program.exit()) {
+            if !has_told_exit && let Some(exit) = viewed.exit() {
                 has_told_exit = true;
                 write_within(
                     &mut writer,

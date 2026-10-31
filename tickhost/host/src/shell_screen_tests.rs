@@ -45,10 +45,6 @@ fn the_header_names_the_task_with_its_status_beside_the_key_command() {
     );
     assert_eq!(shown[5], "─".repeat(44));
     assert_eq!(shown[6..8], ["compiling", "running 3 tests"]);
-    assert_eq!(
-        shown[11], "",
-        "the last row is left for the view's key hints"
-    );
 
     screen.append(b"ok\n");
     screen.end("exit 0".into(), None, true);
@@ -115,22 +111,16 @@ fn a_short_screen_gives_up_the_rule_directory_description_and_full_command_first
             .all(|line| UnicodeWidthStr::width(line.as_str()) <= 50)
     );
 
-    screen.redraw(size(4, 50), b"out\n");
+    screen.redraw(size(3, 50), b"out\n");
     let shown = lines(&mut screen);
     assert!(shown[0].starts_with("$ xxx") && shown[0].ends_with("running 0s"));
     assert_eq!(
         shown[1..],
-        [
-            &format!("  cd /a && {}{ELLIPSIS}", "x".repeat(38)),
-            "out",
-            ""
-        ],
+        [&format!("  cd /a && {}{ELLIPSIS}", "x".repeat(38)), "out"],
         "the full command stays after the description gave way"
     );
-    screen.redraw(size(3, 50), b"out\n");
-    assert_eq!(lines(&mut screen)[1..], ["out", ""]);
     screen.redraw(size(2, 50), b"out\n");
-    assert_eq!(lines(&mut screen)[1], "out", "no room for a hint row");
+    assert_eq!(lines(&mut screen)[1..], ["out"]);
 }
 
 #[test]
@@ -139,7 +129,7 @@ fn a_view_scrolls_back_through_the_output_and_keeps_its_lines_as_more_arrive() {
     let output = (1..=100)
         .map(|line| format!("{line}\n"))
         .collect::<String>();
-    screen.redraw(size(8, 40), output.as_bytes());
+    screen.redraw(size(7, 40), output.as_bytes());
     assert_eq!(screen.output_rows(), 4);
     assert_eq!(
         lines(&mut screen)[3..7],

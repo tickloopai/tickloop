@@ -124,6 +124,11 @@ impl Agent {
         min_rows: Option<u16>,
         max_rows: Option<u16>,
     ) {
+        crate::tick_changes::record_told(
+            chat,
+            instance.clone(),
+            crate::tick_changes::ToldTickState::Running,
+        );
         let member = chat.snapshot.monitor.record_opened(instance.clone(), title);
         member.is_terminal = is_terminal;
         member.min_rows = min_rows;
@@ -146,6 +151,7 @@ impl Agent {
         lost: &InstanceRef,
         reopened: InstanceRef,
     ) -> Result<MonitorMembership, AgentError> {
+        let mut title = None;
         let membership = self
             .update_monitor(chat_id, |membership| {
                 let lost_member = membership
@@ -157,20 +163,37 @@ impl Agent {
                     .as_ref()
                     .and_then(|member| member.joined_at_ms)
                     .or_else(|| identity_time_ms(lost));
-                let member = membership.record_opened(
-                    reopened.clone(),
-                    lost_member.as_ref().and_then(|member| member.title.clone()),
-                );
+                title = lost_member.as_ref().and_then(|member| member.title.clone());
+                let member = membership.record_opened(reopened.clone(), title.clone());
                 if let Some(lost_member) = lost_member {
                     member.is_terminal = lost_member.is_terminal;
                     member.min_rows = lost_member.min_rows;
                     member.max_rows = lost_member.max_rows;
                 }
                 member.joined_at_ms = joined_at_ms;
-                membership.mark_handled(reopened, now_ms());
+                membership.mark_handled(reopened.clone(), now_ms());
                 membership.remove(lost.clone());
             })
             .await?;
+        if let Some(chat) = self.inner.chats.lock().await.get_mut(&chat_id) {
+            chat.bookkeeping.user_tick_changes.push(
+                crate::tick_changes::UserTickChange::Reopened {
+                    ended: lost.clone(),
+                    reopened: reopened.clone(),
+                    title,
+                },
+            );
+            crate::tick_changes::record_told(
+                chat,
+                lost.clone(),
+                crate::tick_changes::ToldTickState::Ended,
+            );
+            crate::tick_changes::record_told(
+                chat,
+                reopened,
+                crate::tick_changes::ToldTickState::Running,
+            );
+        }
         self.sync_tick_subscriptions().await;
         Ok(membership)
     }

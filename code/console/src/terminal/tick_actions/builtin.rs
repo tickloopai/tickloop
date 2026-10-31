@@ -4,7 +4,7 @@ use super::super::{
     task_access::ShellTaskCenter,
 };
 use super::*;
-use crate::monitor_rows::{REMOVE_KEY, SUBSCRIBE_KEY, TickIntent};
+use crate::monitor_rows::{REMOVE_KEY, SUBSCRIBE_KEY, TickIntent, UNSUBSCRIBE_ROW_KEY};
 
 /// The Console executor that carries out a Monitor row's intent. A notice has none: the Console
 /// only shows it.
@@ -26,6 +26,7 @@ pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickA
             card: ReopenedCard::FullScreen,
         }),
         TickIntent::Subscribe(instance) => Arc::new(Subscribe { instance }),
+        TickIntent::Unsubscribe(instance) => Arc::new(Unsubscribe { instance }),
         TickIntent::SendUpdate(instance) => Arc::new(SendUpdate { instance }),
         TickIntent::StopShell { task } => Arc::new(StopShell { task }),
         TickIntent::Artifact { id, key } => artifact(&id, key),
@@ -507,9 +508,32 @@ impl TickActionBackend for SendUpdate {
     }
 }
 
+/// The row's `S`: cancels the Chat's periodic subscriptions on the Tick, shown cancelled at once.
+struct Unsubscribe {
+    instance: tick_protocol::InstanceRef,
+}
+impl TickActionExecutor for Unsubscribe {
+    fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        let subscription = ui
+            .unsubscribe(&self.instance)
+            .ok_or("This Tick has no subscription to cancel")?;
+        Ok(PreparedTickAction::new(
+            self.instance.to_string(),
+            UNSUBSCRIBE_ROW_KEY,
+            Arc::new(ChangeSubscription {
+                panel: None,
+                request: SubscriptionRequest {
+                    subscription,
+                    change: tickloop_harness::protocol::TickSubscriptionChange::Cancel,
+                },
+            }),
+        ))
+    }
+}
+
 /// The row's `s` on an extension or terminal Tick: subscribes the Chat at the default frequency
-/// on its user's word, or, once a Loop of the Chat subscribes to it, cycles that subscription's
-/// frequency.
+/// on its user's word, or, once a Loop of the Chat subscribes to it, cycles that subscription
+/// through the periodic frequencies without ever cancelling it.
 struct Subscribe {
     instance: tick_protocol::InstanceRef,
 }
@@ -542,14 +566,11 @@ impl TickActionBackend for Subscribe {
             .filter(|row| row.frequency.period().is_some())
             .min_by_key(|row| row.frequency.period())
         {
-            let change = match row.frequency {
-                tickloop_harness::protocol::TickSubscriptionFrequency::Low => {
-                    tickloop_harness::protocol::TickSubscriptionChange::Cancel
-                }
-                frequency => tickloop_harness::protocol::TickSubscriptionChange::Frequency(
-                    frequency.next_periodic().expect("periodic subscription"),
-                ),
-            };
+            let change = tickloop_harness::protocol::TickSubscriptionChange::Frequency(
+                row.frequency
+                    .next_periodic()
+                    .expect("periodic subscription"),
+            );
             return ChangeSubscription {
                 panel: None,
                 request: SubscriptionRequest {

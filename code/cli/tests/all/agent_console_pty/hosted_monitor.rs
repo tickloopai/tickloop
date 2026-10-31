@@ -134,7 +134,7 @@ async fn actual_cli_monitor_cards_show_live_ticks_and_take_keys_while_entered() 
             keys_cards(frame) == 1 && frame.contains("space hide")
         })
         .await;
-        view.send(b"k");
+        view.send(b"j");
         view.wait_for("the preview closes as the selection moves on", |frame| {
             keys_cards(frame) == 0 && frame.contains("space show")
         })
@@ -142,7 +142,7 @@ async fn actual_cli_monitor_cards_show_live_ticks_and_take_keys_while_entered() 
         view.send(b" ");
         view.wait_for("one card shows its Tick", |frame| keys_cards(frame) == 1)
             .await;
-        view.send(b"j");
+        view.send(b"k");
         view.wait_for("the other row selected", |frame| {
             frame.contains("space show")
         })
@@ -299,7 +299,8 @@ async fn actual_cli_bubbled_keys_go_back_to_the_list_with_another_tick_selected(
         view.send(b" ");
         view.wait_for("one card shows", |frame| keys_cards(frame) == 1)
             .await;
-        view.send(b"j");
+        // The other Tick joined later, so it is listed above.
+        view.send(b"k");
         view.wait_for("the other row selected", |frame| {
             frame.contains("space show")
         })
@@ -311,7 +312,7 @@ async fn actual_cli_bubbled_keys_go_back_to_the_list_with_another_tick_selected(
             })
             .await;
         assert_eq!(keys_cards(&both), 2, "{both}");
-        view.send(b"k\r");
+        view.send(b"\r");
         view.wait_for("the first card has the focus", |frame| {
             card_focused(frame) && frame.contains("↑↓ tab move")
         })
@@ -986,7 +987,17 @@ async fn actual_cli_terminal_ticks_and_shells_show_full_screen_and_ctrl_c_stops_
             "Space shows no card for a terminal Tick: {frame}"
         );
         view.send(b"\r");
-        wait_for_screen(&view, "cat takes the whole terminal", full_screen).await;
+        wait_for_screen(&view, "cat takes all but the hint row", |frame| {
+            full_screen(frame) && frame.lines().last().map(str::trim_end) == Some("esc esc hide")
+        })
+        .await;
+        view.send(&click(3, TERMINAL_HEIGHT));
+        wait_for_screen(&view, "a click on the hint hides cat", |frame| {
+            !full_screen(frame) && frame.contains("enter open")
+        })
+        .await;
+        view.send(b"\r");
+        wait_for_screen(&view, "cat is shown again", full_screen).await;
         view.send(b"hello cat\r");
         wait_for_screen(&view, "cat echoes full screen", |frame| {
             full_screen(frame) && frame.contains("hello cat")
@@ -1137,8 +1148,9 @@ async fn actual_cli_attach_lists_running_ticks_and_shows_the_chosen_one_full_scr
     }
 }
 
-/// A terminal Tick whose program exits while shown full screen hands the terminal back to the
-/// list, whose status line says how it ended. A card whose extension Tick ends keeps its last
+/// A terminal Tick whose program exits while shown full screen keeps its last screen, saying on
+/// the bottom row how it ended: a lone Esc hides it, and Enter, there or on the row's last screen
+/// shown again, reopens it full screen in the row's place. A card whose extension Tick ends keeps its last
 /// screen, says on its rule that it ended and gives the focus back to the list; Space still
 /// hides the ended Tick's card.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1161,8 +1173,43 @@ async fn actual_cli_a_tick_that_ends_while_shown_says_how() {
         })
         .await;
         view.send(b"\x04");
-        wait_for_screen(&view, "the list says how cat ended", |frame| {
+        wait_for_screen(&view, "cat's last screen says how it ended", |frame| {
+            full_screen(frame)
+                && frame.contains("last words")
+                && frame.contains("exited 0 · enter reopen · esc hide")
+        })
+        .await;
+        view.send(b"x");
+        view.send(b"\x1b");
+        wait_for_screen(&view, "a lone Esc hides the ended Tick", |frame| {
             !full_screen(frame) && frame.contains("exited 0")
+        })
+        .await;
+        view.send(b" ");
+        wait_for_screen(&view, "Space says Enter shows the last screen", |frame| {
+            frame.contains("enter shows its last screen")
+        })
+        .await;
+        view.send(b"\r");
+        wait_for_screen(&view, "Enter shows the ended Tick's last screen", |frame| {
+            full_screen(frame) && frame.contains("last words") && frame.contains("enter reopen")
+        })
+        .await;
+        view.send(b"\r");
+        wait_for_screen(&view, "Enter reopens cat full screen", |frame| {
+            full_screen(frame) && !frame.contains("last words") && !frame.contains("exited 0")
+        })
+        .await;
+        view.send(b"again\r");
+        wait_for_screen(&view, "the reopened cat echoes", |frame| {
+            full_screen(frame) && frame.contains("again")
+        })
+        .await;
+        view.send(b"\x1b");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        view.send(b"\x1b");
+        wait_for_screen(&view, "Esc Esc hides the reopened cat", |frame| {
+            !full_screen(frame)
         })
         .await;
 
@@ -1381,7 +1428,7 @@ async fn actual_cli_s_keeps_a_terminal_update_pending_while_changing_frequency()
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
         }
-        view.send(b"s");
+        view.send(b"S");
         eventually("subscription cancelled", || async {
             tick_subscriptions(&client, execution).await.is_empty().then_some(())
         }).await;
@@ -1394,8 +1441,12 @@ async fn actual_cli_s_keeps_a_terminal_update_pending_while_changing_frequency()
         }).await;
         eventually("resubscribing preserves known unread", || async { (signals(&view).0).then_some(()) }).await;
         view.send(b"sss");
-        eventually("rapid cycle cancels again", || async { tick_subscriptions(&client, execution).await.is_empty().then_some(()) }).await;
-        view.wait_for("manual send available globally", |frame| frame.contains("u send update") && frame.contains("s subscriptions")).await;
+        eventually("a rapid cycle comes back to every minute and never cancels", || async {
+            tick_subscriptions(&client, execution).await.into_iter().find(|row| row.frequency == TickSubscriptionFrequency::High)
+        }).await;
+        view.send(b"S");
+        eventually("S cancels again", || async { tick_subscriptions(&client, execution).await.is_empty().then_some(()) }).await;
+        view.wait_for("manual send available globally", |frame| frame.contains("u send update") && frame.contains("s subscribe")).await;
         assert!(!view.frame().contains("Not subscribed"));
         view.send(b"u");
         view.wait_for("manual update delivered", |frame| frame.contains("Manual update received.") && frame.contains("TickUpdate:")).await;

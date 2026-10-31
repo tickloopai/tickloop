@@ -1163,6 +1163,45 @@ impl HostedTickTools {
         }
     }
 
+    /// How each of `chat`'s hosted Ticks stands on its host, read from the listing alone; an
+    /// instance it does not list has ended.
+    pub async fn states(
+        &self,
+        chat: ChatId,
+    ) -> Result<
+        Vec<(
+            InstanceRef,
+            tickloop_harness::runtime::environment::InstanceState,
+        )>,
+        HostError,
+    > {
+        use tickloop_harness::runtime::environment::InstanceState;
+        let mut states = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.list_page(chat, cursor).await?;
+            states.extend(page.page.items.into_iter().filter_map(|row| {
+                let state = match row.exit {
+                    Some(exit) => InstanceState::Exited {
+                        code: exit.code,
+                        signal: exit.signal,
+                    },
+                    None => InstanceState::Running,
+                };
+                Some((row.instance?, state))
+            }));
+            states.extend(
+                page.lost
+                    .into_iter()
+                    .map(|lost| (lost.instance, InstanceState::Lost)),
+            );
+            match page.page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(states),
+            }
+        }
+    }
+
     /// Forgets `chat`'s bindings of every instance a complete listing did not show running.
     async fn forget_unlisted(&self, chat: ChatId, running: &HashSet<InstanceRef>) {
         self.bindings

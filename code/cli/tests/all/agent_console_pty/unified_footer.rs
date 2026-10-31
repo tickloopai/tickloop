@@ -380,20 +380,31 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         frame.contains("Shells (2)")
     })
     .await;
-    // Rows keep the order they joined: Shift+Down selects the older Shell, `j` the newer one.
+    // The Shell that joined last is listed first: Shift+Down selects it, `j` the older one.
+    let selected = |command: &'static str| {
+        move |frame: &str| {
+            frame
+                .lines()
+                .any(|line| line.contains(SELECTED_MARK) && line.contains(command))
+        }
+    };
     pty.send(b"\x1b[1;2B");
-    pty.wait_for("the older Shell selected first", |frame| {
-        frame.lines().any(|line| {
-            line.contains(SELECTED_MARK) && line.contains("while [ ! -f first-finish ]")
-        })
-    })
+    pty.wait_for(
+        "the newer Shell selected first",
+        selected("while [ ! -f second-finish ]"),
+    )
     .await;
     pty.send(b"j");
-    pty.wait_for("newest exact Shell selected", |frame| {
-        frame.lines().any(|line| {
-            line.contains(SELECTED_MARK) && line.contains("while [ ! -f second-finish ]")
-        })
-    })
+    pty.wait_for(
+        "the older Shell below it",
+        selected("while [ ! -f first-finish ]"),
+    )
+    .await;
+    pty.send(b"k");
+    pty.wait_for(
+        "newest exact Shell selected",
+        selected("while [ ! -f second-finish ]"),
+    )
     .await;
     pty.send(b"\r");
     shell_view_shows(

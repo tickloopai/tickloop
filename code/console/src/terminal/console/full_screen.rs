@@ -8,6 +8,8 @@ use tick_protocol::InstanceRef;
 
 /// Space on an ended Terminal Tick's row, which has no card to show.
 pub(super) const ENDED_TERMINAL_NOTICE: &str = "This Tick ended; enter reopens it";
+/// Space on the row of a Terminal Tick whose program exited and left its last screen.
+pub(super) const EXITED_TERMINAL_NOTICE: &str = "This Tick exited; enter shows its last screen";
 /// Rings the terminal's bell once, for a question that waits behind a full-screen view.
 const BELL: &[u8] = b"\x07";
 
@@ -31,6 +33,26 @@ impl State {
                 None
             }
         }
+    }
+
+    /// The row action that reopens `instance`, a Terminal Tick this Chat opened, in its row's
+    /// place once its program ended.
+    fn reopen_of(&self, instance: &InstanceRef) -> Option<crate::monitor_rows::TickIntent> {
+        let entry = self
+            .monitor
+            .entries()
+            .iter()
+            .find(|entry| &entry.instance == instance)?;
+        entry
+            .actions
+            .iter()
+            .any(|action| {
+                matches!(
+                    action.intent,
+                    crate::monitor_rows::TickIntent::CloseHosted { .. }
+                )
+            })
+            .then(|| crate::monitor_rows::TickIntent::ReopenFullScreen(instance.clone()))
     }
 
     /// The row action that stops `instance`, a running Shell this Chat may stop.
@@ -169,7 +191,9 @@ pub(super) fn lend_terminal_to_attached_view(
             stoppable: lock()?.shell_stop(&attach.instance).is_some(),
         }
     } else {
-        ViewInput::Interactive
+        ViewInput::Interactive {
+            reopenable: lock()?.reopen_of(&attach.instance).is_some(),
+        }
     };
     let attached = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -205,9 +229,10 @@ pub(super) fn lend_terminal_to_attached_view(
     let lent = lock()?.lend_terminal();
     let ended = lent.map(|()| runtime.block_on(view.run(interrupt)));
     let tick_ended = matches!(ended, Ok(Ok(AttachEnd::Gone)));
+    let reopens = matches!(ended, Ok(Ok(AttachEnd::Reopen)));
     let failure = match ended {
         // The selected row's status line says how it ended once Monitor reads it again.
-        Ok(Ok(AttachEnd::Hidden | AttachEnd::Gone)) => None,
+        Ok(Ok(AttachEnd::Hidden | AttachEnd::Gone | AttachEnd::Reopen)) => None,
         Ok(Ok(AttachEnd::Lost(reason))) => Some(format!("The view ended: {reason}")),
         Ok(Err(error)) => Some(format!("The view ended: {error}")),
         Err(error) => Some(format!("Cannot hand the terminal to the Tick: {error}")),
@@ -215,6 +240,14 @@ pub(super) fn lend_terminal_to_attached_view(
     let mut state = lock()?;
     state.reclaim_terminal(failure.as_deref());
     state.draw(&mut io::stdout().lock())?;
+    // Enter on the ended Tick's last screen reopens it in its row's place, which shows the new
+    // instance full screen.
+    let reopen = reopens
+        .then(|| {
+            let intent = state.reopen_of(&attach.instance)?;
+            state.row_action(&intent)
+        })
+        .flatten();
     let refresh = tick_ended
         .then(|| {
             let executor = state.monitor.refresh_action();
@@ -228,8 +261,8 @@ pub(super) fn lend_terminal_to_attached_view(
         })
         .flatten();
     drop(state);
-    if let Some(refresh) = refresh {
-        send_input(sender, stop, refresh);
+    for event in [reopen, refresh].into_iter().flatten() {
+        send_input(sender, stop, event);
     }
     Ok(!stop.load(Ordering::Acquire))
 }

@@ -64,12 +64,7 @@ impl TickProbe for HostedProbe {
             }
             let state = match member.state {
                 HostedMemberState::Running => MemberState::Live,
-                HostedMemberState::Exited => MemberState::Exited(
-                    member
-                        .exit
-                        .map(crate::monitor_rows::terminal_exit_status)
-                        .unwrap_or_else(|| "exited".into()),
-                ),
+                HostedMemberState::Exited => MemberState::Exited(member.exit),
                 HostedMemberState::Lost => MemberState::Lost,
             };
             findings.states.insert(instance.clone(), state);

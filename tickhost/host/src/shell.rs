@@ -965,6 +965,8 @@ async fn supervise(task: Arc<ShellTask>, mut child: Child) {
     task.follow_output();
     task.show_exit(&exit);
     task.exit.send_replace(Some(exit));
+    // Views tell their clients the task ended once its exit is readable.
+    task.view_changes.send_replace(());
 }
 
 async fn terminate(child: &mut Child, pid: u32) -> std::io::Result<std::process::ExitStatus> {

@@ -101,6 +101,11 @@ impl TickActionUi<'_> {
             .request_next_subscription(subscription, all_on_instance)
     }
 
+    /// Shows the row's periodic subscriptions as cancelled at once; returns one of them.
+    pub(super) fn unsubscribe(&mut self, instance: &tick_protocol::InstanceRef) -> Option<Uuid> {
+        self.state.monitor.request_unsubscribe(instance)
+    }
+
     pub(super) fn monitor_entry(
         &self,
         instance: &tick_protocol::InstanceRef,

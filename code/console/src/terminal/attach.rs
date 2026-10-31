@@ -1,6 +1,6 @@
 //! A full-screen view: shows a hosted Tick's terminal or a Shell's screen on the whole terminal
-//! until the user hides it or the Tick ends. A Tick gets the user's keys unchanged; a Shell's
-//! screen is read-only. Other views may show the same Tick at once, and its terminal takes the
+//! but its last row, which lists the view's keys and takes clicks on them, until the user hides
+//! it. A Tick gets the user's keys unchanged; a Shell's screen is read-only. Other views may show the same Tick at once, and its terminal takes the
 //! size of whichever view typed last, so this terminal can be smaller or larger than the screen
 //! it shows.
 
@@ -26,16 +26,24 @@ use tickhost_connect::{
 };
 use tickloop_harness::protocol::HostedViewGrant;
 
+use unicode_width::UnicodeWidthChar;
+
 use super::monitor_cards::{CardInput, CardKeys};
 
 /// A second lone Esc within this time of the one the Tick got hides the view.
 pub(super) const FULL_SCREEN_ESCAPE_WINDOW: Duration = Duration::from_secs(1);
+/// The rows below the Tick's screen that the view keeps for its keys.
+const HINT_ROWS: u16 = 1;
+const HIDE_KEYS: &str = "esc esc hide";
 /// Shown on the bottom row while a second Esc would hide the view.
 const HIDE_HINT: &str = "Press esc again to hide";
-/// The keys of a Shell's screen, on the bottom row the host leaves for them.
-const SHELL_HINT: &str = "↑↓ scroll · G latest · esc hide";
-const STOPPABLE_SHELL_HINT: &str = "ctrl+c stop · ↑↓ scroll · G latest · esc hide";
+const SHELL_STOP_KEYS: &str = "ctrl+c stop · ";
+const SHELL_SCROLL_KEYS: &str = "↑↓ scroll · G latest · ";
+const ESCAPE_HIDE_KEYS: &str = "esc hide";
+const REOPEN_KEYS: &str = "enter reopen";
+const HINT_SEPARATOR: &str = " · ";
 const INTERRUPT: u8 = 0x03;
+const ENTER: u8 = b'\r';
 
 /// Columns and rows assumed when the terminal cannot report its size.
 const FALLBACK_TERMINAL_SIZE: (u16, u16) = (80, 24);
@@ -60,12 +68,27 @@ const SAVE_CURSOR: &str = "\x1b7";
 const RESTORE_CURSOR: &str = "\x1b8";
 const INVERSE: &str = "\x1b[7m";
 const DIM: &str = "\x1b[2m";
+/// Marks the keys on the hint row that take a click.
+const UNDERLINE: &str = "\x1b[4m";
+const NO_UNDERLINE: &str = "\x1b[24m";
+/// Has the terminal report clicks and drags, in the encoding the view reads, while the Tick
+/// does not ask for mouse reports itself; a Tick that asks keeps the reports it chose.
+const CAPTURE_CLICKS: &str = "\x1b[?1002h\x1b[?1006h";
+/// Shown on the hint row a moment after a selection was copied.
+const COPIED_HINT: &str = "Copied";
+const COPIED_HINT_TIME: Duration = Duration::from_millis(1500);
+const READABLE_MOUSE_ENCODING: &str = "\x1b[?1006h";
+const ARROW_UP: &[u8] = b"\x1b[A";
+const ARROW_DOWN: &[u8] = b"\x1b[B";
+const APPLICATION_ARROW_UP: &[u8] = b"\x1bOA";
+const APPLICATION_ARROW_DOWN: &[u8] = b"\x1bOB";
 
 /// What the user's keys do in a full-screen view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ViewInput {
-    /// A Tick: keys reach it, and a second Esc within [`FULL_SCREEN_ESCAPE_WINDOW`] hides.
-    Interactive,
+    /// A Tick: keys reach it, and a second Esc within [`FULL_SCREEN_ESCAPE_WINDOW`] hides. Once
+    /// its program ended, a lone Esc hides and, with `reopenable`, Enter reopens it.
+    Interactive { reopenable: bool },
     /// A Shell's screen: a lone Esc hides at once and its keys only scroll this view's place in
     /// the output; with `stoppable`, Ctrl+C stops the task.
     ReadOnly { stoppable: bool },
@@ -76,8 +99,10 @@ pub(super) enum ViewInput {
 pub(super) enum AttachEnd {
     /// The user hid it; the Tick keeps running.
     Hidden,
-    /// The Tick ended while it was shown.
+    /// The Tick was closed or lost while it was shown.
     Gone,
+    /// Enter on a Tick whose program ended: reopen it in its row's place.
+    Reopen,
     /// The host ended the view, as it does for one that fell behind.
     Lost(String),
 }
@@ -115,7 +140,7 @@ impl AttachedView {
         connection
             .request(
                 "attach",
-                json!({"size":requested_size(terminal_size())}),
+                json!({"size":requested_size(tick_area(terminal_size()))}),
                 CONTROL_TIMEOUT,
             )
             .await?;
@@ -147,13 +172,19 @@ impl AttachedView {
             let mut resized =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                     .map_err(|error| HostError::before("TerminalUnavailable", error.to_string()))?;
-            let mut screen = ViewScreen::new(terminal_size());
+            let mut terminal = terminal_size();
+            let mut screen = ViewScreen::new(tick_area(terminal));
             let mut filter = FullScreenKeys::new(input);
             let mut bubbling = false;
-            let mut hint_until: Option<Instant> = None;
+            let mut shown_hint = filter.hint(Instant::now());
+            let mut output = CAPTURE_CLICKS.as_bytes().to_vec();
+            output.extend(hint_row(terminal, &shown_hint));
+            write_terminal(&output);
             loop {
                 let keys_due = filter.deadline().map(tokio::time::Instant::from_std);
-                let hint_due = hint_until.map(tokio::time::Instant::from_std);
+                let hint_due = filter
+                    .hint_changes_at(Instant::now())
+                    .map(tokio::time::Instant::from_std);
                 let actions = tokio::select! {
                     event = hosted::read_frame(&mut events, BUSINESS_FRAME_BYTES) => {
                         let Some(event) = event? else {
@@ -166,22 +197,28 @@ impl AttachedView {
                                 })?;
                                 let data = event["data"].as_str().unwrap_or_default();
                                 let mut output = screen.frame(size, data.as_bytes());
-                                output.extend(overlay(input, hint_until.is_some(), screen.terminal));
+                                output.extend(mouse_reports(screen.tick.screen()));
+                                // A frame may clear the whole terminal, the hint row with it.
+                                output.extend(hint_row(terminal, &shown_hint));
                                 write_terminal(&output);
                             }
-                            // A terminal Tick's program exited while shown: the view ends,
-                            // and the list says how.
-                            Some("gone" | "exited") => return Ok(AttachEnd::Gone),
+                            // The Tick's program or the Shell ended: its last screen stays
+                            // shown, saying how, and only hiding or reopening is left.
+                            Some("exited") => {
+                                let exit = Exit::deserialize(&event["exit"]).unwrap_or_default();
+                                filter.end(crate::monitor_rows::exit_status(exit.code, exit.signal));
+                            }
+                            Some("gone") => return Ok(AttachEnd::Gone),
                             Some("bubbling") => bubbling = event["enabled"].as_bool().unwrap_or(false),
                             Some("bubble") => {
                                 let key = event["key"].as_str().and_then(BubbledKey::from_name);
-                                if input == ViewInput::Interactive && bubbling && key == Some(BubbledKey::Esc) {
+                                if matches!(input, ViewInput::Interactive { .. }) && !filter.has_ended() && bubbling && key == Some(BubbledKey::Esc) {
                                     send(&mut requests, json!({"method":"detach"})).await?;
                                     return Ok(AttachEnd::Hidden);
                                 }
                             }
                             Some("focus_reports") => {
-                                if input == ViewInput::Interactive && event["enabled"].as_bool() == Some(true) {
+                                if matches!(input, ViewInput::Interactive { .. }) && event["enabled"].as_bool() == Some(true) {
                                     send(&mut requests, json!({"method":"focus","params":{"focused":true}})).await?;
                                 }
                             }
@@ -190,19 +227,20 @@ impl AttachedView {
                         Vec::new()
                     }
                     keys = typed.recv() => match keys {
-                        Some(keys) => filter.feed(&keys, Instant::now(), screen.tick.screen()),
+                        Some(keys) => filter.feed(&keys, Instant::now(), screen.tick.screen(), terminal),
                         None => vec![KeyAction::Hide],
                     },
                     () = sleep_until(keys_due), if keys_due.is_some() => {
-                        filter.expire(Instant::now(), screen.tick.screen())
+                        filter.expire(Instant::now(), screen.tick.screen(), terminal)
                     }
                     () = sleep_until(hint_due), if hint_due.is_some() => Vec::new(),
                     _ = resized.recv() => {
-                        let terminal = terminal_size();
-                        let mut output = screen.resize_terminal(terminal);
-                        output.extend(overlay(input, hint_until.is_some(), terminal));
+                        terminal = terminal_size();
+                        let mut output = screen.resize_terminal(tick_area(terminal));
+                        output.extend(mouse_reports(screen.tick.screen()));
+                        output.extend(hint_row(terminal, &shown_hint));
                         write_terminal(&output);
-                        send(&mut requests, json!({"method":"resize","params":{"size":requested_size(terminal)}})).await?;
+                        send(&mut requests, json!({"method":"resize","params":{"size":requested_size(tick_area(terminal))}})).await?;
                         Vec::new()
                     }
                 };
@@ -218,19 +256,41 @@ impl AttachedView {
                             }
                         }
                         KeyAction::Interrupt => interrupt(),
+                        KeyAction::Reopen => return Ok(AttachEnd::Reopen),
+                        KeyAction::Select(selection) => {
+                            let mut output = screen.draw();
+                            output.extend(screen.highlight(selection));
+                            output.extend(hint_row(terminal, &shown_hint));
+                            write_terminal(&output);
+                        }
+                        KeyAction::Unselect => {
+                            let mut output = screen.draw();
+                            output.extend(hint_row(terminal, &shown_hint));
+                            write_terminal(&output);
+                        }
+                        KeyAction::Copy(selection) => {
+                            let text = screen.selected_text(selection);
+                            if !text.trim().is_empty() {
+                                let mut output = std::io::stdout().lock();
+                                if super::clipboard::Clipboard::detect()
+                                    .write(&text, &mut output)
+                                    .is_ok()
+                                {
+                                    filter.copied(Instant::now());
+                                }
+                            }
+                        }
                         KeyAction::Hide => {
                             send(&mut requests, json!({"method":"detach"})).await?;
                             return Ok(AttachEnd::Hidden);
                         }
                     }
                 }
-                let wanted = filter.hint_until(Instant::now());
-                match (hint_until.is_some(), wanted.is_some()) {
-                    (false, true) => write_terminal(&hint_overlay(screen.terminal, HIDE_HINT, INVERSE)),
-                    (true, false) => write_terminal(&screen.draw()),
-                    _ => {}
+                let wanted = filter.hint(Instant::now());
+                if wanted != shown_hint {
+                    write_terminal(&hint_row(terminal, &wanted));
+                    shown_hint = wanted;
                 }
-                hint_until = wanted;
             }
         }
         .await;
@@ -270,6 +330,14 @@ enum KeyAction {
     Input(Vec<u8>),
     /// Ctrl+C on a stoppable Shell's screen: stop the task, and stay.
     Interrupt,
+    /// Enter on a reopenable Tick whose program ended.
+    Reopen,
+    /// A drag over the Tick's screen selects what it covers so far.
+    Select(Selection),
+    /// The drag ended: copy what it selected, which stays shown.
+    Copy(Selection),
+    /// A new click: the selection shown goes.
+    Unselect,
     /// Hide the view; nothing read after it reaches the Tick.
     Hide,
 }
@@ -278,11 +346,21 @@ enum KeyAction {
 /// Esc pair: a lone Esc reaches the Tick at once and a second within
 /// [`FULL_SCREEN_ESCAPE_WINDOW`] hides the view. On a read-only screen a lone Esc hides, Ctrl+C
 /// interrupts a stoppable task and the other keys go to the host, which only scrolls with them.
-/// The terminal's focus reports never reach the Tick, and a click does only when the Tick asked
-/// for mouse reports, at its place on the Tick's screen.
+/// Once the Tick's program ended, a lone Esc hides and Enter reopens a reopenable Tick; nothing
+/// else reaches it. A click on the hint row's keys acts as they say. The terminal's focus reports
+/// never reach the Tick, and a click on its screen does only when the Tick asked for mouse
+/// reports, at its place on the Tick's screen; without them the wheel moves as the arrow keys.
 struct FullScreenKeys {
     keys: CardKeys,
     input: ViewInput,
+    /// How the Tick's program or the Shell ended, once it did.
+    ended: Option<String>,
+    /// Where the drag selecting text began, while the left button is held.
+    drag_from: Option<(u16, u16)>,
+    /// Whether a selection is drawn over the screen.
+    shows_selection: bool,
+    /// Until when the hint row says a selection was copied.
+    copied_until: Option<Instant>,
 }
 
 impl FullScreenKeys {
@@ -290,25 +368,63 @@ impl FullScreenKeys {
         Self {
             keys: CardKeys::with_escape_window(FULL_SCREEN_ESCAPE_WINDOW),
             input,
+            ended: None,
+            drag_from: None,
+            shows_selection: false,
+            copied_until: None,
         }
     }
 
-    fn is_read_only(&self) -> bool {
-        matches!(self.input, ViewInput::ReadOnly { .. })
+    /// A selection was copied at `now`; the hint row says so a moment.
+    fn copied(&mut self, now: Instant) {
+        self.copied_until = Some(now + COPIED_HINT_TIME);
     }
 
-    fn feed(&mut self, input: &[u8], now: Instant, tick: &vt100::Screen) -> Vec<KeyAction> {
+    /// When the hint row next changes by itself: the Esc hint or the copy notice running out.
+    fn hint_changes_at(&self, now: Instant) -> Option<Instant> {
+        let copied = self.copied_until.filter(|until| now < *until);
+        [self.hint_until(now), copied].into_iter().flatten().min()
+    }
+
+    /// The Tick's program or the Shell ended as `status` says: a Shell can no longer be stopped.
+    fn end(&mut self, status: String) {
+        self.ended = Some(status);
+        if let ViewInput::ReadOnly { stoppable } = &mut self.input {
+            *stoppable = false;
+        }
+    }
+
+    fn has_ended(&self) -> bool {
+        self.ended.is_some()
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.has_ended() || matches!(self.input, ViewInput::ReadOnly { .. })
+    }
+
+    fn feed(
+        &mut self,
+        input: &[u8],
+        now: Instant,
+        tick: &vt100::Screen,
+        terminal: ScreenSize,
+    ) -> Vec<KeyAction> {
         let read_only = self.is_read_only();
         let items = self
             .keys
             .feed(input, now, tick.bracketed_paste(), read_only);
-        self.actions(items, tick)
+        self.actions(items, now, tick, terminal)
     }
 
-    fn expire(&mut self, now: Instant, tick: &vt100::Screen) -> Vec<KeyAction> {
+    fn expire(
+        &mut self,
+        now: Instant,
+        tick: &vt100::Screen,
+        terminal: ScreenSize,
+    ) -> Vec<KeyAction> {
         let read_only = self.is_read_only();
         let items = self.keys.expire(now, read_only);
-        self.actions(items, tick)
+        self.actions(items, now, tick, terminal)
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -323,7 +439,46 @@ impl FullScreenKeys {
             .filter(|until| now < *until)
     }
 
-    fn actions(&self, items: Vec<CardInput>, tick: &vt100::Screen) -> Vec<KeyAction> {
+    /// What the hint row says at `now`, and which of its keys take a click.
+    fn hint(&self, now: Instant) -> Hint {
+        if self.copied_until.is_some_and(|until| now < until) {
+            return Hint::new(INVERSE, vec![HintPart::text(COPIED_HINT)]);
+        }
+        if self.hint_until(now).is_some() {
+            return Hint::new(INVERSE, vec![HintPart::button(HIDE_HINT, HintButton::Hide)]);
+        }
+        match (self.input, &self.ended) {
+            (ViewInput::Interactive { reopenable }, Some(ended)) => {
+                let mut parts = vec![HintPart::text(ended), HintPart::text(HINT_SEPARATOR)];
+                if reopenable {
+                    parts.push(HintPart::button(REOPEN_KEYS, HintButton::Reopen));
+                    parts.push(HintPart::text(HINT_SEPARATOR));
+                }
+                parts.push(HintPart::button(ESCAPE_HIDE_KEYS, HintButton::Hide));
+                Hint::new(INVERSE, parts)
+            }
+            (ViewInput::Interactive { .. }, None) => {
+                Hint::new(DIM, vec![HintPart::button(HIDE_KEYS, HintButton::Hide)])
+            }
+            (ViewInput::ReadOnly { stoppable }, _) => {
+                let mut parts = Vec::new();
+                if stoppable {
+                    parts.push(HintPart::text(SHELL_STOP_KEYS));
+                }
+                parts.push(HintPart::text(SHELL_SCROLL_KEYS));
+                parts.push(HintPart::button(ESCAPE_HIDE_KEYS, HintButton::Hide));
+                Hint::new(DIM, parts)
+            }
+        }
+    }
+
+    fn actions(
+        &mut self,
+        items: Vec<CardInput>,
+        now: Instant,
+        tick: &vt100::Screen,
+        terminal: ScreenSize,
+    ) -> Vec<KeyAction> {
         let mut actions = Vec::new();
         for item in items {
             match item {
@@ -332,7 +487,13 @@ impl FullScreenKeys {
                     break;
                 }
                 CardInput::Bytes(bytes) => match self.input {
-                    ViewInput::Interactive => actions.push(KeyAction::Input(bytes)),
+                    ViewInput::Interactive { reopenable } if self.has_ended() => {
+                        if reopenable && bytes.contains(&ENTER) {
+                            actions.push(KeyAction::Reopen);
+                            break;
+                        }
+                    }
+                    ViewInput::Interactive { .. } => actions.push(KeyAction::Input(bytes)),
                     ViewInput::ReadOnly { stoppable } => {
                         for keys in bytes.split_inclusive(|byte| *byte == INTERRUPT) {
                             let (keys, interrupts) = match keys.strip_suffix(&[INTERRUPT]) {
@@ -348,11 +509,75 @@ impl FullScreenKeys {
                         }
                     }
                 },
-                _ if self.is_read_only() => {}
                 CardInput::Mouse(mouse) => {
-                    let (rows, columns) = tick.size();
                     let (column, row) =
                         (mouse.column.saturating_sub(1), mouse.row.saturating_sub(1));
+                    let asks_for_mouse =
+                        tick.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
+                    let takes_mouse = self.is_read_only() || !asks_for_mouse;
+                    let (rows, columns) = tick.size();
+                    // A drag selects the Tick's screen as far as it reaches, the hint row
+                    // standing for its last row.
+                    let at = (
+                        row.min(rows.saturating_sub(1)),
+                        column.min(columns.saturating_sub(1)),
+                    );
+                    if let Some(from) = self.drag_from {
+                        if mouse.is_left_drag() {
+                            self.shows_selection = true;
+                            actions.push(KeyAction::Select(Selection::between(from, at)));
+                            continue;
+                        }
+                        if mouse.is_release() {
+                            self.drag_from = None;
+                            if from != at {
+                                actions.push(KeyAction::Copy(Selection::between(from, at)));
+                            }
+                            continue;
+                        }
+                    }
+                    if row + HINT_ROWS >= terminal.rows {
+                        let pressed = mouse
+                            .is_left_click()
+                            .then(|| self.hint(now).button_at(column))
+                            .flatten();
+                        match pressed {
+                            Some(HintButton::Hide) => {
+                                actions.push(KeyAction::Hide);
+                                break;
+                            }
+                            Some(HintButton::Reopen) => {
+                                actions.push(KeyAction::Reopen);
+                                break;
+                            }
+                            None => continue,
+                        }
+                    }
+                    if mouse.is_left_click() && std::mem::take(&mut self.shows_selection) {
+                        actions.push(KeyAction::Unselect);
+                    }
+                    if takes_mouse && mouse.is_left_click() && row < rows && column < columns {
+                        self.drag_from = Some((row, column));
+                        continue;
+                    }
+                    if let Some(up) = mouse.wheel_scrolls_up()
+                        && takes_mouse
+                    {
+                        if self.has_ended() && matches!(self.input, ViewInput::Interactive { .. }) {
+                            continue;
+                        }
+                        let arrow = match (up, tick.application_cursor()) {
+                            (true, false) => ARROW_UP,
+                            (false, false) => ARROW_DOWN,
+                            (true, true) => APPLICATION_ARROW_UP,
+                            (false, true) => APPLICATION_ARROW_DOWN,
+                        };
+                        actions.push(KeyAction::Input(arrow.to_vec()));
+                        continue;
+                    }
+                    if self.is_read_only() {
+                        continue;
+                    }
                     if row < rows
                         && column < columns
                         && let Some(report) = mouse.for_tick(
@@ -372,39 +597,154 @@ impl FullScreenKeys {
     }
 }
 
-/// What the view draws over the screen on its bottom row: the Esc hint while a second Esc would
-/// hide it, and a Shell's keys always.
-fn overlay(input: ViewInput, hides_on_escape: bool, terminal: ScreenSize) -> Vec<u8> {
-    match input {
-        _ if hides_on_escape => hint_overlay(terminal, HIDE_HINT, INVERSE),
-        ViewInput::ReadOnly { stoppable } => hint_overlay(
-            terminal,
-            if stoppable {
-                STOPPABLE_SHELL_HINT
+/// Text a drag selected on the Tick's screen, from `from` through `to` in reading order, both
+/// `(row, column)` and both included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Selection {
+    from: (u16, u16),
+    to: (u16, u16),
+}
+
+impl Selection {
+    fn between(one: (u16, u16), other: (u16, u16)) -> Self {
+        Self {
+            from: one.min(other),
+            to: one.max(other),
+        }
+    }
+
+    /// Each row it covers with its columns, the end excluded, within `columns`.
+    fn rows(self, columns: u16) -> impl Iterator<Item = (u16, u16, u16)> {
+        (self.from.0..=self.to.0).map(move |row| {
+            let start = if row == self.from.0 { self.from.1 } else { 0 };
+            let end = if row == self.to.0 {
+                self.to.1 + 1
             } else {
-                SHELL_HINT
-            },
-            DIM,
-        ),
-        ViewInput::Interactive => Vec::new(),
+                columns
+            };
+            (row, start, end.min(columns))
+        })
     }
 }
 
-/// `hint` in `style` on the bottom row of `terminal`, drawn over the screen without moving its
-/// cursor or changing its colours.
-fn hint_overlay(terminal: ScreenSize, hint: &str, style: &str) -> Vec<u8> {
-    let hint: String = hint.chars().take(usize::from(terminal.columns)).collect();
-    format!(
-        "{SAVE_CURSOR}\x1b[{};1H\x1b[m\x1b[2K{style}{hint}\x1b[m{RESTORE_CURSOR}",
-        terminal.rows
-    )
-    .into_bytes()
+/// What a click on a key of the hint row does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HintButton {
+    Hide,
+    Reopen,
+}
+
+/// The view's last row: its keys in `style`, the ones a click takes underlined.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Hint {
+    style: &'static str,
+    parts: Vec<HintPart>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HintPart {
+    text: String,
+    button: Option<HintButton>,
+}
+
+impl HintPart {
+    fn text(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            button: None,
+        }
+    }
+
+    fn button(text: &str, button: HintButton) -> Self {
+        Self {
+            text: text.to_owned(),
+            button: Some(button),
+        }
+    }
+}
+
+impl Hint {
+    fn new(style: &'static str, parts: Vec<HintPart>) -> Self {
+        Self { style, parts }
+    }
+
+    /// The key drawn at `column`, counted from 0.
+    fn button_at(&self, column: u16) -> Option<HintButton> {
+        let mut start = 0;
+        for part in &self.parts {
+            let width = part
+                .text
+                .chars()
+                .map(|character| character.width().unwrap_or(0))
+                .sum::<usize>();
+            if (start..start + width).contains(&usize::from(column)) {
+                return part.button;
+            }
+            start += width;
+        }
+        None
+    }
+}
+
+/// The hint row drawn on the bottom row of `terminal`, cut at its width, without moving the
+/// Tick's cursor or changing its colours.
+fn hint_row(terminal: ScreenSize, hint: &Hint) -> Vec<u8> {
+    let mut row = format!(
+        "{SAVE_CURSOR}\x1b[{};1H\x1b[m\x1b[2K{}",
+        terminal.rows, hint.style
+    );
+    let mut room = usize::from(terminal.columns);
+    for part in &hint.parts {
+        if part.button.is_some() {
+            row.push_str(UNDERLINE);
+        }
+        for character in part.text.chars() {
+            let width = character.width().unwrap_or(0);
+            if width > room {
+                room = 0;
+                break;
+            }
+            room -= width;
+            row.push(character);
+        }
+        if part.button.is_some() {
+            row.push_str(NO_UNDERLINE);
+        }
+    }
+    row.push_str("\x1b[m");
+    row.push_str(RESTORE_CURSOR);
+    row.into_bytes()
+}
+
+/// The mouse reports the terminal makes after a frame of `tick`: clicks for the hint row while
+/// the Tick asks for none, in the encoding the view reads either way.
+fn mouse_reports(tick: &vt100::Screen) -> &'static [u8] {
+    if tick.mouse_protocol_mode() == vt100::MouseProtocolMode::None {
+        CAPTURE_CLICKS.as_bytes()
+    } else {
+        READABLE_MOUSE_ENCODING.as_bytes()
+    }
+}
+
+/// How a Tick's program or a Shell ended, as the host's `exited` event tells.
+#[derive(Debug, Default, Deserialize)]
+struct Exit {
+    code: Option<i32>,
+    signal: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 struct ScreenSize {
     rows: u16,
     columns: u16,
+}
+
+/// The part of `terminal` the Tick's screen takes: all but the hint row.
+fn tick_area(terminal: ScreenSize) -> ScreenSize {
+    ScreenSize {
+        rows: terminal.rows.saturating_sub(HINT_ROWS).max(1),
+        columns: terminal.columns,
+    }
 }
 
 /// This terminal's size, at least one row and one column.
@@ -424,19 +764,20 @@ fn requested_size(terminal: ScreenSize) -> Value {
     })
 }
 
-/// What this terminal shows of the Tick's screen. A screen of this terminal's size is drawn as
-/// the host frames it; one of another size is redrawn whole from its top-left corner, cut where
-/// this terminal ends and blank where this terminal reaches beyond it.
+/// What the area of this terminal above the hint row shows of the Tick's screen. A screen of the
+/// area's size is drawn as the host frames it; one of another size is redrawn whole from its
+/// top-left corner, cut where the area ends and blank where the area reaches beyond it.
 struct ViewScreen {
     tick: vt100::Parser,
-    terminal: ScreenSize,
+    /// The part of this terminal the Tick's screen takes.
+    area: ScreenSize,
 }
 
 impl ViewScreen {
-    fn new(terminal: ScreenSize) -> Self {
+    fn new(area: ScreenSize) -> Self {
         Self {
             tick: vt100::Parser::default(),
-            terminal,
+            area,
         }
     }
 
@@ -446,17 +787,59 @@ impl ViewScreen {
             self.tick.screen_mut().set_size(size.rows, size.columns);
         }
         self.tick.process(data);
-        if size == self.terminal {
+        if size == self.area {
             data.to_vec()
         } else {
             self.draw()
         }
     }
 
-    /// The output that shows the Tick's screen once this terminal is `terminal`.
-    fn resize_terminal(&mut self, terminal: ScreenSize) -> Vec<u8> {
-        self.terminal = terminal;
+    /// The output that shows the Tick's screen once its area is `area`.
+    fn resize_terminal(&mut self, area: ScreenSize) -> Vec<u8> {
+        self.area = area;
         self.draw()
+    }
+
+    /// The text `selection` covers, its rows' trailing blanks left out.
+    fn selected_text(&self, selection: Selection) -> String {
+        let screen = self.tick.screen();
+        let (_, columns) = screen.size();
+        selection
+            .rows(columns)
+            .map(|(row, start, end)| {
+                screen
+                    .contents_between(row, start, row, end)
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Draws `selection` over the shown screen in inverse, within the part this terminal shows.
+    fn highlight(&self, selection: Selection) -> Vec<u8> {
+        let screen = self.tick.screen();
+        let columns = self.tick_size().columns.min(self.area.columns);
+        let mut output = SAVE_CURSOR.as_bytes().to_vec();
+        for (row, start, end) in selection.rows(columns) {
+            if row >= self.area.rows || start >= end {
+                continue;
+            }
+            let text = screen.contents_between(row, start, row, end);
+            let width = unicode_width::UnicodeWidthStr::width(text.as_str());
+            let padding = usize::from(end - start).saturating_sub(width);
+            output.extend(
+                format!(
+                    "\x1b[{};{}H\x1b[m{INVERSE}{text}{}\x1b[m",
+                    row + 1,
+                    start + 1,
+                    " ".repeat(padding)
+                )
+                .as_bytes(),
+            );
+        }
+        output.extend(RESTORE_CURSOR.as_bytes());
+        output
     }
 
     fn tick_size(&self) -> ScreenSize {
@@ -469,11 +852,11 @@ impl ViewScreen {
     fn draw(&self) -> Vec<u8> {
         let screen = self.tick.screen();
         let tick = self.tick_size();
-        if tick == self.terminal {
+        if tick == self.area {
             return screen.state_formatted();
         }
-        let rows = tick.rows.min(self.terminal.rows);
-        let columns = tick.columns.min(self.terminal.columns);
+        let rows = tick.rows.min(self.area.rows);
+        let columns = tick.columns.min(self.area.columns);
         let is_cut = columns < tick.columns;
         // A wide character starting in the last column shown would spill past this terminal's
         // edge, so such a row leaves that column blank.

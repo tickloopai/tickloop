@@ -1,7 +1,8 @@
 //! What the views of a Shell task show. A Shell runs on pipes rather than a terminal, so the host
 //! draws its screen itself: a header naming the task with how it stands, over a terminal model of
-//! its output that keeps its newest lines and can be scrolled back, and a last row left blank for
-//! the view's own key hints. The view is read-only; nothing typed reaches the task.
+//! its output that keeps its newest lines and can be scrolled back. A view asks for a screen one
+//! row shorter than its terminal and draws its own key hints below it. The view is read-only;
+//! nothing typed reaches the task.
 
 use std::{io::Write, time::Instant};
 
@@ -14,10 +15,6 @@ pub(crate) const OUTPUT_HISTORY_ROWS: usize = 10_000;
 /// The most rows the full command takes under the key command; a longer one is cut with an
 /// ellipsis.
 const COMMAND_ROWS: usize = 3;
-/// The last row, which the view draws its key hints on.
-const HINT_ROWS: u16 = 1;
-/// The fewest rows that keep a hint row; a smaller screen gives it to the output.
-const HINT_MIN_ROWS: u16 = 3;
 /// The narrowest screen whose first row holds the status beside the key command; a narrower one
 /// gives the status its own row.
 const STATUS_BESIDE_COMMAND_MIN_COLUMNS: usize = 40;
@@ -124,12 +121,7 @@ impl ShellScreen {
     pub(crate) fn redraw(&mut self, size: TerminalSize, output: &[u8]) {
         self.size = size;
         self.header = self.header_rows();
-        let hint_rows = if size.rows >= HINT_MIN_ROWS {
-            HINT_ROWS
-        } else {
-            0
-        };
-        let output_rows = (size.rows - hint_rows).saturating_sub(self.header.len() as u16);
+        let output_rows = size.rows.saturating_sub(self.header.len() as u16);
         self.output = vt100::Parser::new(output_rows.max(1), size.columns, OUTPUT_HISTORY_ROWS);
         self.holds_line_feed = false;
         self.composed = None;
@@ -332,13 +324,8 @@ impl ShellScreen {
             DIM,
         );
         let rule = styled(vec![RULE.to_string().repeat(columns)], DIM);
-        let hint_rows = if self.size.rows >= HINT_MIN_ROWS {
-            usize::from(HINT_ROWS)
-        } else {
-            0
-        };
         let available = usize::from(self.size.rows)
-            .saturating_sub(hint_rows + 1)
+            .saturating_sub(1)
             .max(first.len());
         // In the order they give way.
         let mut optional = [rule, directory, description];

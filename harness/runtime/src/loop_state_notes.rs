@@ -81,7 +81,12 @@ impl LoopStateView {
 impl Agent {
     /// Tells the model, at the end of the conversation, what changed in its Loop without its own
     /// tool calls; after a compaction or a load, which leave it untold, what still runs.
-    pub(super) async fn announce_loop_state(&self, receipt: &Receipt) -> Result<(), AgentError> {
+    pub(super) async fn announce_loop_state(
+        &self,
+        receipt: &Receipt,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), AgentError> {
+        let tick_states = self.hosted_tick_states(receipt, cancel).await?;
         let family = self.family_agents(receipt.chat_id).await?;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats
@@ -103,6 +108,11 @@ impl Agent {
                 let running = running_children(&family, chat.snapshot.id.into());
                 snapshot_text(&current, &running, &chat.ids)
             }
+        };
+        let ticks = crate::tick_changes::take_change_text(chat, tick_states.as_ref());
+        let text = match (ticks, text) {
+            (Some(ticks), Some(text)) => Some(format!("{ticks}\n{text}")),
+            (ticks, text) => ticks.or(text),
         };
         if let Some(text) = text {
             crate::host_notes::append_note(&mut chat.snapshot, receipt, text, HostNote::LoopState);

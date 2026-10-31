@@ -104,6 +104,7 @@ mod shell_description;
 mod shell_task_center;
 mod suspension;
 mod system_prompt;
+mod tick_changes;
 mod tool_batch;
 mod tool_execution;
 pub mod tool_exposure;
@@ -452,6 +453,12 @@ struct ChatBookkeeping {
     /// records for a load to restore.
     #[serde(default)]
     loop_state_views: BTreeMap<usize, serde_json::Value>,
+    /// Changes the user made to the Chat's hosted Ticks since the model was last told.
+    #[serde(default)]
+    user_tick_changes: Vec<tick_changes::UserTickChange>,
+    /// How each hosted Tick the Chat opened stood when the model last knew it.
+    #[serde(default)]
+    told_tick_states: BTreeMap<tick_protocol::InstanceRef, tick_changes::ToldTickState>,
     /// The model and private history source of each assistant message that a later version
     /// recorded with values this version does not know, kept as written for its entry.
     #[serde(default)]
@@ -3480,7 +3487,7 @@ impl Agent {
                 )
             });
         let timing = timing::Phase::new("announce_loop_state");
-        Box::pin(self.announce_loop_state(receipt)).await?;
+        Box::pin(self.announce_loop_state(receipt, &cancel)).await?;
         drop(timing);
         let timing = timing::Phase::new("announce_guidance");
         Box::pin(self.announce_guidance(receipt)).await?;

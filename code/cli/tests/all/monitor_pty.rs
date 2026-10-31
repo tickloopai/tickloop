@@ -462,7 +462,7 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
     session.send(b"\x7f\x7f\x7f\x7f");
     session.wait_without("❯\u{a0}xxjk");
     session.send(b"\x1b[C");
-    session.wait("enter details · x remove · s subscriptions · tab next · esc input");
+    session.wait("enter details · x remove · s subscribe · tab next · esc input");
     session.send(b"\r");
     session.wait("Owner     this Chat");
     session.wait("Resources unavailable");

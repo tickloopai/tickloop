@@ -35,7 +35,7 @@ A capability an Extension Tick declares in its own description for the Agent to 
 _Avoid_: Action (refers only to the action kind)
 
 **Tick Subscription**:
-An explicitly established association between a Chat's Loop and a Tick Instance; it is one kind of Trigger for the Loop. There are only four frequencies: immediate, high (1 minute), medium (10 minutes), and low (30 minutes); immediate is used only for Shell Ticks. Opening, discovering, or reading a Tick is not subscribing; Artifacts do not accept Tick Subscriptions.
+An explicitly established association between a Chat's Loop and a Tick Instance; it is one kind of Trigger for the Loop. There are only four frequencies: immediate, high (1 minute), medium (10 minutes), and low (30 minutes); immediate is used only for Shell Ticks. Opening, discovering, or reading a Tick is not subscribing; Artifacts do not accept Tick Subscriptions. A subscription is how a Loop asks to be woken by a Tick's changes; a change to a Tick the Chat opened that no subscription delivers, such as the user reopening or closing it, only reaches the model in a host note on its next request.
 _Avoid_: listen, Watch, poll
 
 **Tickhost**:
@@ -47,7 +47,7 @@ The view of an Extension Tick in the Agent View: a card under the Tick's row in 
 _Avoid_: popup, view Pane
 
 **Full-screen View**:
-A view of a local Tick that takes the whole terminal: `Enter` on a Terminal Tick's or a Shell's Monitor row, or `tickloop attach` for any local Tick or Shell of a running Chat. Hiding it leaves the Tick running; a Shell's is read-only.
+A view of a local Tick that takes the whole terminal, its last row listing the view's keys: `Enter` on a Terminal Tick's or a Shell's Monitor row, or `tickloop attach` for any local Tick or Shell of a running Chat. Hiding it leaves the Tick running; a Shell's is read-only.
 _Avoid_: popup, attach Pane
 
 **Key Bubbling**:

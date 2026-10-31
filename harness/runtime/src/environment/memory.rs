@@ -97,6 +97,8 @@ struct MemoryInstance {
     screen: String,
     history_floor: u64,
     updates: tokio::sync::watch::Sender<ExecutionUpdate>,
+    /// A terminal program's exit code once it exited.
+    exit_code: Option<i32>,
 }
 
 impl MemoryInstance {
@@ -297,6 +299,14 @@ impl MemoryEnvironment {
                 }),
             });
         }
+    }
+
+    /// Ends a terminal Tick's program with `code`; its instance stays listed as exited.
+    pub fn exit_terminal(&self, instance: &InstanceRef, code: i32) {
+        let mut state = self.state.lock().unwrap();
+        let instance = state.instances.get_mut(instance).unwrap();
+        assert!(instance.tick.is_none());
+        instance.exit_code = Some(code);
     }
 
     pub fn publish(&self, instance: &InstanceRef, data: Value) {
@@ -588,6 +598,30 @@ impl ExecutionPort for MemoryPort {
                     .map(|(instance, _)| instance.clone())
                     .collect(),
             )),
+            ExecutionQuery::InstanceStates => {
+                let state = self.state.lock().unwrap();
+                let running = state.instances.iter().map(|(instance, target)| {
+                    let state = match target.exit_code {
+                        Some(code) => InstanceState::Exited {
+                            code: Some(code),
+                            signal: None,
+                        },
+                        None => InstanceState::Running,
+                    };
+                    (instance, target, state)
+                });
+                let lost = state
+                    .lost
+                    .iter()
+                    .map(|(instance, target)| (instance, target, InstanceState::Lost));
+                Ok(ExecutionInspection::InstanceStates(
+                    running
+                        .chain(lost)
+                        .filter(|(_, target, _)| target.owner == self.scope.chat)
+                        .map(|(instance, _, state)| (instance.clone(), state))
+                        .collect(),
+                ))
+            }
             ExecutionQuery::Receipt(operation) => Ok(ExecutionInspection::Receipt(
                 self.state
                     .lock()
@@ -1069,6 +1103,7 @@ impl ExecutionPort for MemoryPort {
                             sequence: 0,
                             screen,
                             history_floor: 0,
+                            exit_code: None,
                             updates: tokio::sync::watch::channel(ExecutionUpdate {
                                 update: None,
                                 received: 0,

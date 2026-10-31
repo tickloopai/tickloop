@@ -43,12 +43,29 @@ fn terminal_tick() -> MonitorEntry {
 
 fn ended_terminal_tick() -> MonitorEntry {
     let instance = tick_protocol::InstanceRef::hosted(Uuid::new_v4());
-    entry(
-        instance.clone(),
-        TickGroup::Ticks,
-        Glyph::TerminalTick,
-        TickIntent::ReopenFullScreen(instance),
-    )
+    MonitorEntry {
+        ended: Some("ended".into()),
+        ..entry(
+            instance.clone(),
+            TickGroup::Ticks,
+            Glyph::TerminalTick,
+            TickIntent::ReopenFullScreen(instance),
+        )
+    }
+}
+
+/// A Terminal Tick whose program exited and left its last screen.
+fn exited_terminal_tick() -> MonitorEntry {
+    let instance = tick_protocol::InstanceRef::hosted(Uuid::new_v4());
+    MonitorEntry {
+        ended: Some("exited 0".into()),
+        ..entry(
+            instance.clone(),
+            TickGroup::Ticks,
+            Glyph::TerminalTick,
+            TickIntent::OpenFullScreen(instance),
+        )
+    }
 }
 
 fn shell() -> MonitorEntry {
@@ -222,4 +239,22 @@ fn a_lent_terminal_draws_nothing_and_rings_once_for_a_waiting_question() {
     state.draw(&mut output).unwrap();
     assert_eq!(state.rung_for, Some(menu.id), "it rings once");
     assert!(state.menu.is_some(), "the question waits behind the view");
+}
+
+#[test]
+fn space_on_an_exited_terminal_tick_says_enter_shows_its_last_screen_and_enter_does() {
+    let mut state = fixture(vec![exited_terminal_tick()], Vec::new());
+    let chat = state.chat.unwrap();
+    let row = state.monitor.selected().unwrap().instance.clone();
+    assert!(press(&mut state, KeyCode::Char(' '), KeyModifiers::NONE).is_none());
+    assert_eq!(
+        state.monitor_key_notice(),
+        Some(full_screen::EXITED_TERMINAL_NOTICE)
+    );
+    assert!(state.cards.cards().is_empty());
+    opens(
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE),
+        chat,
+        &row,
+    );
 }

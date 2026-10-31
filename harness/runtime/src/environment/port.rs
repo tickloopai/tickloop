@@ -126,6 +126,8 @@ pub enum ExecutionQuery {
     Capabilities,
     Guidance,
     Instances,
+    /// How each of the Chat's hosted Ticks stands on its host, without reading any of them.
+    InstanceStates,
     Receipt(Uuid),
     Preparation(PreparationId),
     Read(InstanceRef),
@@ -674,11 +676,25 @@ pub enum ExecutionReceipt {
     Unknown,
 }
 
+/// How a hosted Tick instance stands on its host; one the host no longer lists has ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InstanceState {
+    Running,
+    /// A terminal Tick whose program exited; its last screen stays until it is closed.
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    /// Lost with the host that ran it.
+    Lost,
+}
+
 #[derive(Debug)]
 pub enum ExecutionInspection {
     Capabilities(ExecutionCapabilities),
     Guidance(ExecutionGuidance),
     Instances(Vec<InstanceRef>),
+    InstanceStates(Vec<(InstanceRef, InstanceState)>),
     Receipt(ExecutionReceipt),
     Validated,
     Read(ExecutionRead),

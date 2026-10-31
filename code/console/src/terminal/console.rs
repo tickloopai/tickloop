@@ -8921,18 +8921,11 @@ impl State {
         let overview = self.overview.projection.is_some();
         let command_feedback =
             (self.status_held && !self.status.is_empty()).then(|| self.status.clone());
-        let suggestion = (self.monitor_visible() && !self.monitor.overlay)
-            .then(|| self.visible_prompt_suggestion().map(str::to_owned))
-            .flatten();
-        let feedback_rows =
-            usize::from(command_feedback.is_some()) + usize::from(suggestion.is_some());
+        let feedback_rows = usize::from(command_feedback.is_some());
         let short = self.height < agent_layout::NORMAL_LAYOUT_MIN_ROWS;
         let cap = agent_layout::bottom_capacity(self.height);
-        let (draft, cursor) = if suggestion.is_some() {
-            (String::new(), 0)
-        } else {
-            self.input_display()
-        };
+        // A prompt suggestion shows in the empty input itself, Monitor beside it or not.
+        let (draft, cursor) = self.input_display();
         let mut input_rows = agent_layout::editor_capacity(self.height);
         let input = InputView::frame_with_prompt(
             &draft,
@@ -9193,11 +9186,7 @@ impl State {
             self.width,
             input_rows,
             self.input_prompt(),
-            &if suggestion.is_some() {
-                Vec::new()
-            } else {
-                self.input_image_marks()
-            },
+            &self.input_image_marks(),
         );
         if !candidates.is_empty() {
             candidates = self.candidate_rows(candidates.len());
@@ -9229,14 +9218,6 @@ impl State {
             let mut line = RoleLine::role(feedback, Role::Warning);
             line.truncate(self.content_columns());
             lines.push(line);
-        }
-        if let Some(suggestion) = suggestion {
-            let lead = format!("{} ", self.display.glyph(Glyph::Prompt));
-            let text = super::loop_view_text::ellipsize(
-                &super::safe_line(&suggestion),
-                self.content_columns().saturating_sub(display_width(&lead)),
-            );
-            lines.push(RoleLine::role(format!("{lead}{text}"), Role::Subtle));
         }
         let conversation_footer = if overview {
             Vec::new()
@@ -13169,15 +13150,24 @@ impl State {
                         Err(error) => self.monitor.action_error = Some(super::safe_line(&error)),
                     }
                 }
-                // An ended Terminal Tick has no card to reopen into; Enter reopens it full screen.
+                // An ended Terminal Tick has no card to show or reopen into: Enter shows its last
+                // screen, or reopens it full screen once that is gone too.
                 (KeyCode::Char(' '), KeyModifiers::NONE)
-                    if self
+                    if self.monitor.selected().is_some_and(|entry| {
+                        entry.opens_full_screen() && entry.ended.is_some()
+                    }) =>
+                {
+                    let is_gone = self
                         .monitor
                         .selected()
-                        .is_some_and(|entry| entry.reopens_full_screen().is_some()) =>
-                {
+                        .is_some_and(|entry| entry.reopens_full_screen().is_some());
                     self.monitor_notice = Some(TimedNotice {
-                        text: full_screen::ENDED_TERMINAL_NOTICE.into(),
+                        text: if is_gone {
+                            full_screen::ENDED_TERMINAL_NOTICE
+                        } else {
+                            full_screen::EXITED_TERMINAL_NOTICE
+                        }
+                        .into(),
                         until: Instant::now() + MONITOR_NOTICE_WINDOW,
                     });
                 }
@@ -13227,7 +13217,8 @@ impl State {
                 (KeyCode::Enter, KeyModifiers::NONE) if self.monitor.is_goal_selected() => {
                     return Some(InputEvent::Line("/goal".into()));
                 }
-                (KeyCode::Enter, _) | (KeyCode::Char(_), KeyModifiers::NONE) => {
+                (KeyCode::Enter, _)
+                | (KeyCode::Char(_), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                     if let Some(entry) = self.monitor.selected().cloned() {
                         let action_key = match key.code {
                             KeyCode::Enter => crate::monitor_rows::MONITOR_ENTER_KEY,

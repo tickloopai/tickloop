@@ -857,6 +857,8 @@ struct ShellView {
     events: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
     requests: tokio::net::unix::OwnedWriteHalf,
     screen: vt100::Parser,
+    /// How the task ended, once the view was told.
+    exit: Option<Value>,
 }
 
 impl ShellView {
@@ -899,6 +901,7 @@ impl ShellView {
             events,
             requests,
             screen: vt100::Parser::new(VIEW_ROWS, VIEW_COLUMNS, 0),
+            exit: None,
         }
     }
 
@@ -930,9 +933,33 @@ impl ShellView {
                 .await
                 .unwrap_or_else(|_| panic!("{texts:?} never showed:\n{contents}"))
                 .expect("the view stays attached");
-            assert_eq!(event["event"], "frame", "{event}");
-            self.screen
-                .process(event["data"].as_str().unwrap().as_bytes());
+            self.take(event);
+        }
+    }
+
+    /// Draws frames until the view is told how the task ended, and returns that.
+    async fn ended(&mut self) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.exit.is_none() {
+            let event = tokio::time::timeout_at(deadline, self.next_event())
+                .await
+                .expect("the view is told the task ended")
+                .expect("the view stays attached");
+            self.take(event);
+        }
+        self.exit.clone().unwrap()
+    }
+
+    fn take(&mut self, event: Value) {
+        match event["event"].as_str() {
+            Some("frame") => self
+                .screen
+                .process(event["data"].as_str().unwrap().as_bytes()),
+            Some("exited") => {
+                assert!(self.exit.is_none(), "told twice: {event}");
+                self.exit = Some(event["exit"].clone());
+            }
+            _ => panic!("{event}"),
         }
     }
 }
@@ -965,6 +992,7 @@ async fn a_shell_view_shows_the_task_over_its_live_output_and_then_how_it_ended(
     view.type_text("typed\r").await;
     std::fs::write(&release, "").unwrap();
     let shown = view.shows(&["outtwo", "exit 4"]).await;
+    assert_eq!(view.ended().await["code"], 4);
     assert!(!shown.contains("running"), "{shown}");
     assert!(!shown.contains("typed"), "{shown}");
     assert_eq!(exited(&mut started).await.code, Some(4));
@@ -986,6 +1014,11 @@ async fn a_shell_view_shows_the_task_over_its_live_output_and_then_how_it_ended(
     );
     let mut later = ShellView::open(&fixture, &binding, &instance).await;
     later.shows(&["outone", "outtwo", "exit 4"]).await;
+    assert_eq!(
+        later.ended().await["code"],
+        4,
+        "a view of an ended task is told how it ended"
+    );
 }
 
 /// Each view of a Shell scrolls back through the output on its own and follows the newest
@@ -1009,9 +1042,7 @@ async fn each_shell_view_scrolls_back_on_its_own_and_follows_again() {
         tokio::time::timeout(Duration::from_millis(300), async {
             loop {
                 let event = following.next_event().await.unwrap();
-                following
-                    .screen
-                    .process(event["data"].as_str().unwrap().as_bytes());
+                following.take(event);
                 if !following.screen.screen().contents().contains("\n200") {
                     break;
                 }

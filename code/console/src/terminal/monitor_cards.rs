@@ -1305,6 +1305,33 @@ impl SgrMouse {
         self.pressed && !self.is_motion() && !self.is_wheel()
     }
 
+    /// The left button pressed down.
+    pub(super) fn is_left_click(self) -> bool {
+        self.is_click() && self.code & MOUSE_BUTTONS == 0
+    }
+
+    /// The pointer moved with the left button held.
+    pub(super) fn is_left_drag(self) -> bool {
+        self.is_motion() && !self.is_wheel() && self.code & MOUSE_BUTTONS == 0
+    }
+
+    /// A button let go.
+    pub(super) fn is_release(self) -> bool {
+        !self.pressed && !self.is_motion() && !self.is_wheel()
+    }
+
+    /// Whether a wheel report scrolls up (`Some(true)`) or down; `None` for any other report.
+    pub(super) fn wheel_scrolls_up(self) -> Option<bool> {
+        if !self.is_wheel() {
+            return None;
+        }
+        match self.code & MOUSE_BUTTONS {
+            0 => Some(true),
+            1 => Some(false),
+            _ => None,
+        }
+    }
+
     /// The report as the Console's own mouse event, as crossterm decodes it.
     pub(super) fn console_event(self) -> crossterm::event::MouseEvent {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};

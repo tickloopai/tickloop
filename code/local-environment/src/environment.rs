@@ -245,6 +245,17 @@ impl ExecutionPort for LocalPort {
                         members.into_iter().map(|member| member.instance).collect(),
                     ))
                 }
+                ExecutionQuery::InstanceStates => {
+                    let states = match &self.tools {
+                        Some(tools) => tools
+                            .states(self.scope.chat)
+                            .await
+                            .map_err(|error| ExecutionError::new(error.code, error.message))?,
+                        None => Vec::new(),
+                    };
+                    self.authority.check(self.scope.chat)?;
+                    Ok(ExecutionInspection::InstanceStates(states))
+                }
                 ExecutionQuery::Receipt(operation) => {
                     let receipt = match &self.tools {
                         Some(tools) => tools.execution_receipt(self.scope.chat, operation).await,

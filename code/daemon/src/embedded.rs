@@ -1036,6 +1036,11 @@ impl EmbeddedAgentAccess {
                     .close_for_user(chat.into(), &instance)
                     .await
                     .map_err(hosted_access_error)?;
+                self.inner
+                    .agent
+                    .record_user_closed_tick(chat.into(), &instance)
+                    .await
+                    .map_err(agent_access_error)?;
                 Ok(CommandResult::Done)
             }),
             AgentCommand::ReopenHostedTick {

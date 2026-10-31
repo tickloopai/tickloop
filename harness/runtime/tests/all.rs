@@ -76,6 +76,8 @@ mod prompt_cache_wire;
 #[path = "all/output_limit_recovery.rs"]
 mod output_limit_recovery;
 
+#[path = "all/tick_changes.rs"]
+mod tick_changes;
 #[path = "all/tool_batches.rs"]
 mod tool_batches;
 

@@ -89,7 +89,8 @@ pub async fn run(arguments: &[OsString]) -> Result<(), String> {
     let input = if chosen.is_shell {
         ViewInput::ReadOnly { stoppable: false }
     } else {
-        ViewInput::Interactive
+        // Reopening takes the Chat's Monitor row, so only the Console offers it.
+        ViewInput::Interactive { reopenable: false }
     };
     let view = AttachedView::attach(&grant, input)
         .await
@@ -98,7 +99,7 @@ pub async fn run(arguments: &[OsString]) -> Result<(), String> {
     let ended = view.run(|| {}).await;
     let _ = terminal::disable_raw_mode();
     match ended {
-        Ok(AttachEnd::Hidden) => Ok(()),
+        Ok(AttachEnd::Hidden | AttachEnd::Reopen) => Ok(()),
         Ok(AttachEnd::Gone) => Err(format!("{} ended while shown", chosen.title)),
         Ok(AttachEnd::Lost(reason)) => Err(format!("The view ended: {reason}")),
         Err(error) => Err(format!("The view ended: {error}")),

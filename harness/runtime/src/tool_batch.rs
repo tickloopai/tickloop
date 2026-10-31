@@ -536,11 +536,21 @@ impl Agent {
                 OperationState::Completed
             };
         }
-        if is_appended
-            && !result.tool.is_error
-            && let Some(tool_use) = tool_use
-        {
-            self.mark_tool_use(chat, tool_use);
+        if is_appended && !result.tool.is_error {
+            let call = chat
+                .snapshot
+                .operations
+                .iter()
+                .find(|operation| {
+                    operation.run_id == receipt.run_id && operation.call_id == call_id
+                })
+                .map(|operation| (operation.name.clone(), operation.input.clone()));
+            if let Some((name, input)) = call {
+                crate::tick_changes::record_own_call(chat, &name, &input);
+            }
+            if let Some(tool_use) = tool_use {
+                self.mark_tool_use(chat, tool_use);
+            }
         }
         self.apply_completed_host_effect(chat, receipt, call_id, host_effect);
         if is_appended && let Some(sources) = &sources {
@@ -636,10 +646,11 @@ impl Agent {
         if Agent::release_of(chat, receipt.run_id).is_cancelled() {
             return Err(super::suspension::RUN_RELEASED.into());
         }
-        if !completion.result.tool.is_error
-            && let Some(tool_use) = monitor_members::ToolUse::of(&call.name, &call.input)
-        {
-            self.mark_tool_use(chat, tool_use);
+        if !completion.result.tool.is_error {
+            crate::tick_changes::record_own_call(chat, &call.name, &call.input);
+            if let Some(tool_use) = monitor_members::ToolUse::of(&call.name, &call.input) {
+                self.mark_tool_use(chat, tool_use);
+            }
         }
         self.apply_completed_host_effect(chat, receipt, &call.call_id, completion.host_effect);
         if let Some(operation) = chat.snapshot.operations.iter_mut().find(|operation| {
@@ -703,10 +714,11 @@ impl Agent {
         let chat = chats
             .get_mut(&receipt.chat_id)
             .ok_or("chat is unavailable")?;
-        if !completion.result.tool.is_error
-            && let Some(tool_use) = monitor_members::ToolUse::of(name, input)
-        {
-            self.mark_tool_use(chat, tool_use);
+        if !completion.result.tool.is_error {
+            crate::tick_changes::record_own_call(chat, name, input);
+            if let Some(tool_use) = monitor_members::ToolUse::of(name, input) {
+                self.mark_tool_use(chat, tool_use);
+            }
         }
         self.apply_completed_host_effect(chat, receipt, call_id, completion.host_effect);
         self.save(&chat.snapshot);

@@ -147,6 +147,11 @@ fn a_terminal_of_the_screen_size_gets_the_frames_as_drawn_and_a_redraw_when_eith
 }
 
 const ESC: &[u8] = b"\x1b";
+/// The terminal the key tests' views fill: the Tick's 24 rows and the hint row.
+const TERMINAL: ScreenSize = ScreenSize {
+    rows: 25,
+    columns: 80,
+};
 
 fn tick_screen(output: &[u8]) -> vt100::Parser {
     let mut parser = vt100::Parser::new(24, 80, 0);
@@ -161,9 +166,9 @@ fn press(
     at: Instant,
     tick: &vt100::Screen,
 ) -> Vec<KeyAction> {
-    let mut actions = keys.feed(input, at, tick);
+    let mut actions = keys.feed(input, at, tick, TERMINAL);
     if let Some(due) = keys.deadline() {
-        actions.extend(keys.expire(due, tick));
+        actions.extend(keys.expire(due, tick, TERMINAL));
     }
     actions
 }
@@ -171,7 +176,7 @@ fn press(
 #[test]
 fn a_lone_esc_reaches_the_tick_and_a_second_within_a_second_hides_the_view() {
     let tick = tick_screen(b"");
-    let mut keys = FullScreenKeys::new(ViewInput::Interactive);
+    let mut keys = FullScreenKeys::new(ViewInput::Interactive { reopenable: false });
     let start = Instant::now();
     assert_eq!(
         press(&mut keys, ESC, start, tick.screen()),
@@ -197,7 +202,7 @@ fn a_lone_esc_reaches_the_tick_and_a_second_within_a_second_hides_the_view() {
 #[test]
 fn an_esc_after_the_window_or_after_another_key_reaches_the_tick() {
     let tick = tick_screen(b"");
-    let mut keys = FullScreenKeys::new(ViewInput::Interactive);
+    let mut keys = FullScreenKeys::new(ViewInput::Interactive { reopenable: false });
     let start = Instant::now();
     press(&mut keys, ESC, start, tick.screen());
     let late = start + FULL_SCREEN_ESCAPE_WINDOW + Duration::from_millis(100);
@@ -225,7 +230,7 @@ fn an_esc_after_the_window_or_after_another_key_reaches_the_tick() {
 #[test]
 fn ctrl_keys_and_escape_sequences_reach_the_tick_unchanged() {
     let tick = tick_screen(b"");
-    let mut keys = FullScreenKeys::new(ViewInput::Interactive);
+    let mut keys = FullScreenKeys::new(ViewInput::Interactive { reopenable: false });
     let now = Instant::now();
     assert_eq!(
         press(&mut keys, b"\x03\x02\x1b[A\x1bx", now, tick.screen()),
@@ -263,7 +268,7 @@ fn a_read_only_screen_hides_on_a_lone_esc_and_takes_no_other_key() {
 fn clicks_reach_a_tick_only_when_it_asked_for_mouse_reports() {
     let click = b"\x1b[<0;5;3M";
     let plain = tick_screen(b"");
-    let mut keys = FullScreenKeys::new(ViewInput::Interactive);
+    let mut keys = FullScreenKeys::new(ViewInput::Interactive { reopenable: false });
     let now = Instant::now();
     assert_eq!(press(&mut keys, click, now, plain.screen()), []);
 
@@ -289,13 +294,27 @@ fn clicks_reach_a_tick_only_when_it_asked_for_mouse_reports() {
     );
 }
 
+/// The hint row's text as a terminal of `terminal`'s size shows it.
+fn hint_text(terminal: ScreenSize, hint: &Hint) -> String {
+    let mut shown = vt100::Parser::new(terminal.rows, terminal.columns, 0);
+    shown.process(&hint_row(terminal, hint));
+    shown
+        .screen()
+        .contents_between(terminal.rows - 1, 0, terminal.rows - 1, terminal.columns)
+}
+
 #[test]
 fn the_hint_sits_on_the_bottom_row_and_leaves_the_ticks_cursor_and_colours() {
+    let keys = FullScreenKeys::new(ViewInput::Interactive { reopenable: false });
+    let hint = keys.hint(Instant::now());
     let mut shown = vt100::Parser::new(4, 30, 0);
     shown.process(b"\x1b[31mred\x1b[2;2H");
-    shown.process(&hint_overlay(size(4, 30), HIDE_HINT, INVERSE));
-    assert_eq!(shown.screen().contents_between(3, 0, 3, 30), HIDE_HINT);
-    assert!(shown.screen().cell(3, 0).unwrap().inverse());
+    shown.process(&hint_row(size(4, 30), &hint));
+    assert_eq!(shown.screen().contents_between(3, 0, 3, 30), HIDE_KEYS);
+    assert!(
+        shown.screen().cell(3, 0).unwrap().underline(),
+        "a key that takes a click is underlined"
+    );
     assert_eq!(shown.screen().cursor_position(), (1, 1));
     shown.process(b"x");
     assert_eq!(
@@ -303,39 +322,281 @@ fn the_hint_sits_on_the_bottom_row_and_leaves_the_ticks_cursor_and_colours() {
         vt100::Color::Idx(1),
         "the Tick keeps drawing in its own colours"
     );
-
-    let mut narrow = vt100::Parser::new(2, 10, 0);
-    narrow.process(&hint_overlay(size(2, 10), HIDE_HINT, INVERSE));
-    assert_eq!(narrow.screen().contents_between(1, 0, 1, 10), "Press esc ");
+    assert_eq!(hint_text(size(2, 6), &hint), "esc es", "cut at the width");
+    assert_eq!(
+        tick_area(size(25, 80)),
+        size(24, 80),
+        "the Tick's screen leaves the hint row"
+    );
+    assert_eq!(tick_area(size(1, 80)), size(1, 80));
 }
 
 #[test]
-fn a_shells_screen_always_shows_its_keys_and_a_ticks_only_the_esc_hint() {
+fn the_hint_row_lists_each_views_keys() {
     let terminal = size(5, 60);
-    let text = |bytes: Vec<u8>| {
-        let mut shown = vt100::Parser::new(5, 60, 0);
-        shown.process(&bytes);
-        shown.screen().contents_between(4, 0, 4, 60)
+    let now = Instant::now();
+    let hint = |input: ViewInput, ended: Option<&str>| {
+        let mut keys = FullScreenKeys::new(input);
+        if let Some(ended) = ended {
+            keys.end(ended.into());
+        }
+        hint_text(terminal, &keys.hint(now))
     };
     assert_eq!(
-        text(overlay(
-            ViewInput::ReadOnly { stoppable: true },
-            false,
-            terminal
-        )),
-        STOPPABLE_SHELL_HINT
+        hint(ViewInput::ReadOnly { stoppable: true }, None),
+        "ctrl+c stop · ↑↓ scroll · G latest · esc hide"
     );
     assert_eq!(
-        text(overlay(
-            ViewInput::ReadOnly { stoppable: false },
-            false,
-            terminal
-        )),
-        SHELL_HINT
+        hint(ViewInput::ReadOnly { stoppable: true }, Some("exited 0")),
+        "↑↓ scroll · G latest · esc hide",
+        "an ended Shell cannot be stopped, and its header says how it ended"
     );
-    assert!(overlay(ViewInput::Interactive, false, terminal).is_empty());
+    let tick = ViewInput::Interactive { reopenable: true };
+    assert_eq!(hint(tick, None), "esc esc hide");
     assert_eq!(
-        text(overlay(ViewInput::Interactive, true, terminal)),
-        HIDE_HINT
+        hint(tick, Some("exited by SIGTERM")),
+        "exited by SIGTERM · enter reopen · esc hide"
     );
+    assert_eq!(
+        hint(
+            ViewInput::Interactive { reopenable: false },
+            Some("exited 0")
+        ),
+        "exited 0 · esc hide"
+    );
+
+    let mut keys = FullScreenKeys::new(tick);
+    press(&mut keys, ESC, now, tick_screen(b"").screen());
+    assert_eq!(hint_text(terminal, &keys.hint(now)), HIDE_HINT);
+    assert_eq!(
+        hint_text(terminal, &keys.hint(now + FULL_SCREEN_ESCAPE_WINDOW)),
+        "esc esc hide"
+    );
+}
+
+/// A left click at `column`, counted from 1, on the terminal's `row`.
+fn left_click(row: u16, column: u16) -> Vec<u8> {
+    format!("\x1b[<0;{column};{row}M").into_bytes()
+}
+
+#[test]
+fn a_click_on_the_hint_rows_keys_does_what_they_say() {
+    let now = Instant::now();
+    let tick = tick_screen(b"");
+    let hint_row = TERMINAL.rows;
+    let mut keys = FullScreenKeys::new(ViewInput::Interactive { reopenable: true });
+    assert_eq!(
+        press(&mut keys, &left_click(hint_row, 3), now, tick.screen()),
+        [KeyAction::Hide]
+    );
+    assert_eq!(
+        press(&mut keys, &left_click(hint_row, 20), now, tick.screen()),
+        [],
+        "a click beside the keys does nothing"
+    );
+
+    keys.end("exited 0".into());
+    // `exited 0 · enter reopen · esc hide`
+    assert_eq!(
+        press(&mut keys, &left_click(hint_row, 2), now, tick.screen()),
+        [],
+        "how it ended is no key"
+    );
+    assert_eq!(
+        press(&mut keys, &left_click(hint_row, 13), now, tick.screen()),
+        [KeyAction::Reopen]
+    );
+    assert_eq!(
+        press(&mut keys, &left_click(hint_row, 28), now, tick.screen()),
+        [KeyAction::Hide]
+    );
+
+    let mut shell = FullScreenKeys::new(ViewInput::ReadOnly { stoppable: true });
+    assert_eq!(
+        press(&mut shell, &left_click(hint_row, 3), now, tick.screen()),
+        [],
+        "ctrl+c stop takes no click"
+    );
+    // `ctrl+c stop · ↑↓ scroll · G latest · esc hide`
+    assert_eq!(
+        press(&mut shell, &left_click(hint_row, 40), now, tick.screen()),
+        [KeyAction::Hide]
+    );
+}
+
+#[test]
+fn the_wheel_moves_as_the_arrow_keys_unless_the_tick_takes_mouse_reports() {
+    let now = Instant::now();
+    let wheel_up = b"\x1b[<64;5;3M";
+    let wheel_down = b"\x1b[<65;5;3M";
+    let mut keys = FullScreenKeys::new(ViewInput::Interactive { reopenable: false });
+    let plain = tick_screen(b"");
+    assert_eq!(
+        press(&mut keys, wheel_up, now, plain.screen()),
+        [KeyAction::Input(b"\x1b[A".to_vec())]
+    );
+    let application = tick_screen(b"\x1b[?1h");
+    assert_eq!(
+        press(&mut keys, wheel_down, now, application.screen()),
+        [KeyAction::Input(b"\x1bOB".to_vec())],
+        "in the Tick's application cursor mode"
+    );
+    let reporting = tick_screen(b"\x1b[?1000h\x1b[?1006h");
+    assert_eq!(
+        press(&mut keys, wheel_up, now, reporting.screen()),
+        [KeyAction::Input(wheel_up.to_vec())],
+        "a Tick that takes mouse reports gets the wheel as it is"
+    );
+
+    let mut shell = FullScreenKeys::new(ViewInput::ReadOnly { stoppable: false });
+    assert_eq!(
+        press(&mut shell, wheel_down, now, plain.screen()),
+        [KeyAction::Input(b"\x1b[B".to_vec())],
+        "a Shell's screen scrolls with the wheel"
+    );
+    keys.end("exited 0".into());
+    assert_eq!(press(&mut keys, wheel_up, now, plain.screen()), []);
+}
+
+#[test]
+fn an_ended_tick_hides_on_a_lone_escape_and_reopens_on_enter() {
+    let start = Instant::now();
+    let screen = tick_screen(b"");
+    let mut keys = FullScreenKeys::new(ViewInput::Interactive { reopenable: true });
+    keys.end("exited 0".into());
+    assert!(
+        press(&mut keys, b"ab", start, screen.screen()).is_empty(),
+        "an ended program takes no keys"
+    );
+    assert_eq!(
+        press(&mut keys, b"\r", start, screen.screen()),
+        vec![KeyAction::Reopen]
+    );
+    assert_eq!(
+        press(&mut keys, ESC, start, screen.screen()),
+        vec![KeyAction::Hide],
+        "a lone Esc hides at once"
+    );
+
+    let mut keys = FullScreenKeys::new(ViewInput::Interactive { reopenable: false });
+    keys.end("exited 0".into());
+    assert!(press(&mut keys, b"\r", start, screen.screen()).is_empty());
+
+    let mut shell = FullScreenKeys::new(ViewInput::ReadOnly { stoppable: true });
+    shell.end("exited 0".into());
+    assert!(
+        press(&mut shell, b"\x03", start, screen.screen()).is_empty(),
+        "an ended Shell cannot be stopped"
+    );
+    assert_eq!(shell.input, ViewInput::ReadOnly { stoppable: false });
+}
+
+/// An SGR report of the left button at `column` and `row`, counted from 1: pressed, dragged
+/// there or let go.
+fn left_button(kind: &str, row: u16, column: u16) -> Vec<u8> {
+    match kind {
+        "press" => format!("\x1b[<0;{column};{row}M"),
+        "drag" => format!("\x1b[<32;{column};{row}M"),
+        _ => format!("\x1b[<0;{column};{row}m"),
+    }
+    .into_bytes()
+}
+
+#[test]
+fn a_drag_over_a_screen_without_mouse_reports_selects_and_copies_its_text() {
+    let now = Instant::now();
+    let plain = tick_screen(b"");
+    let mut keys = FullScreenKeys::new(ViewInput::Interactive { reopenable: false });
+    assert!(press(&mut keys, &left_button("press", 2, 3), now, plain.screen()).is_empty());
+    let selection = Selection::between((1, 2), (2, 4));
+    assert_eq!(
+        press(&mut keys, &left_button("drag", 3, 5), now, plain.screen()),
+        [KeyAction::Select(selection)]
+    );
+    assert_eq!(
+        press(
+            &mut keys,
+            &left_button("release", 3, 5),
+            now,
+            plain.screen()
+        ),
+        [KeyAction::Copy(selection)]
+    );
+    assert_eq!(
+        press(&mut keys, &left_button("press", 5, 1), now, plain.screen()),
+        [KeyAction::Unselect],
+        "the next click takes the selection away"
+    );
+    assert!(
+        press(
+            &mut keys,
+            &left_button("release", 5, 1),
+            now,
+            plain.screen()
+        )
+        .is_empty(),
+        "a click without a drag copies nothing"
+    );
+
+    let reporting = tick_screen(b"\x1b[?1002h\x1b[?1006h");
+    let mut keys = FullScreenKeys::new(ViewInput::Interactive { reopenable: false });
+    let drag = left_button("drag", 3, 5);
+    press(
+        &mut keys,
+        &left_button("press", 2, 3),
+        now,
+        reporting.screen(),
+    );
+    assert_eq!(
+        press(&mut keys, &drag, now, reporting.screen()),
+        [KeyAction::Input(drag.clone())],
+        "a Tick that takes mouse reports gets the drag itself"
+    );
+
+    let mut shell = FullScreenKeys::new(ViewInput::ReadOnly { stoppable: false });
+    press(
+        &mut shell,
+        &left_button("press", 1, 1),
+        now,
+        reporting.screen(),
+    );
+    assert!(matches!(
+        press(
+            &mut shell,
+            &left_button("release", 1, 4),
+            now,
+            reporting.screen()
+        )[..],
+        [KeyAction::Copy(_)]
+    ));
+    shell.copied(now);
+    assert_eq!(
+        hint_text(TERMINAL, &shell.hint(now)),
+        COPIED_HINT,
+        "the hint row says it was copied"
+    );
+    assert_eq!(
+        hint_text(TERMINAL, &shell.hint(now + COPIED_HINT_TIME)),
+        "↑↓ scroll · G latest · esc hide"
+    );
+}
+
+#[test]
+fn a_selection_copies_its_rows_text_and_shows_in_inverse() {
+    let mut view = ViewScreen::new(size(3, 12));
+    view.frame(size(3, 12), b"first line\r\nsecond one\r\nthird");
+    let selection = Selection::between((0, 6), (1, 5));
+    assert_eq!(view.selected_text(selection), "line\nsecond");
+    let mut shown = vt100::Parser::new(3, 12, 0);
+    shown.process(&view.draw());
+    shown.process(&view.highlight(selection));
+    assert!(shown.screen().cell(0, 6).unwrap().inverse());
+    assert!(
+        shown.screen().cell(0, 11).unwrap().inverse(),
+        "to the row's end"
+    );
+    assert!(shown.screen().cell(1, 5).unwrap().inverse());
+    assert!(!shown.screen().cell(1, 6).unwrap().inverse());
+    assert!(!shown.screen().cell(0, 5).unwrap().inverse());
+    assert_eq!(shown.screen().contents_between(0, 0, 0, 12), "first line");
 }

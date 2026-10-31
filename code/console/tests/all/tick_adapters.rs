@@ -498,8 +498,13 @@ fn built_in_rows_describe_their_actions_as_intents() {
         ),
         action(
             's',
-            "subscriptions",
+            "every 10 min",
             TickIntent::Subscribe(pane.instance.clone()),
+        ),
+        action(
+            'S',
+            "unsubscribe",
+            TickIntent::Unsubscribe(pane.instance.clone()),
         ),
     ];
     assert_eq!(actions(&pane.instance), pane_actions);
