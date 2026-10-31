@@ -63,7 +63,10 @@ const PERMISSION_BITS: u32 = 0o7777;
 /// How much of a tracked file one read through its host asks for.
 const READ_CHUNK_BYTES: usize = 1024 * 1024;
 /// Why a file only in the environment is neither backed up nor restored.
-pub(crate) const ONLY_IN_ENVIRONMENT: &str = "the file is only in the execution environment, and file history keeps no copy of it on this machine";
+///
+/// The same reason fits a file whose root is only in the environment and a file of a Chat whose
+/// Folder is, which keeps no backup even of files in its roots on this machine.
+pub(crate) const ONLY_IN_ENVIRONMENT: &str = "file history keeps no copy of this file on this machine, because the file or this Chat's Folder is only in the execution environment";
 
 /// A file's version in one snapshot; an empty `backup_file_name` means the file does not exist in
 /// that version.

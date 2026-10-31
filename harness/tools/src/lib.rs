@@ -633,9 +633,14 @@ impl From<LocalFileError> for ToolError {
 /// The local directories of one Chat with a Folder.
 #[derive(Clone, Debug)]
 pub struct ChatDirectory {
-    /// File change reviews and stored tool results go here; `None` for a Chat whose Folder is
-    /// only in its Execution Environment, which keeps nothing on this machine: its large results
-    /// are cut instead of stored and its changes have no review artifact.
+    /// File change reviews, stored tool results, the feedback inbox, Trigger leases and Tick
+    /// watermarks go here; `None` for a Chat whose Folder is only in its Execution Environment,
+    /// which keeps no such records on this machine: its large results are cut instead of stored
+    /// and its changes have no review artifact. Such a Chat takes no Trigger lease, so its host
+    /// must keep waits durably (`WaitHosting::Durable`) and deliver Artifact feedback with
+    /// `TurnOp::Deliver`; under process-held waits with a Transcript its Triggers are refused as
+    /// no longer loaded, event-source feedback is not delivered and Tick watermarks are not
+    /// kept. Shells the environment runs still write their output to `task_output`, a known gap.
     pub chat: Option<PrivateDirectory>,
     /// Background task output directory; following Claude Code, `<chatId>/tasks` under the system
     /// temp directory.
