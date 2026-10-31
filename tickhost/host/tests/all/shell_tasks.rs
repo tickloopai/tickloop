@@ -988,6 +988,43 @@ async fn a_shell_view_shows_the_task_over_its_live_output_and_then_how_it_ended(
     later.shows(&["outone", "outtwo", "exit 4"]).await;
 }
 
+/// Each view of a Shell scrolls back through the output on its own and follows the newest
+/// output again with `G`, while other views keep following it.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_shell_view_scrolls_back_on_its_own_and_follows_again() {
+    let fixture = Fixture::start().await;
+    let workdir = fixture.workdir("scroll");
+    let binding = fixture.binding("seq 1 200", &workdir);
+    let mut started = start(&fixture, &binding, &[]).await;
+    let instance = started.submitted.spawned.instance.clone();
+    assert_eq!(exited(&mut started).await.code, Some(0));
+    let mut scrolled = ShellView::open(&fixture, &binding, &instance).await;
+    let mut following = ShellView::open(&fixture, &binding, &instance).await;
+    scrolled.shows(&["\n200", "exit 0"]).await;
+    following.shows(&["\n200", "exit 0"]).await;
+    scrolled.type_text("\x1b[H").await;
+    let shown = scrolled.shows(&["\n1\n", "\n2\n"]).await;
+    assert!(!shown.contains("\n200"), "{shown}");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                let event = following.next_event().await.unwrap();
+                following
+                    .screen
+                    .process(event["data"].as_str().unwrap().as_bytes());
+                if !following.screen.screen().contents().contains("\n200") {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_err(),
+        "the other view keeps the newest output"
+    );
+    scrolled.type_text("G").await;
+    scrolled.shows(&["199\n200"]).await;
+}
+
 /// Only the Worker and Chat that submitted a task are granted views of it, and a released task
 /// nobody views is forgotten after the idle timeout.
 #[tokio::test(flavor = "multi_thread")]

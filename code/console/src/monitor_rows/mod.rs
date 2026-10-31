@@ -63,9 +63,14 @@ pub enum TickIntent {
     ShowDetails(InstanceRef),
     /// Hides the row in this Chat and cancels its Tick Subscriptions.
     RemoveFromMonitor(InstanceRef),
-    /// Shows the live screen of a hosted Tick or a Shell as a Monitor card under its row, which
-    /// Enter enters.
+    /// Shows the live screen of an extension Tick as a Monitor card under its row, which Enter
+    /// enters.
     OpenView(InstanceRef),
+    /// Shows the live screen of a Terminal Tick or a Shell full screen in this terminal.
+    OpenFullScreen(InstanceRef),
+    /// Reopens an ended Terminal Tick this Chat opened in its row's place and shows the new
+    /// instance full screen.
+    ReopenFullScreen(InstanceRef),
     /// Ends a hosted Tick this Chat opened, or forgets the record of one that already ended, and
     /// takes its row out with the Tick Subscriptions on it.
     CloseHosted {

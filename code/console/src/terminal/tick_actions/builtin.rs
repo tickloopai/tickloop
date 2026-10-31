@@ -16,9 +16,14 @@ pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickA
         // The Console shows and enters Monitor cards itself.
         TickIntent::OpenView(_) => return None,
         TickIntent::CloseHosted { instance, .. } => Arc::new(CloseHosted { instance }),
+        TickIntent::OpenFullScreen(instance) => Arc::new(OpenFullScreen { instance }),
         TickIntent::ReopenHosted(instance) => Arc::new(ReopenHosted {
             instance,
             card: ReopenedCard::Enter,
+        }),
+        TickIntent::ReopenFullScreen(instance) => Arc::new(ReopenHosted {
+            instance,
+            card: ReopenedCard::FullScreen,
         }),
         TickIntent::Subscribe(instance) => Arc::new(Subscribe { instance }),
         TickIntent::SendUpdate(instance) => Arc::new(SendUpdate { instance }),
@@ -266,6 +271,37 @@ impl TickActionBackend for AttachCard {
     }
 }
 
+/// Enter or a double click on a Terminal Tick's or a Shell's row: a one-time view grant from the
+/// Agent, with which the view takes this whole terminal.
+struct OpenFullScreen {
+    instance: tick_protocol::InstanceRef,
+}
+impl TickActionExecutor for OpenFullScreen {
+    fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        ui.monitor_entry(&self.instance)
+            .ok_or("This Tick is no longer in Monitor")?;
+        Ok(PreparedTickAction::new(
+            self.instance.to_string(),
+            crate::monitor_rows::MONITOR_ENTER_KEY,
+            Arc::new(OpenFullScreen {
+                instance: self.instance.clone(),
+            }),
+        ))
+    }
+}
+#[async_trait]
+impl TickActionBackend for OpenFullScreen {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
+        let grant = ctx
+            .agent
+            .attach_hosted_tick(ctx.chat, self.instance.clone())
+            .await
+            .map_err(|error| format!("Cannot open {}: {error}", self.instance.public()))?;
+        ctx.console
+            .begin_full_screen_attach(ctx.chat, self.instance.clone(), grant)
+    }
+}
+
 struct NoBackend;
 #[async_trait]
 impl TickActionBackend for NoBackend {
@@ -381,6 +417,8 @@ pub(in crate::terminal) enum ReopenedCard {
     Show,
     /// Enter: shows it and gives it the keys.
     Enter,
+    /// Enter on a Terminal Tick: shows the new instance full screen.
+    FullScreen,
 }
 
 /// Reopens a hosted Tick from its row with Space, which shows the new instance's card.
@@ -424,6 +462,15 @@ impl TickActionBackend for ReopenHosted {
         refresh_subscriptions(&ctx).await?;
         if let Some(error) = restore_error {
             ctx.notify(&format!("Reopened as {reopened}; {}", safe_text(&error)))?;
+        }
+        if self.card == ReopenedCard::FullScreen {
+            if ctx
+                .console
+                .reopened_opens_full_screen(ctx.chat, &reopened)?
+            {
+                OpenFullScreen { instance: reopened }.execute(ctx).await?;
+            }
+            return Ok(());
         }
         if ctx
             .console

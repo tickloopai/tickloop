@@ -18,6 +18,8 @@ mod agent_messaging;
 mod approval_status;
 mod artifact_ui;
 mod artifacts_picker;
+mod attach;
+pub mod attach_command;
 mod auto_setup_surface;
 mod background_work;
 #[cfg(test)]
@@ -914,6 +916,7 @@ Usage: tickloop [--cwd DIRECTORY]
        tickloop acp [--working-directory-is-trusted]
        tickloop update [--check | --status]
        tickloop daemon stop
+       tickloop attach [INSTANCE]
        tickloop tick install TICK[@MARKETPLACE] | install --path PATH | update [TICK] | uninstall TICK [--keep-data] | enable TICK | disable TICK | list [--available] | login TICK [--issuer LABEL] | logout TICK
        tickloop plugin install PLUGIN[@MARKETPLACE] | install --path PATH | update [PLUGIN] | uninstall PLUGIN [--keep-data] | enable PLUGIN | disable PLUGIN | list [--available] | validate DIRECTORY | marketplace add SOURCE | marketplace list | marketplace update [MARKETPLACE] | marketplace remove MARKETPLACE
        tickloop mcp list | add NAME URL [--header 'NAME: VALUE']... [--dir] | add NAME [--env NAME=VALUE]... [--dir] -- COMMAND [ARGUMENTS...] | remove NAME [--dir] | login NAME | logout NAME
@@ -923,6 +926,7 @@ Print/ACP use new managed Chats, not Console resume. They disable questions, Pla
 ACP stdout contains protocol traffic only; it offers one-time tool permissions, cancellation, session listing and loading, and approved session-scoped stdio MCP, not client filesystem or terminal execution.
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
+attach shows a Tick or a Shell that a running Agent opened full screen in this terminal, chosen from a list without INSTANCE; hiding it leaves the Tick running.
 Run tickloop again to start this build. Each config root (~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set) has one daemon.
 tick manages Ticks, the plugins that carry a Tick program: installs one by name from a marketplace or from its directory or archive, updates, enables, disables or uninstalls one, logs one in or out of its data source, or lists those installed or available; tickloop tick --help explains them.
 plugin manages the plugins without a Tick program the same way, manages marketplaces, or checks a plugin directory; tickloop plugin --help explains them.
@@ -955,7 +959,7 @@ Click Subagents N to hide/show the list. In the list enter opens an Agent (modif
 Subagents wear the colour they were given at creation; the input takes the colour of the subagent it is viewing.
 The key hints always end the screen; notices share that row.
 shift+up/down focuses Monitor's Shells group; enter opens the selected Shell.
-space or a click on a hosted Tick or a Shell in Monitor shows or hides its live screen as a card under its row, and several cards can stay open; enter enters the card, or a click in it does: keys, ctrl+c and a single esc included, go to the Tick until esc esc leaves the card back to the list, which shows other cards with space, while the card stays shown and the Tick keeps running; a Tick that hands back keys it does not use also leaves on one esc, moves to the card above or below with the arrows, to the next row with tab and to the input with left; a click outside leaves too and then acts where it landed, so a click on another row shows its card; a Shell's screen only shows it, and esc leaves it. tab and shift+tab select every row in turn and preview its card until tab moves on, unless you enter it; a click on an edge line counting updated rows above or below selects one. Rows keep the order they joined. Press x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. space on a Tick this Chat opened that no longer runs reopens it in place, restoring its subscriptions at their frequencies, and shows its card, and enter reopens it and enters the card; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
+space or a click on an extension Tick in Monitor shows or hides its live screen as a card under its row, and several cards can stay open; enter enters the card, or a click in it does: keys, ctrl+c and a single esc included, go to the Tick until esc esc leaves the card back to the list, which shows other cards with space, while the card stays shown and the Tick keeps running; a Tick that hands back keys it does not use also leaves on one esc, moves to the card above or below with the arrows, to the next row with tab and to the input with left; a click outside leaves too and then acts where it landed, so a click on another row shows its card. A terminal Tick or a Shell has no card: enter or a double click shows it full screen. There keys, ctrl+c included, go to a terminal Tick, its first esc too, and a second esc within a second hides it; a Shell's screen hides on esc, scrolls with the arrows, ctrl+n/p and page up/down, follows its newest output again with G or end, and ctrl+c stops it. Hiding leaves the Tick running; tickloop attach shows any of them full screen from another terminal. tab and shift+tab select every row in turn and preview its card until tab moves on, unless you enter it; a click on an edge line counting updated rows above or below selects one. Rows keep the order they joined. Press x twice within 3 seconds to perform the selected row's close/remove action: it stops a running Shell, closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. space on an extension Tick this Chat opened that no longer runs reopens it in place, restoring its subscriptions at their frequencies, and shows its card, and enter reopens it and enters the card, or for a terminal Tick shows it full screen; s subscribes a Tick at high. Close/remove actions first show a red confirmation hint on the status line; pressing another key or changing the selected row cancels it. enter reopens directly. Actions report their result on the status line. Press x twice to remove a scheduled task or unlink an Artifact; f links new Artifact feedback and h includes earlier feedback.
 The shared tasks summary appears only when tasks exist. ctrl+t expands or focuses it; ctrl+n/p select, enter shows details, esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
@@ -11470,5 +11474,9 @@ mod status_agents_help_tests {
         assert!(help.contains(
             "a click outside leaves too and then acts where it landed, so a click on another row shows its card"
         ));
+        assert!(help.contains(
+            "A terminal Tick or a Shell has no card: enter or a double click shows it full screen"
+        ));
+        assert!(help.contains("tickloop attach [INSTANCE]"));
     }
 }

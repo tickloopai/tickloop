@@ -3029,10 +3029,11 @@ impl Viewed {
         }
     }
 
-    fn frame_since(&self, shown: Option<&vt100::Screen>) -> (Vec<u8>, vt100::Screen) {
+    /// The output that brings `view`, showing `shown`, to what it shows now.
+    fn frame_since(&self, view: u64, shown: Option<&vt100::Screen>) -> (Vec<u8>, vt100::Screen) {
         match self {
             Self::Tick(tick) => tick.screen.lock().unwrap().frame_since(shown),
-            Self::Shell(task) => task.frame_since(shown),
+            Self::Shell(task) => task.frame_since(view, shown),
         }
     }
 
@@ -3103,9 +3104,11 @@ impl ViewLease {
         }
         let tick = match &self.viewed {
             Viewed::Tick(tick) => tick,
-            // A Shell's view is read-only: typing only makes it the view that sizes the screen.
+            // A Shell's view is read-only: its keys only scroll this view's place in the output,
+            // and typing makes it the view that sizes the screen.
             Viewed::Shell(task) => {
                 task.change_views(|views| views.typed(self.view));
+                task.scroll(self.view, data);
                 return Ok(());
             }
         };
@@ -3158,7 +3161,10 @@ impl Drop for ViewLease {
                     });
                 }
             }
-            Viewed::Shell(task) => task.change_views(|views| views.detach(self.view)),
+            Viewed::Shell(task) => {
+                task.forget_scroll(self.view);
+                task.change_views(|views| views.detach(self.view));
+            }
         }
     }
 }
@@ -3175,6 +3181,7 @@ async fn attach_view(
     id: &Value,
 ) -> Result<(), HostError> {
     let viewed = lease.viewed.clone();
+    let view = lease.view;
     request_send_buffer(&writer, ATTACH_SEND_BUFFER_BYTES);
     let mut changes = viewed.changes();
     write_within(
@@ -3203,11 +3210,21 @@ async fn attach_view(
         }
         told = current;
     }
+    // A terminal Tick whose program exits while this view shows it says so once; one that had
+    // exited before only shows its last screen.
+    let program = match &viewed {
+        Viewed::Tick(tick) => match &tick.adapter {
+            Adapter::Terminal(program) => Some(program),
+            Adapter::Protocol(_) => None,
+        },
+        Viewed::Shell(_) => None,
+    };
+    let mut has_told_exit = program.is_some_and(|program| program.exit().is_some());
     let output = async {
         let mut shown = None;
         loop {
             changes.borrow_and_update();
-            let (bytes, screen) = viewed.frame_since(shown.as_ref());
+            let (bytes, screen) = viewed.frame_since(view, shown.as_ref());
             let (rows, columns) = screen.size();
             shown = Some(screen);
             if !bytes.is_empty() {
@@ -3218,6 +3235,16 @@ async fn attach_view(
                         "size": TerminalSize { rows, columns },
                         "data": String::from_utf8_lossy(&bytes),
                     }),
+                    BUSINESS_FRAME_BYTES,
+                    STREAM_WRITE_TIMEOUT,
+                )
+                .await?;
+            }
+            if !has_told_exit && let Some(exit) = program.and_then(|program| program.exit()) {
+                has_told_exit = true;
+                write_within(
+                    &mut writer,
+                    &json!({"event":"exited","exit":exit}),
                     BUSINESS_FRAME_BYTES,
                     STREAM_WRITE_TIMEOUT,
                 )

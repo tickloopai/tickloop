@@ -75,7 +75,12 @@ impl MonitorRows for HostedRows {
                         HostedRun::Ended => Some(TICK_ENDED.into()),
                     },
                     resources: None,
-                    actions: hosted_actions(&row.instance, is_opened_here, run),
+                    actions: hosted_actions(
+                        &row.instance,
+                        is_opened_here,
+                        run,
+                        descriptor.glyph == TickGlyph::Terminal,
+                    ),
                 }
             })
             .collect()
@@ -122,7 +127,12 @@ impl MonitorRows for HostedRows {
             // Until the first probe answers, the Tick this Chat opened is taken to run.
             None => HostedRun::Running,
         };
-        row.actions = hosted_actions(&member.instance, true, run);
+        row.actions = hosted_actions(
+            &member.instance,
+            true,
+            run,
+            row.glyph == TickGlyph::Terminal,
+        );
         row
     }
 }
@@ -137,8 +147,9 @@ enum HostedRun {
     Ended,
 }
 
-/// A hosted Tick row's Enter and x. Enter opens the view of a Tick that still has a screen,
-/// and reopens one this Chat opened that no longer runs. x closes a Tick this Chat opened, so
+/// A hosted Tick row's Enter and x. Enter opens the view of a Tick that still has a screen, a
+/// card for an extension Tick and the whole terminal for a Terminal Tick, and reopens one this
+/// Chat opened that no longer runs. x closes a Tick this Chat opened, so
 /// nothing it opened keeps running out of sight and the record of one that ended goes with its
 /// row, and otherwise only takes the row out with this Chat's subscriptions, never ending another
 /// Chat's Tick.
@@ -146,13 +157,19 @@ fn hosted_actions(
     instance: &InstanceRef,
     is_opened_here: bool,
     run: HostedRun,
+    is_terminal: bool,
 ) -> Vec<MonitorAction> {
     let enter = match (run, is_opened_here) {
+        (HostedRun::Running | HostedRun::Exited, _) if is_terminal => open_full_screen(instance),
         (HostedRun::Running | HostedRun::Exited, _) => open_view(instance),
         (HostedRun::Ended, true) => MonitorAction {
             key: MONITOR_ENTER_KEY,
             label: "reopen",
-            intent: TickIntent::ReopenHosted(instance.clone()),
+            intent: if is_terminal {
+                TickIntent::ReopenFullScreen(instance.clone())
+            } else {
+                TickIntent::ReopenHosted(instance.clone())
+            },
         },
         (HostedRun::Ended, false) => MonitorAction {
             key: MONITOR_ENTER_KEY,
@@ -342,10 +359,10 @@ impl MonitorRows for ShellRows {
             .collect()
     }
 }
-/// A Shell row opens the Shell's view; a running one can be stopped, where its owner allows it,
-/// and must be before it is removed.
+/// A Shell row opens the Shell's view full screen; a running one can be stopped, where its owner
+/// allows it, and must be before it is removed.
 fn shell_actions(task: &ShellTask, instance: &InstanceRef) -> Vec<MonitorAction> {
-    let mut actions = vec![open_view(instance)];
+    let mut actions = vec![open_full_screen(instance)];
     if task.state.is_terminal() {
         actions.push(remove_from_monitor(instance));
         return actions;
@@ -369,12 +386,21 @@ fn shell_actions(task: &ShellTask, instance: &InstanceRef) -> Vec<MonitorAction>
 /// A running Shell that this Chat cannot stop stays visible until it ends.
 const RUNNING_SHELL_REMOVAL: &str = "This Shell leaves Monitor once it ends";
 
-/// Enter on a local Tick's row opens its attached view.
+/// Enter on an extension Tick's row enters its card.
 fn open_view(instance: &InstanceRef) -> MonitorAction {
     MonitorAction {
         key: MONITOR_ENTER_KEY,
         label: "open",
         intent: TickIntent::OpenView(instance.clone()),
+    }
+}
+
+/// Enter on a Terminal Tick's or a Shell's row shows it full screen.
+fn open_full_screen(instance: &InstanceRef) -> MonitorAction {
+    MonitorAction {
+        key: MONITOR_ENTER_KEY,
+        label: "open",
+        intent: TickIntent::OpenFullScreen(instance.clone()),
     }
 }
 

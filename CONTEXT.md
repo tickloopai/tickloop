@@ -10,7 +10,7 @@ Tickloop's product glossary. This file gives only term definitions and naming co
 A running object that the Agent can describe, read, and call, and from which it receives Tick Updates when it changes. There are only four Tick types (see "Tick Types"); a program a person starts themselves in a Herdr Pane or another terminal is not a Tick.
 
 **Tick Instance**:
-One independent run of a Tick, holding its own business identity and runtime state; its identity is written `<type>:<id>` (`hosted:`, `shell:`, `artifact:`). The identity is independent of the card that shows it; closing and reopening produces a new instance.
+One independent run of a Tick, holding its own business identity and runtime state; its identity is written `<type>:<id>` (`hosted:`, `shell:`, `artifact:`). The identity is independent of the view that shows it; closing and reopening produces a new instance.
 _Avoid_: using a Pane ID to refer to a Tick
 
 **Tick Standard**:
@@ -39,15 +39,19 @@ An explicitly established association between a Chat's Loop and a Tick Instance;
 _Avoid_: listen, Watch, poll
 
 **Tickhost**:
-The local service that runs all local Ticks (Extension Ticks, Terminal Ticks, Shell Ticks) and holds their terminals and screens; the Daemon starts it on demand, one per config root. Tick Cards in the Monitor are the only views attached to it. The program, process, and command are always written `tickhost`.
+The local service that runs all local Ticks (Extension Ticks, Terminal Ticks, Shell Ticks) and holds their terminals and screens; the Daemon starts it on demand, one per config root. Tick Cards in the Monitor and Full-screen Views are the views attached to it. The program, process, and command are always written `tickhost`.
 _Avoid_: Tick host, tick-host, tick_host
 
 **Tick Card**:
-The only view of a local Tick: a card under the Tick's row in the Agent View's Monitor column, attached through Tickhost, showing the Tick's own screen below a rule. Showing a card and entering it (giving it keyboard input) are separate; several cards can be open, and hiding or leaving a card does not end the Tick.
+The view of an Extension Tick in the Agent View: a card under the Tick's row in the Monitor column, attached through Tickhost, showing the Tick's own screen below a rule. Showing a card and entering it (giving it keyboard input) are separate; several cards can be open, and hiding or leaving a card does not end the Tick. Terminal Ticks and Shells have no card.
 _Avoid_: popup, view Pane
 
+**Full-screen View**:
+A view of a local Tick that takes the whole terminal: `Enter` on a Terminal Tick's or a Shell's Monitor row, or `tickloop attach` for any local Tick or Shell of a running Chat. Hiding it leaves the Tick running; a Shell's is read-only.
+_Avoid_: popup, attach Pane
+
 **Key Bubbling**:
-A Tick handing a key it does not use (Esc, an arrow, Tab or Shift+Tab) back to the client that shows it, through a private OSC sequence in its terminal output, after declaring that it does so; the Monitor then moves the focus from the card to its list or the input.
+A Tick handing a key it does not use (Esc, an arrow, Tab or Shift+Tab) back to the client that shows it, through a private OSC sequence in its terminal output, after declaring that it does so; the Monitor then moves the focus from the card to its list or the input, and a Full-screen View hides on a bubbled Esc.
 
 **Tick Ownership**:
 A persistent Chat's responsibility for the lifetime of the Ticks it opens, determined jointly by the config root and the Chat identity; a Subagent's Chat independently owns its own Ticks.
@@ -216,7 +220,7 @@ _Avoid_: owner, owner daemon, Agent execution service
 The process the Daemon starts for each root Agent; it calls the Harness as a library and runs model calls, tools, approvals, Triggers, and the Transcript for that Agent and its Subagents and Branches. Processes that run the Harness in other hosts are not called Workers.
 
 **Monitor**:
-The unified list in the Agent View of the Tick Instances, Artifacts, background Shells, and Scheduled Tasks this Chat has opened or subscribed to, with the Goal pinned at the bottom; local Ticks are shown in it as Tick Cards. Membership is managed separately from subscription and ownership.
+The unified list in the Agent View of the Tick Instances, Artifacts, background Shells, and Scheduled Tasks this Chat has opened or subscribed to, with the Goal pinned at the bottom; Extension Ticks are shown in it as Tick Cards, and Terminal Ticks and Shells open from it as Full-screen Views. Membership is managed separately from subscription and ownership.
 _Avoid_: Ticks panel, task list
 
 **Unread Update**:

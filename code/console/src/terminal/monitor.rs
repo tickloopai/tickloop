@@ -106,6 +106,30 @@ impl MonitorEntry {
         })
     }
 
+    /// The ended Terminal Tick whose row reopens it in its place and shows it full screen.
+    pub(super) fn reopens_full_screen(&self) -> Option<&InstanceRef> {
+        self.actions.iter().find_map(|action| match &action.intent {
+            crate::monitor_rows::TickIntent::ReopenFullScreen(instance)
+                if action.key == crate::monitor_rows::MONITOR_ENTER_KEY =>
+            {
+                Some(instance)
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether Enter, or a double click, on this row shows its Tick full screen or reopens it so.
+    pub(super) fn opens_full_screen(&self) -> bool {
+        self.actions.iter().any(|action| {
+            action.key == crate::monitor_rows::MONITOR_ENTER_KEY
+                && matches!(
+                    action.intent,
+                    crate::monitor_rows::TickIntent::OpenFullScreen(_)
+                        | crate::monitor_rows::TickIntent::ReopenFullScreen(_)
+                )
+        })
+    }
+
     fn state_label(&self) -> &str {
         match (self.status.is_empty(), self.tone) {
             (true, StatusTone::Running { .. }) => "running",

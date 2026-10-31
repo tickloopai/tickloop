@@ -961,12 +961,13 @@ fn monitor_shows(frame: &str, text: &str) -> bool {
         .any(|line| monitor_part(line).is_some_and(|part| part.contains(text)))
 }
 
-/// A terminal Tick and a Shell show in cards too: the terminal Tick takes the keys typed into
-/// its entered card; the Shell's card shows its status over its live output, takes no input and
-/// shows how it ended. A lone Esc leaves each card while it keeps running. A running Shell needs
-/// two presses to stop.
+/// A terminal Tick and a Shell show full screen: Enter on the row takes the whole terminal. The
+/// terminal Tick takes the keys typed there; its first Esc reaches it and shows how to hide, a
+/// second within a second hides it. The Shell's screen shows its status over its live output,
+/// takes no input, shows how it ended and hides on a lone Esc; Ctrl+C there stops a running
+/// Shell. Neither row ever shows a card.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_cli_cards_show_terminal_ticks_and_shells_and_a_row_stops_a_shell() {
+async fn actual_cli_terminal_ticks_and_shells_show_full_screen_and_ctrl_c_stops_a_shell() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(async {
         let mut view = view_with_local_ticks(&fixture, &[], true).await;
@@ -975,57 +976,68 @@ async fn actual_cli_cards_show_terminal_ticks_and_shells_and_a_row_stops_a_shell
             .await;
 
         select_row(&mut view, "cat").await;
+        view.send(b" ");
+        tokio::time::sleep(SELECTION_REST).await;
+        let frame = view.frame();
+        assert!(
+            !frame.lines().any(|line| {
+                monitor_part(line).is_some_and(|part| part.trim_start().starts_with('─'))
+            }) && !full_screen(&frame),
+            "Space shows no card for a terminal Tick: {frame}"
+        );
         view.send(b"\r");
-        view.wait_for("the cat card has the focus", card_focused)
-            .await;
+        wait_for_screen(&view, "cat takes the whole terminal", full_screen).await;
         view.send(b"hello cat\r");
-        view.wait_for("cat echoes in its card", |frame| {
-            monitor_shows(frame, "hello cat")
+        wait_for_screen(&view, "cat echoes full screen", |frame| {
+            full_screen(frame) && frame.contains("hello cat")
         })
         .await;
-        view.send(LEAVE_CARD);
-        view.wait_for("Esc Esc leaves the cat card", |frame| {
-            !card_focused(frame) && monitor_shows(frame, "hello cat")
+        view.send(b"\x1b");
+        wait_for_screen(&view, "the first Esc says how to hide", |frame| {
+            full_screen(frame) && frame.contains("Press esc again to hide")
+        })
+        .await;
+        view.send(b"\x1b");
+        wait_for_screen(&view, "the second Esc hides cat", |frame| {
+            !full_screen(frame) && frame.contains("enter open") && monitor_shows(frame, "cat")
         })
         .await;
 
         select_row(&mut view, SHELL_VIEW_COMMAND).await;
         view.send(b"\r");
-        view.wait_for("the Shell card shows its output", |frame| {
-            card_focused(frame) && monitor_shows(frame, "outone") && monitor_shows(frame, "running")
+        wait_for_screen(&view, "the Shell's screen shows its output", |frame| {
+            full_screen(frame)
+                && frame.contains("outone")
+                && frame.contains("running")
+                && frame.contains("ctrl+c stop")
         })
         .await;
         view.send(b"typed into the view");
         std::fs::write(fixture.path("work/gate"), "").unwrap();
-        let ended = view
-            .wait_for("the Shell card shows how it ended", |frame| {
-                monitor_shows(frame, "outtwo") && monitor_shows(frame, "exit 0")
-            })
-            .await;
+        let ended = wait_for_screen(&view, "the Shell's screen shows how it ended", |frame| {
+            full_screen(frame) && frame.contains("outtwo") && frame.contains("exit 0")
+        })
+        .await;
         assert!(!ended.contains("typed into the view"), "{ended}");
         view.send(CLOSE);
-        view.wait_for("the ended Shell keeps its row and card", |frame| {
-            !card_focused(frame) && frame.contains(SHELL_VIEW_COMMAND) && frame.contains("cat")
+        wait_for_screen(&view, "a lone Esc hides the Shell's screen", |frame| {
+            !full_screen(frame) && frame.contains(SHELL_VIEW_COMMAND) && frame.contains("cat")
         })
         .await;
 
         select_row(&mut view, LONG_SHELL_COMMAND).await;
-        view.wait_for("the running Shell's row offers stop", |frame| {
-            monitor_hint(frame).contains("x stop")
+        view.send(b"\r");
+        wait_for_screen(&view, "the long Shell's screen", |frame| {
+            full_screen(frame) && frame.contains("running")
         })
         .await;
-        view.send(b"x");
-        view.wait_for("stopping needs confirmation", |frame| {
-            frame.contains("Press x again to stop this Shell")
+        view.send(b"\x03");
+        wait_for_screen(&view, "Ctrl+C stops it and its screen stays", |frame| {
+            full_screen(frame) && frame.contains("stopped")
         })
         .await;
-        assert!(
-            view.frame()
-                .lines()
-                .any(|line| line.starts_with("Press x again to stop this Shell"))
-        );
-        view.send(b"x");
-        view.wait_for("the stopped Shell shows how it ended", |frame| {
+        view.send(CLOSE);
+        view.wait_for("the stopped Shell's row says so", |frame| {
             frame.lines().any(|line| {
                 line.split_once(SELECTED_MARK).is_some_and(|(_, row)| {
                     row.contains(LONG_SHELL_COMMAND) && row.contains("SIGTERM")
@@ -1033,8 +1045,6 @@ async fn actual_cli_cards_show_terminal_ticks_and_shells_and_a_row_stops_a_shell
             }) && !monitor_hint(frame).contains("x stop")
         })
         .await;
-        assert!(!view.frame().contains("Shell stopped"), "{}", view.frame());
-        assert!(!input_focused(&view.frame()), "{}", view.frame());
         view.send(b"\x1b");
         view.wait_for("input focused again", input_focused).await;
         view.close().await;
@@ -1047,11 +1057,92 @@ async fn actual_cli_cards_show_terminal_ticks_and_shells_and_a_row_stops_a_shell
     }
 }
 
-/// A card whose Tick ends keeps its last screen, says how the Tick ended on its rule and gives
-/// the focus back to the list: a terminal Tick whose program exited tells its exit status, an
-/// extension Tick whose process died says it ended. Space still hides the ended Tick's card.
+/// `tickloop attach` in another terminal lists the Ticks and Shells the running Agents opened,
+/// shows the chosen one full screen with its keys, and exits once it is hidden, leaving the Tick
+/// running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_cli_a_card_whose_tick_ends_keeps_its_last_screen_and_says_how() {
+async fn actual_cli_attach_lists_running_ticks_and_shows_the_chosen_one_full_screen() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        let mut view = view_with_local_ticks(&fixture, &[], false).await;
+        let model = fixture.path("model.json");
+        let mut attach = PtyView::run_command(
+            &fixture,
+            &["--transport-fixture", model.to_str().unwrap(), "attach"],
+        );
+        let listed = wait_for_screen(&attach, "the picker lists what can be shown", |frame| {
+            frame.contains("Attach to a Tick or a Shell")
+                && frame.contains("◉ Keys")
+                && frame.contains("cat")
+                && frame.contains(&format!("$ {SHELL_VIEW_DESCRIPTION}"))
+        })
+        .await;
+        assert!(
+            listed.lines().any(|line| line.starts_with("❯ ◉ Keys")),
+            "the first row is current: {listed}"
+        );
+        attach.send(b"\x0e");
+        wait_for_screen(&attach, "Ctrl+N moves to cat", |frame| {
+            frame
+                .lines()
+                .any(|line| line.starts_with("❯ >") && line.contains("cat"))
+        })
+        .await;
+        attach.send(b"\r");
+        wait_for_screen(&attach, "cat takes the attaching terminal", |frame| {
+            !frame.contains("Attach to a Tick or a Shell")
+        })
+        .await;
+        attach.send(b"via attach\r");
+        wait_for_screen(&attach, "cat echoes there", |frame| {
+            frame.matches("via attach").count() == 2
+        })
+        .await;
+        attach.send(b"\x1b\x1b");
+        tokio::time::timeout(UI_TIMEOUT, async {
+            loop {
+                if let Some(status) = attach.child.try_wait().unwrap() {
+                    assert!(status.success(), "attach ended unsuccessfully");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("hiding the view ends the command");
+
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
+            .await;
+        select_row(&mut view, "cat").await;
+        view.send(b"\r");
+        wait_for_screen(&view, "cat kept running with what was typed", |frame| {
+            full_screen(frame) && frame.contains("via attach")
+        })
+        .await;
+        view.send(b"\x1b\x1b");
+        wait_for_screen(&view, "Esc Esc hides cat", |frame| {
+            !full_screen(frame) && frame.contains("enter open")
+        })
+        .await;
+        view.send(CLOSE);
+        view.wait_for("input focused again", input_focused).await;
+        view.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A terminal Tick whose program exits while shown full screen hands the terminal back to the
+/// list, whose status line says how it ended. A card whose extension Tick ends keeps its last
+/// screen, says on its rule that it ended and gives the focus back to the list; Space still
+/// hides the ended Tick's card.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_cli_a_tick_that_ends_while_shown_says_how() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(async {
         let mut view = view_with_local_ticks(&fixture, &[], false).await;
@@ -1063,27 +1154,17 @@ async fn actual_cli_a_card_whose_tick_ends_keeps_its_last_screen_and_says_how() 
 
         select_row(&mut view, "cat").await;
         view.send(b"\r");
-        view.wait_for("the cat card has the focus", card_focused)
-            .await;
+        wait_for_screen(&view, "cat takes the whole terminal", full_screen).await;
         view.send(b"last words\r");
-        view.wait_for("cat echoes in its card", |frame| {
-            monitor_shows(frame, "last words")
+        wait_for_screen(&view, "cat echoes full screen", |frame| {
+            full_screen(frame) && frame.contains("last words")
         })
         .await;
         view.send(b"\x04");
-        let exited = view
-            .wait_for("the cat card says how its program ended", |frame| {
-                monitor_shows(frame, " exited 0 ")
-            })
-            .await;
-        assert!(
-            monitor_shows(&exited, "last words"),
-            "the last screen stays: {exited}"
-        );
-        assert!(
-            !card_focused(&exited),
-            "the focus leaves the ended card: {exited}"
-        );
+        wait_for_screen(&view, "the list says how cat ended", |frame| {
+            !full_screen(frame) && frame.contains("exited 0")
+        })
+        .await;
 
         let keys = hosted_members(&client, execution)
             .await
@@ -1138,12 +1219,12 @@ fn kitty_keyboard(view: &PtyView) -> KittyKeyboard {
     KittyKeyboard::after(&view.output.lock().unwrap())
 }
 
-/// In a terminal speaking the kitty keyboard protocol, every entered card, of a protocol Tick, a
-/// terminal Tick and a Shell alike, reads legacy keys and leaves on Esc each time it is entered,
-/// and Esc Esc sends Esc. The Console gets its disambiguated keys back on its own screen, pushed
-/// once however often a card was entered, with the main screen left untouched.
+/// In a terminal speaking the kitty keyboard protocol, every entered view, a protocol Tick's card
+/// and a terminal Tick's or a Shell's full screen alike, reads legacy keys and leaves on Esc each
+/// time it is entered, and Esc Esc sends Esc. The Console gets its disambiguated keys back on its
+/// own screen, pushed once however often a view was entered, with the main screen left untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_cli_entered_cards_read_legacy_keys_in_a_terminal_speaking_the_kitty_keyboard_protocol()
+async fn actual_cli_entered_views_read_legacy_keys_in_a_terminal_speaking_the_kitty_keyboard_protocol()
  {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(async {
@@ -1157,28 +1238,47 @@ async fn actual_cli_entered_cards_read_legacy_keys_in_a_terminal_speaking_the_ki
             ("cat", Some(b"meow\r".as_slice()), "meow"),
             (SHELL_VIEW_COMMAND, None, "outone"),
         ] {
+            // The extension Tick is entered in its card, the others full screen.
+            let in_card = row == "Keys";
             for _ in 0..2 {
                 select_row(&mut view, row).await;
                 view.send(b"\r");
-                view.wait_for("the card has the focus", card_focused).await;
+                wait_for_screen(&view, "the Tick has the keys", |frame| {
+                    if in_card {
+                        card_focused(frame)
+                    } else {
+                        full_screen(frame)
+                    }
+                })
+                .await;
                 if let Some(typed) = typed {
                     view.send(typed);
                 }
-                view.wait_for("the card shows its Tick", |frame| {
-                    monitor_shows(frame, shown)
+                wait_for_screen(&view, "the view shows its Tick", |frame| {
+                    if in_card {
+                        monitor_shows(frame, shown)
+                    } else {
+                        full_screen(frame) && frame.contains(shown)
+                    }
                 })
                 .await;
-                let in_card = kitty_keyboard(&view);
-                assert_eq!(in_card.flags(), 0, "the {row} card reads legacy keys");
+                let entered = kitty_keyboard(&view);
+                assert_eq!(entered.flags(), 0, "the {row} view reads legacy keys");
                 if row == SHELL_VIEW_COMMAND {
-                    view.send(in_card.escape());
-                    view.wait_for("a lone Esc leaves the read-only card", |frame| {
-                        !card_focused(frame)
+                    view.send(entered.escape());
+                    wait_for_screen(&view, "a lone Esc hides the Shell's screen", |frame| {
+                        !full_screen(frame) && frame.contains("enter open")
+                    })
+                    .await;
+                } else if !in_card {
+                    view.send(&[entered.escape(), entered.escape()].concat());
+                    wait_for_screen(&view, "Esc Esc hides the full-screen Tick", |frame| {
+                        !full_screen(frame) && frame.contains("enter open")
                     })
                     .await;
                 } else {
                     if row == "Keys" {
-                        view.send(in_card.escape());
+                        view.send(entered.escape());
                         keys_escapes += 1;
                         let shown = format!("keys {}", vec!["1b"; keys_escapes].join(" "));
                         view.wait_for("a lone Esc reaches the Tick", |frame| {
@@ -1190,7 +1290,7 @@ async fn actual_cli_entered_cards_read_legacy_keys_in_a_terminal_speaking_the_ki
                         keys_escapes += 1;
                         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     }
-                    view.send(&[in_card.escape(), in_card.escape()].concat());
+                    view.send(&[entered.escape(), entered.escape()].concat());
                     view.wait_for("Esc Esc leaves the card", |frame| !card_focused(frame))
                         .await;
                 }

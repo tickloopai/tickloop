@@ -451,9 +451,9 @@ The host uses `mutates` to decide whether approval is needed before a call and w
 
 `screen.min_rows` and `screen.max_rows` count the rows of the terminal the Tick draws on, its own status line included. They exclude anything the client draws around that terminal, such as a card's title line. The host reads the declaration once, when the Tick initializes; later changes are ignored.
 
-A client may show a Tick's terminal in a card beside its conversation, as the Monitor does. Such a card is exactly `screen.min_rows` rows tall when it has room, and 40 columns wide unless the user narrows it. A Tick that declares `screen.max_rows` may get more rows, up to `screen.max_rows`, when the client has height to spare; a client never takes rows from another card's `min_rows` to grow one. For Ticks shown this way:
+A client may show a Tick's terminal in a card beside its conversation, as the Monitor does for extension Ticks, or full screen, taking the whole terminal, as it does for a program it runs on a terminal without the protocol. `screen.min_rows` and `screen.max_rows` apply only to cards; a full-screen view gives the Tick the whole terminal. Such a card is exactly `screen.min_rows` rows tall when it has room, and 40 columns wide unless the user narrows it. A Tick that declares `screen.max_rows` may get more rows, up to `screen.max_rows`, when the client has height to spare; a client never takes rows from another card's `min_rows` to grow one. For Ticks shown this way:
 
-- A Tick **MAY** use Esc, but **MUST NOT** require a double Esc: while a card has the keyboard, a second Esc within 300 ms of the first leaves the card and is not delivered to the Tick. The first Esc is delivered at once.
+- A Tick **MAY** use Esc, but **MUST NOT** require a double Esc: while a card has the keyboard, a second Esc within 300 ms of the first leaves the card and is not delivered to the Tick; in a full-screen view a second Esc within 1 second hides the view the same way. The first Esc is delivered at once.
 - A Tick **SHOULD** declare key bubbling and bubble the keys listed in [Section 5.8](#s5-8) that it does not use, so the person can move to other Ticks with them.
 - A Tick **MUST** stay usable at 30 columns.
 - A Tick **MUST** redraw its whole screen after `SIGWINCH`, and **SHOULD NOT** repaint when nothing changed.
@@ -479,7 +479,7 @@ Rules:
 - A Tick declares `bubble=on` once it is ready for input, typically at startup. The declaration holds for the rest of the instance, across views and resizes, until the Tick writes `bubble=off`. A Tick starts with bubbling off.
 - A Tick **SHOULD** write `key=<name>` right after reading one of the listed keys that it does not use in its current state, and **MUST NOT** write it for a key it acted on.
 - The host ignores `key=` while bubbling is off, and unknown fields and key names. It removes every such sequence from the screen it keeps, so views never show them.
-- A bubbled key goes to the view that typed last, or else the view that attached last. What the client does with it is the client's choice: the Monitor leaves the card on `esc` for its list, on `up`, `down`, `tab` and `backtab` for its list with another Tick selected (entering no other card), and on `left` for its input.
+- A bubbled key goes to the view that typed last, or else the view that attached last. What the client does with it is the client's choice: the Monitor leaves the card on `esc` for its list, on `up`, `down`, `tab` and `backtab` for its list with another Tick selected (entering no other card), and on `left` for its input; a full-screen view hides on `esc` and ignores the other keys.
 - Other keys, including letters such as `h`, `j`, `k` and `l`, are never bubbled.
 - A Tick that never declares bubbling works unchanged; the person leaves its card with a double Esc.
 

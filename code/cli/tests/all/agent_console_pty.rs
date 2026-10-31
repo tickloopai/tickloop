@@ -222,6 +222,33 @@ impl PtyView {
         environment: &[(&str, &std::path::Path)],
         saves_chats: bool,
     ) -> Self {
+        let mut arguments = vec![
+            "--working-directory-is-trusted".to_owned(),
+            "--transport-fixture".to_owned(),
+            fixture.path("model.json").to_string_lossy().into_owned(),
+        ];
+        if !saves_chats {
+            arguments.push("--no-session-persistence".into());
+        }
+        arguments.extend(flags.iter().map(|flag| (*flag).to_owned()));
+        Self::spawn(fixture, &arguments, environment)
+    }
+
+    /// Runs the CLI with exactly `arguments` in the fixture's environment, as a product command
+    /// such as `attach` that takes no Console flags.
+    fn run_command(fixture: &PrivateFixture, arguments: &[&str]) -> Self {
+        let arguments: Vec<String> = arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect();
+        Self::spawn(fixture, &arguments, &[])
+    }
+
+    fn spawn(
+        fixture: &PrivateFixture,
+        arguments: &[String],
+        environment: &[(&str, &std::path::Path)],
+    ) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: TERMINAL_HEIGHT as u16,
@@ -231,12 +258,7 @@ impl PtyView {
             })
             .unwrap();
         let mut command = support::fixture_cli::pty_command();
-        command.args(["--working-directory-is-trusted", "--transport-fixture"]);
-        command.arg(fixture.path("model.json"));
-        if !saves_chats {
-            command.arg("--no-session-persistence");
-        }
-        command.args(flags);
+        command.args(arguments);
         command.cwd(fixture.path("work"));
         command.env_clear();
         command.env("PATH", "/usr/bin:/bin");
@@ -741,7 +763,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         })
         .await;
     reopened.send(b"\r");
-    // The Shell's card, drawn by the Tickhost, opens and takes the focus.
+    // The Shell's screen, drawn by the Tickhost, takes the whole terminal.
     view_shows(&reopened, &["$ printf 'shell began'", "running"]).await;
     std::fs::write(fixture.path("work/finish"), b"finish").unwrap();
     tokio::time::timeout(UI_TIMEOUT, async {
@@ -783,12 +805,12 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     view_shows(&reopened, &["shell beganshell ended", "exit 0"]).await;
     reopened.send(b"\x1b");
     tokio::time::timeout(UI_TIMEOUT, async {
-        while card_focused(&terminal_screen(&reopened)) {
+        while full_screen(&terminal_screen(&reopened)) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("Esc leaves the Shell's card");
+    .expect("Esc hides the Shell's screen");
     reopened
         .wait_for("the Shell's row is selected again", |frame| {
             frame.contains("Shells (1)")
@@ -1357,12 +1379,40 @@ fn card_focused(frame: &str) -> bool {
     })
 }
 
-/// Waits until a Monitor card has the focus and the screen shows every one of `texts`.
+/// Waits until the terminal, whatever drew it, shows a screen that `matches`, and returns it. A
+/// full-screen view draws without the Console's synchronized frames, which `PtyView::frame` reads.
+async fn wait_for_screen(view: &PtyView, label: &str, matches: impl Fn(&str) -> bool) -> String {
+    tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            let screen = terminal_screen(view);
+            if matches(&screen) {
+                return screen;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("CLI PTY {label}: {}", terminal_screen(view)))
+}
+
+/// Whether a full-screen view has the whole terminal: a Shell's screen with its keys on the last
+/// row, or a Tick's with nothing of the Console around it.
+fn full_screen(frame: &str) -> bool {
+    frame.contains("G latest · esc hide")
+        || !frame
+            .lines()
+            .any(|line| line.contains('│') || line.starts_with('❯') || line.contains("⏵⏵ "))
+}
+
+/// Waits until a Monitor card has the focus or a view has the whole terminal, and the screen
+/// shows every one of `texts`.
 async fn view_shows(view: &PtyView, texts: &[&str]) {
     tokio::time::timeout(UI_TIMEOUT, async {
         loop {
             let screen = terminal_screen(view);
-            if card_focused(&screen) && texts.iter().all(|text| screen.contains(text)) {
+            if (card_focused(&screen) || full_screen(&screen))
+                && texts.iter().all(|text| screen.contains(text))
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1371,7 +1421,7 @@ async fn view_shows(view: &PtyView, texts: &[&str]) {
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "{texts:?} never showed in a focused card:\n{}",
+            "{texts:?} never showed in a focused card or full screen:\n{}",
             terminal_screen(view)
         )
     });

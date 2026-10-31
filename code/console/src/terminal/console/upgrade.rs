@@ -334,6 +334,7 @@ impl State {
             && self.menu_submission_pending.is_none()
             && self.branch_submission == BranchSubmission::Idle
             && !self.card_focused()
+            && !self.full_screen_pending()
             && self.transcript.is_none()
             && self.diff_screen.is_none()
             && !self.help_open
@@ -788,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_waits_for_dialogs_focused_cards_and_submitted_input() {
+    fn upgrade_waits_for_dialogs_focused_cards_full_screen_views_and_submitted_input() {
         let console = Console::test_interactive_for_chat(Uuid::new_v4());
         let mut state = console.state.lock().unwrap();
         assert!(state.ready_for_upgrade());
@@ -799,6 +800,12 @@ mod tests {
         assert!(!state.ready_for_upgrade(), "a card has the user's keys");
         state.cards.close_all();
         assert!(state.ready_for_upgrade());
+        state.terminal_lent = true;
+        assert!(
+            !state.ready_for_upgrade(),
+            "a full-screen view has the terminal"
+        );
+        state.terminal_lent = false;
         state.menu = Some(Menu {
             id: Uuid::new_v4(),
             title: "Permission".into(),

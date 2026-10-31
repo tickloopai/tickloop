@@ -27,6 +27,7 @@ use uuid::Uuid;
 mod agent_layout;
 mod cards;
 mod delayed_submissions;
+mod full_screen;
 use delayed_submissions::DelayedSubmission;
 #[cfg(test)]
 mod image_preparation_tests;
@@ -56,6 +57,9 @@ mod ended_agents_tests;
 #[cfg(test)]
 #[path = "console/foreground_command_tests.rs"]
 mod foreground_command_tests;
+#[cfg(test)]
+#[path = "console/full_screen_tests.rs"]
+mod full_screen_tests;
 #[cfg(test)]
 #[path = "console/goal_tests.rs"]
 mod goal_tests;
@@ -1020,6 +1024,12 @@ pub(super) struct State {
     queued_card_inputs: Vec<InputEvent>,
     /// A left press on a card or on a row with a card; it acts on its release.
     card_press: Option<(Cell, super::monitor::MonitorTarget)>,
+    /// A full-screen view waiting to take this terminal; the input thread lends it between keys.
+    full_screen_attach: Option<full_screen::FullScreenAttach>,
+    /// A full-screen view owns the terminal; nothing is drawn until it is taken back.
+    terminal_lent: bool,
+    /// The permission request or question the terminal last rang for while it was lent.
+    rung_for: Option<Uuid>,
     /// One probe per access whose members' host state can be read: Herdr members inside a
     /// Herdr View and hosted Ticks in every View.
     member_probes: Vec<Arc<dyn crate::monitor_rows::TickProbe>>,
@@ -6524,6 +6534,9 @@ impl State {
             collapsed_cards: Vec::new(),
             queued_card_inputs: Vec::new(),
             card_press: None,
+            full_screen_attach: None,
+            terminal_lent: false,
+            rung_for: None,
             member_probes: Vec::new(),
             member_probe_running: false,
             permissions_surface: None,
@@ -6925,8 +6938,20 @@ impl State {
                     self.conversation_focused = false;
                     self.monitor.focus(self.monitor.overlay, None);
                     self.monitor.select_target(&instance);
+                    // A row shown full screen takes a double click, so a single click only
+                    // selects it.
+                    let clicks = self.count_click(at, Instant::now());
+                    let opens_full_screen = matches!(
+                        &instance,
+                        super::monitor::MonitorTarget::Tick(selected)
+                            if self.monitor.selected().is_some_and(|entry| {
+                                &entry.instance == selected && entry.opens_full_screen()
+                            })
+                    );
                     // An edge line only scrolls to the row it counts; it opens nothing.
-                    if !matches!(instance, super::monitor::MonitorTarget::Unseen { .. }) {
+                    if !matches!(instance, super::monitor::MonitorTarget::Unseen { .. })
+                        && (!opens_full_screen || clicks >= 2)
+                    {
                         self.pointer_input =
                             self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                     }
@@ -7419,6 +7444,10 @@ impl State {
 
     fn draw(&mut self, output: &mut impl Write) -> io::Result<()> {
         self.schedule_file_index();
+        if self.terminal_lent {
+            self.ring_for_waiting_question();
+            return Ok(());
+        }
         if !self.interactive {
             return Ok(());
         }
@@ -10554,6 +10583,7 @@ impl State {
         let input_visible = self.interactive
             && self.file_index_focused
             && self.prompt_enabled
+            && !self.terminal_lent
             && self.workspace_trust.is_none()
             && self.menu.is_none()
             && self.conversation_picker.is_none()
@@ -10961,6 +10991,7 @@ impl State {
             && self.scrollback.is_at_bottom()
             && !self.monitor.focused
             && !self.conversation_focused
+            && !self.terminal_lent
             && self.status_area.tasks_can_take_focus()
     }
 
@@ -13138,10 +13169,22 @@ impl State {
                         Err(error) => self.monitor.action_error = Some(super::safe_line(&error)),
                     }
                 }
-                // Space is the card key of hosted Tick and Shell rows; on one without a card, such
-                // as a Tick another Chat opened that ended, it does nothing rather than leave the
-                // list and type into the input. An Artifact row never has a card, so there Space
-                // types into the input.
+                // An ended Terminal Tick has no card to reopen into; Enter reopens it full screen.
+                (KeyCode::Char(' '), KeyModifiers::NONE)
+                    if self
+                        .monitor
+                        .selected()
+                        .is_some_and(|entry| entry.reopens_full_screen().is_some()) =>
+                {
+                    self.monitor_notice = Some(TimedNotice {
+                        text: full_screen::ENDED_TERMINAL_NOTICE.into(),
+                        until: Instant::now() + MONITOR_NOTICE_WINDOW,
+                    });
+                }
+                // Space is the card key of hosted Tick rows; on one without a card, such as a
+                // Terminal Tick, a Shell or a Tick another Chat opened that ended, it does nothing
+                // rather than leave the list and type into the input. An Artifact row never has a
+                // card, so there Space types into the input.
                 (KeyCode::Char(' '), KeyModifiers::NONE)
                     if self
                         .monitor
@@ -14357,6 +14400,17 @@ fn read_keys(
             break;
         }
         if !event::poll(INPUT_POLL_INTERVAL)? {
+            let attach = state
+                .lock()
+                .map_err(|error| io::Error::other(error.to_string()))?
+                .full_screen_attach
+                .take();
+            if let Some(attach) = attach {
+                if !full_screen::lend_terminal_to_attached_view(state, attach, stop, sender)? {
+                    break;
+                }
+                continue;
+            }
             if !idle_tick(state, stop, sender)? {
                 break;
             }

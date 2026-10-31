@@ -448,7 +448,11 @@ fn built_in_rows_describe_their_actions_as_intents() {
     assert_eq!(
         actions(&running_instance),
         [
-            action('o', "open", TickIntent::OpenView(running_instance.clone())),
+            action(
+                'o',
+                "open",
+                TickIntent::OpenFullScreen(running_instance.clone())
+            ),
             action('x', "stop", TickIntent::StopShell { task: running.id }),
         ]
     );
@@ -459,7 +463,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
             action(
                 'o',
                 "open",
-                TickIntent::OpenView(unstoppable_instance.clone())
+                TickIntent::OpenFullScreen(unstoppable_instance.clone())
             ),
             action(
                 'x',
@@ -473,7 +477,11 @@ fn built_in_rows_describe_their_actions_as_intents() {
     assert_eq!(
         actions(&finished_instance),
         [
-            action('o', "open", TickIntent::OpenView(finished_instance.clone())),
+            action(
+                'o',
+                "open",
+                TickIntent::OpenFullScreen(finished_instance.clone())
+            ),
             action(
                 'x',
                 "remove",

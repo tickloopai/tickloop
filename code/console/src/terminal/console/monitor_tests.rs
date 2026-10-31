@@ -45,9 +45,9 @@ fn shell(id: Uuid, title: &str) -> MonitorEntry {
         resources: None,
         actions: vec![
             crate::monitor_rows::MonitorAction {
-                key: 'o',
+                key: crate::monitor_rows::MONITOR_ENTER_KEY,
                 label: "open",
-                intent: crate::monitor_rows::TickIntent::OpenView(
+                intent: crate::monitor_rows::TickIntent::OpenFullScreen(
                     tick_protocol::InstanceRef::shell(id),
                 ),
             },
@@ -77,8 +77,7 @@ fn removed(instance: tick_protocol::InstanceRef) -> MonitorMembership {
     }
 }
 
-/// Monitor shows no Tick content: Enter on a Shell row asks for its view and opens no detail
-/// inside Monitor.
+/// Enter on a Shell row asks for its full-screen view and opens no detail inside Monitor.
 #[test]
 fn shell_tick_enter_opens_its_view_and_no_monitor_detail() {
     let mut state = click_fixture(140, false, TickGroup::Shells);
@@ -384,13 +383,10 @@ fn mixed_monitor_navigation_orders_ticks_tasks_and_fixed_goal_with_matching_hint
     assert!(
         matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::TickAction { action, .. }) if action.instance == tick.instance.to_string() && action.key == crate::monitor_rows::MONITOR_ENTER_KEY)
     );
-    assert!(state.card_focused(), "Enter enters the Shell's card");
     assert!(
-        state
-            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .is_none()
+        !state.card_focused() && state.monitor.focused,
+        "Enter shows the Shell full screen and the list keeps the keys"
     );
-    assert!(!state.card_focused() && state.monitor.focused);
     assert!(
         state
             .key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
@@ -447,11 +443,15 @@ fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
                 let row = if meta { *rows.last().unwrap() } else { rows[0] };
                 let column = state.width - state.monitor_columns() + 2;
                 assert!(!state.monitor.focused);
-                // A row whose Tick has a card acts on the release, so a drag never toggles it.
+                // A row whose Tick has a card acts on the release, so a drag never toggles it;
+                // a Shell's row, shown full screen, takes a double click.
+                let clicks = if group == TickGroup::Shells { 2 } else { 1 };
                 for kind in [
                     MouseEventKind::Down(MouseButton::Left),
                     MouseEventKind::Up(MouseButton::Left),
-                ] {
+                ]
+                .repeat(clicks)
+                {
                     state.pointer(
                         MouseEvent {
                             kind,
@@ -2942,9 +2942,10 @@ fn a_character_the_focused_row_does_not_bind_is_typed_into_the_input() {
             .is_some(),
         "a key the row binds keeps its row action"
     );
-    // The Shell's Enter key entered its card; a lone Esc leaves it.
-    assert!(state.card_focused());
-    state.leave_card();
+    assert!(
+        !state.card_focused(),
+        "the Shell's Enter key shows it full screen, never in a card"
+    );
     state.monitor.detail = None;
     state.monitor.focus(false, None);
     for (code, modifiers) in [
