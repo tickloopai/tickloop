@@ -680,6 +680,46 @@ async fn http_connection_falls_back_to_initialize_when_discover_is_rejected_over
 }
 
 #[tokio::test]
+async fn legacy_http_connection_accepts_empty_sse_priming_for_initialize_and_directories() {
+    let server = McpService::start().await;
+    server.set_discover_replies(vec![(
+        422,
+        json!({"id":null,"error":{"code":-32602,"message":"not initialized"}}),
+    )]);
+    server.prime_sse_with_empty_data();
+    server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object"}}]));
+    server.set_resources(json!([{"uri":"fixture://guide","name":"guide"}]));
+    let connections = McpConnections::new(
+        HostCapabilities::default(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    connections
+        .reconcile(vec![http_config("legacy", &server)])
+        .await;
+    settled(&connections).await;
+    let snapshot = connections.snapshot();
+    assert_eq!(snapshot[0].state, McpServerState::Connected);
+    assert_eq!(snapshot[0].tools.len(), 1);
+    assert_eq!(snapshot[0].tools[0].name, "mcp__legacy__probe");
+    assert_eq!(
+        snapshot[0].resources,
+        vec![json!({"uri":"fixture://guide","name":"guide"})]
+    );
+    assert_eq!(
+        server.methods(),
+        [
+            "server/discover",
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "resources/list",
+        ]
+    );
+    connections.shutdown().await;
+}
+
+#[tokio::test]
 async fn http_connection_discovers_and_calls_the_original_tool() {
     let server = McpService::start().await;
     server.set_tools(
@@ -2257,6 +2297,7 @@ async fn http_private_configuration_preserves_protocol_flags_and_original_schema
 #[tokio::test]
 async fn a_resumed_directory_keeps_the_original_schema_for_validation() {
     let server = McpService::start().await;
+    server.prime_sse_with_empty_data();
     server.resume_tool_directory_once();
     server.set_tools(json!([{"name":"probe","inputSchema":{"type":"object","properties":{"pin":{"type":"number","minimum":839271}}}}]));
     let connections = McpConnections::new(
@@ -2284,6 +2325,10 @@ async fn a_resumed_directory_keeps_the_original_schema_for_validation() {
         .await;
     settled(&connections).await;
     assert_eq!(server.directory_resumes(), 1);
+    assert_eq!(
+        server.directory_resume_id().as_deref(),
+        Some("directory-cut")
+    );
     assert_eq!(connections.snapshot()[0].state, McpServerState::Connected);
     assert_eq!(connections.snapshot()[0].tools.len(), 1);
     assert!(matches!(
