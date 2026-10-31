@@ -97,7 +97,7 @@ The user's `sandbox.network.allowedDomains` is frozen with each prepared Shell a
 single-use spawn authorization. Only matching destinations are reachable through that
 Shell's authenticated route through the Tickhost's lifetime-bound loopback proxy; direct network access remains blocked. A denied domain is
 reported in the Shell output. The proxy neither asks a model nor grants a new domain;
-only the user can change the allowlist in their settings. The proxy checks a random per-Tickhost token and a private per-Shell routing identity; a Shell's route is revoked at exit without releasing the listener. Detached descendants surviving a Tickhost restart retain the old OS port permission, as documented in the README sandbox limitation. There is no model-callable
+only the user can change the allowlist in their settings. The proxy checks a random per-Tickhost token and a private per-Shell routing identity; a Shell's route is revoked at exit without releasing the listener. Detached descendants surviving a Tickhost restart retain the old OS port permission, as documented in the [sandbox known limitation](../../../../docs/sandbox.md#known-limitation). There is no model-callable
 SandboxNetworkAccess tool, and this mapping adds no policy rule. Existing permission
 rules and the separate sandboxed-Bash admission path retain their own conditions.
 

@@ -19,8 +19,11 @@ __pycache__/
 *.pyo
 
 # Maintainer-local workspace and design records (specs, tickets, ADRs, design notes, evidence); never published.
+# User-facing manual pages under docs/ are tracked. Only the maintainer-local trees stay ignored.
 .scratch/
-/docs/
+/docs/design/
+/docs/adr/
+/docs/agents/
 
 # Native binaries compiled ad hoc (keep the .rs source next to them)
 *.dSYM/
